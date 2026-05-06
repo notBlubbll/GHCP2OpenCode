@@ -1,0 +1,20 @@
+{
+  "name": "ghcp2opencode",
+  "version": "2.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/server.js",
+    "dev": "bun --watch src/server.js"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.75",
+    "@ai-sdk/google": "^3.0.67",
+    "@ai-sdk/openai": "^3.0.61",
+    "@ai-sdk/openai-compatible": "^2.0.46",
+    "ai": "^6.0.175",
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}

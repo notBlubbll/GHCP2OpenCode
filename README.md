@@ -25,7 +25,7 @@ When you connect VS Copilot to this proxy, you get access to 14 Go models — in
    # or on Windows: start.cmd
    ```
 
-4. **Configure VS Code** — set `github.copilot.chat.advanced.debug.overrideProxyUrl` to `http://localhost:3000` and `overrideEngineUrl` to `http://localhost:3000/v1`
+4. **Configure VS Code** — set `github.copilot.chat.advanced.debug.overrideProxyUrl` to `http://localhost:11434` and `overrideEngineUrl` to `http://localhost:11434/v1`
 
 ### Connect via Ollama
 
@@ -33,7 +33,7 @@ You can register the proxy as an Ollama instance using the project port:
 
 ```json
 // settings.json
-"ollama.endpoint": "http://localhost:3000"
+"ollama.endpoint": "http://localhost:11434"
 ```
 
 ## Endpoints
@@ -54,7 +54,6 @@ All models support tool calling (agent mode). Vision-capable models are listed b
 | Model | Vision |
 |-------|--------|
 | DeepSeek V4 Flash | |
-| DeepSeek V4 Pro | |
 | Qwen3.5 Plus | ✓ |
 | Qwen3.6 Plus | ✓ |
 | MiniMax M2.5 | |
@@ -73,7 +72,7 @@ All models support tool calling (agent mode). Vision-capable models are listed b
 | Variable | Default |
 |----------|---------|
 | `OPENCODE_API_KEY` | *(required)* |
-| `SERVER_PORT` | `3000` |
+| `SERVER_PORT` | `11434` |
 | `SERVER_HOST` | `127.0.0.1` |
 | `DEFAULT_MODEL` | `deepseek-v4-flash` |
 

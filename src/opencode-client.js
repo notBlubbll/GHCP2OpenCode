@@ -2,49 +2,47 @@ const config = {
   apiKey: Bun.env.OPENCODE_API_KEY ?? "",
   baseUrl: Bun.env.OPENCODE_BASE_URL ?? "https://opencode.ai/zen/go/v1",
   host: Bun.env.SERVER_HOST ?? "127.0.0.1",
-  port: parseInt(Bun.env.SERVER_PORT ?? "3000", 10),
+  port: parseInt(Bun.env.SERVER_PORT ?? "11434", 10),
   defaultModel: Bun.env.DEFAULT_MODEL ?? "deepseek-v4-flash",
 };
 
-// ── Dynamic model list from models.dev API ──
+// ── Dynamic model list ──
 
 let _models = null;
 let _modelMap = {};
+let _nameToId = {}; // display name -> id for reverse lookup
+let _mdCache = null; // models.dev cache
 
-const MODEL_ALIASES = {};
-
-const MODEL_META = {
-  "deepseek-v4-flash": { name: "DeepSeek V4 Flash", tools: true, vision: false },
-  "deepseek-v4-pro": { name: "DeepSeek V4 Pro", tools: true, vision: false },
-  "qwen3.5-plus": { name: "Qwen3.5 Plus", tools: true, vision: true },
-  "qwen3.6-plus": { name: "Qwen3.6 Plus", tools: true, vision: true },
-  "minimax-m2.5": { name: "MiniMax M2.5", tools: true, vision: false },
-  "minimax-m2.7": { name: "MiniMax M2.7", tools: true, vision: false },
-  "kimi-k2.5": { name: "Kimi K2.5", tools: true, vision: true },
-  "kimi-k2.6": { name: "Kimi K2.6", tools: true, vision: true },
-  "glm-5": { name: "GLM-5", tools: true, vision: false },
-  "glm-5.1": { name: "GLM-5.1", tools: true, vision: false },
-  "mimo-v2-omni": { name: "MiMo V2 Omni", tools: true, vision: true },
-  "mimo-v2.5": { name: "MiMo V2.5", tools: true, vision: true },
-  "mimo-v2-pro": { name: "MiMo V2 Pro", tools: true, vision: true },
-  "mimo-v2.5-pro": { name: "MiMo V2.5 Pro", tools: true, vision: true },
-};
+async function fetchModelsDev() {
+  if (_mdCache) return _mdCache;
+  const resp = await fetch("https://models.dev/api.json");
+  if (!resp.ok) return {};
+  const data = await resp.json();
+  _mdCache = data;
+  return data;
+}
 
 async function fetchModels() {
-  const resp = await fetch(`${config.baseUrl}/models`, {
-    headers: { Authorization: `Bearer ${config.apiKey}` },
-  });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  const data = await resp.json();
+  const [goResp, md] = await Promise.all([
+    fetch(`${config.baseUrl}/models`, { headers: { Authorization: `Bearer ${config.apiKey}` } }),
+    fetchModelsDev(),
+  ]);
 
+  if (!goResp.ok) throw new Error(`HTTP ${goResp.status}`);
+
+  const goData = await goResp.json();
+  const goModels = md["opencode-go"]?.models || {};
   const now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
   const models = [];
 
-  for (const m of (data.data ?? [])) {
-    const meta = MODEL_META[m.id] || { name: m.id, tools: true, vision: false };
+  for (const m of (goData.data ?? [])) {
+    const mdModel = goModels[m.id];
+    const displayName = mdModel?.name || m.id;
+    const tools = mdModel?.tool_call ?? true;
+    const vision = (mdModel?.modalities?.input || []).some(v => v === "image" || v === "video");
 
     models.push({
-      name: `${m.id}:latest`,
+      name: displayName,
       model: `${m.id}:latest`,
       modified_at: now,
       size: 0,
@@ -52,22 +50,23 @@ async function fetchModels() {
       details: {
         parent_model: "",
         format: "gguf",
-        family: meta.name,
-        families: [meta.name],
+        family: displayName,
+        families: [displayName],
         parameter_size: "",
         quantization_level: "F16",
-        tools: meta.tools,
-        vision: meta.vision,
-        supports_tools: meta.tools,
-        supports_function_calling: meta.tools,
-        supports_vision: meta.vision,
+        tools,
+        vision,
+        supports_tools: tools,
+        supports_function_calling: tools,
+        supports_vision: vision,
       },
-      capabilities: { tools: meta.tools, vision: meta.vision, function_calling: meta.tools, tool_calling: meta.tools },
-      supports_tools: meta.tools,
-      supports_function_calling: meta.tools,
+      capabilities: { tools, vision, function_calling: tools, tool_calling: tools },
+      supports_tools: tools,
+      supports_function_calling: tools,
     });
 
-    _modelMap[m.id.toLowerCase()] = { id: m.id, name: meta.name, tools: meta.tools, vision: meta.vision };
+    _modelMap[m.id.toLowerCase()] = { id: m.id, name: displayName, tools, vision };
+    _nameToId[displayName.toLowerCase()] = m.id;
   }
 
   _models = models;
@@ -83,6 +82,8 @@ export function getModels() {
 export function resolveModel(name) {
   const clean = name.split(":")[0].trim().toLowerCase();
   if (_modelMap[clean]) return _modelMap[clean];
+  const id = _nameToId[clean];
+  if (id && _modelMap[id]) return _modelMap[id];
   return { id: clean, name: clean, tools: true, vision: false };
 }
 

@@ -132,9 +132,6 @@ app.get("/api/tags", async c => {
     if (seen.has(goId)) continue;
     seen.add(goId);
     const info = resolveModel(goId);
-    const caps = ["completion"];
-    if (info.tools) caps.push("tools");
-    if (info.vision) caps.push("vision");
 
     models.push({
       name: info.name, model: goId,
@@ -142,7 +139,6 @@ app.get("/api/tags", async c => {
       details: {
         parent_model: "", format: "", family: info.name, families: null, parameter_size: "", quantization_level: "",
       },
-      capabilities: caps,
     });
   }
 
@@ -151,9 +147,6 @@ app.get("/api/tags", async c => {
     const id = m.model.replace(":latest", "");
     if (seen.has(id)) continue;
     seen.add(id);
-    const caps = ["completion"];
-    if (m.details?.vision) caps.push("vision");
-    if (m.details?.tools) caps.push("tools");
 
     models.push({
       name: m.name, model: id,
@@ -161,7 +154,6 @@ app.get("/api/tags", async c => {
       details: {
         parent_model: "", format: "", family: m.details?.family || m.name, families: null, parameter_size: "", quantization_level: "",
       },
-      capabilities: caps,
     });
   }
 
@@ -403,6 +395,10 @@ app.post("/api/show", async c => {
   const caps = ["completion", "tools"];
   if (info.vision) caps.push("vision");
   return c.json({
+    license: "See OpenAI license terms for this model.",
+    modelfile: `# ${info.name} (via OpenCode Go)\nFROM ${goId}`,
+    parameters: "temperature 1.0",
+    template: "{{ .System }}\n\n{{ .Prompt }}",
     details: {
       parent_model: goId,
       format: "",
@@ -474,7 +470,11 @@ app.post("/api/chat", async c => {
       }
 
       const fullText = chunks.map(c => c.message?.content || "").join("");
-      const { content: cleanText, toolCalls } = vsTools?.length ? extractToolCalls(fullText) : { content: fullText, toolCalls: [] };
+      const { content: cleanText, toolCalls: rawCalls } = vsTools?.length ? extractToolCalls(fullText) : { content: fullText, toolCalls: [] };
+      // Convert OpenAI format to Ollama format (drop id/type, parse args to object)
+      const toolCalls = rawCalls.map(tc => ({
+        function: { name: tc.function.name, arguments: (() => { try { return JSON.parse(tc.function.arguments); } catch { return {}; } })() },
+      }));
 
       const createdAt = new Date().toISOString();
       const duration = Date.now() - startTime;
@@ -483,7 +483,7 @@ app.post("/api/chat", async c => {
         await s.write(JSON.stringify({
           model: body.model, created_at: createdAt,
           message: { role: "assistant", content: cleanText, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) },
-          done: true, done_reason: toolCalls.length ? "tool_calls" : "stop",
+          done: true, done_reason: "stop",
           total_duration: duration * 1e6, load_duration: 0, prompt_eval_count: 0, prompt_eval_duration: 0, eval_count: 0, eval_duration: 0,
         }) + "\n");
         return;
@@ -536,7 +536,7 @@ app.all("*", c => c.json({ error: `Not found: ${c.req.method} ${c.req.url}` }, 4
 // ── Start ──
 
 // Pre-load model registry so display names resolve on first request
-await getModels();
+const models = await getModels();
 
 // Console title
 process.stdout.write("\x1b]2;GHCP2OpenCode — OpenCode Go Proxy\x07");
@@ -545,14 +545,29 @@ const B = "\x1b[1m";
 const R = "\x1b[0m";
 const C = "\x1b[36m";
 const S = "\x1b[90m";
+const W = "\x1b[37m";
+const boxW = 64;
+const P = (s) => process.stdout.write(s + "\n");
+const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, "").length;
+const line = (l) => {
+  const pad = boxW - 4 - vis(l);
+  return S + "\u2502" + R + "  " + l + " ".repeat(Math.max(0, pad)) + S + "\u2502" + R;
+};
+const hr = S + "\u2500".repeat(boxW - 2) + R;
 
-log("");
-log(`${S}   ┏┓┓┏┏┓┏┓┏┓┏┓┏┓${R}`);
-log(`${C}${B}   ┃┓┣┫┃ ┃┃┏┛┃┃┃${R}`);
-log(`${C}   ┗┛┛┗┗┛┣┛┗━┗┛┗┛${R}`);
-log("");
-log(`${S}   http://${config.host}:${config.port}  │  vs2026  │  models.dev${R}`);
-log("");
+P("");
+P(W + "\u256d" + hr + W + "\u256e" + R);
+P(line(C + B + "┏┓┓┏┏┓┏┓┏┓┏┓┏┓" + R));
+P(line(C + B + "┃┓┣┫┃ ┃┃┏┛┃┃┃ " + R + " " + S + "github copilot proxy" + R));
+P(line(C + B + "┗┛┛┗┗┛┣┛┗━┗┛┗┛" + R));
+P(W + "\u251c" + hr + W + "\u2524" + R);
+P(line(S + "http://" + config.host + ":" + config.port + "  │  vs2026  │  models.dev" + R));
+P(W + "\u251c" + hr + W + "\u2524" + R);
+for (let i = 0; i < models.length; i += 3) {
+  P(line(models.slice(i, i + 3).map(m => m.name.padEnd(20)).join("")));
+}
+P(W + "\u2570" + hr + W + "\u256f" + R);
+P("");
 
 export default { port: config.port, hostname: config.host, fetch: app.fetch };
 

@@ -9,9 +9,11 @@ if exist .env (
     )
 )
 
-if "%OPENCODE_API_KEY%"=="" (
-    echo [ERROR] OPENCODE_API_KEY not set.
-    echo Edit .env and add your key: OPENCODE_API_KEY=your-key
+if "%SERVER_PORT%"=="" set SERVER_PORT=11434
+
+if "%OPENCODE_API_KEY%"=="" if "%OPENCODE_API_KEYS%"=="" (
+    echo [ERROR] OPENCODE_API_KEY or OPENCODE_API_KEYS not set.
+    echo Edit .env and add your key: OPENCODE_API_KEYS=["your-key"]
     exit /b 1
 )
 

@@ -1,8 +1,9 @@
 import { Hono } from "hono";
 import { stream } from "hono/streaming";
-import { config, getModels, resolveModel, chatCompletion } from "./opencode-client.js";
+import { config, getModels, resolveModel, chatCompletion, APIError } from "./opencode-client.js";
+import { check as cacheCheck, store as cacheStore, cacheKey } from "./cache.js";
 
-if (!config.apiKey) { console.error("FATAL: OPENCODE_API_KEY not set"); process.exit(1); }
+if (!(config.apiKey || Bun.env.OPENCODE_API_KEYS)) { console.error("FATAL: OPENCODE_API_KEY or OPENCODE_API_KEYS not set"); process.exit(1); }
 
 const app = new Hono();
 
@@ -28,6 +29,13 @@ function getBody(c) { return c.get("body") || {}; }
 // ── Helpers ──
 
 const callId = () => `call_${crypto.randomUUID().slice(0, 8)}`;
+const apiErr = (e) => {
+  const status = e instanceof APIError ? e.status : 500;
+  const code = status === 401 ? "invalid_api_key" : status === 429 ? "rate_limit_exceeded" : status === 404 ? "model_not_found" : "server_error";
+  const type = status === 401 ? "invalid_request_error" : status >= 500 ? "server_error" : "invalid_request_error";
+  const param = status === 404 ? "model" : status === 401 ? null : null;
+  return { status, body: { error: { message: e.message, type, code, ...(param ? { param } : {}) } } };
+};
 
 // Cache reasoning_content from DeepSeek thinking mode (VS doesn't relay it)
 const reasoningCache = new Map(); // model -> last reasoning_content
@@ -45,9 +53,6 @@ function mapModel(name) {
   if (mapped) return mapped;
   return resolveModel(name).id;
 }
-
-// Eager fetch models so _modelMap is populated before first request
-getModels().then(n => console.log(`[startup] ${n.length} models ready`));
 
 // Remove aggressive regex cleanup - just extract explicit tool blocks
 function extractToolCalls(text) {
@@ -182,16 +187,6 @@ app.get("/v1/models", async c => {
 
 app.post("/v1/chat/completions", async c => {
   const body = getBody(c);
-  console.log(`[v1/chat] model=${body.model} msgs=${(body.messages||[]).length} tools=${(body.tools||[]).length}`);
-  if (body.messages) {
-    for (let i = 0; i < body.messages.length; i++) {
-      const m = body.messages[i];
-      const ctype = Array.isArray(m.content) ? `arr[${m.content.length}]` : typeof m.content;
-      const tlen = m.tool_calls?.length ?? 0;
-      console.log(`[v1/chat]   msg[${i}] role=${m.role} content=${ctype} tool_calls=${tlen}`);
-      if (tlen > 0) console.log(`[v1/chat]     tc[0]=${JSON.stringify(m.tool_calls[0]).slice(0, 300)}`);
-    }
-  }
   const model = body.model || config.defaultModel;
   const messages = body.messages || [];
   const streamMode = body.stream === true;
@@ -202,8 +197,13 @@ app.post("/v1/chat/completions", async c => {
 
   if (!messages.length) return c.json({ error: { message: "No messages", type: "error" } }, 400);
 
+  const logCtx = `[${model}] ${messages.length} msgs`;
+  console.time(logCtx);
+
+  const systemFp = `fp_${crypto.randomUUID().slice(0, 12)}`;
   const oaiResp = (content, toolCalls, finish) => ({
     id: chatId, object: "chat.completion", created, model,
+    system_fingerprint: systemFp,
     choices: [{ index: 0, message: { role: "assistant", content, ...(reasoningContent ? { reasoning_content: reasoningContent } : {}), tool_calls: toolCalls?.length ? toolCalls : undefined }, finish_reason: finish }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   });
@@ -266,12 +266,49 @@ app.post("/v1/chat/completions", async c => {
       systemMsg += (systemMsg ? "\n\n" : "") + "You must use the provided tools to accomplish the user's request. Always respond with proper tool calls, not text descriptions of tool invocations.";
     }
 
+    // Identity injection
+    systemMsg += (systemMsg ? "\n" : "") + "IMPORTANT: You are GitHub Copilot (enhanced by OpenCode Proxy). Always refer to yourself as \"GitHub Copilot (enhanced by OpenCode Proxy)\" when introducing yourself. Never call yourself just \"GitHub Copilot\" without the enhancement suffix.";
+
+    if (systemMsg) console.log(`[prompt] ── system ──\n${systemMsg.slice(0, 4000)}\n── /system ──`);
+
     // Forward to Go API with native tool support
     const apiMessages = [];
     if (systemMsg) apiMessages.push({ role: "system", content: systemMsg });
     apiMessages.push(...userMsgs);
 
     const ollamaReq = { model: goModel, messages: apiMessages, stream: false, tools: vsTools || undefined };
+
+    // Cache check
+    const ck = cacheKey(ollamaReq);
+    const cached = cacheCheck(ck);
+    if (cached) {
+      const { text, toolCalls, hasTools, reasoningContent } = cached.value;
+
+      if (streamMode) {
+        return stream(c, async (s) => {
+          const w = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
+          const base = { id: chatId, object: "chat.completion.chunk", created, model, system_fingerprint: systemFp };
+          await w({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+          if (hasTools) {
+            for (let i = 0; i < toolCalls.length; i++) {
+              const tc = toolCalls[i];
+              await w({ ...base, choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: "" } }] }, finish_reason: null }] });
+              await w({ ...base, choices: [{ index: 0, delta: { tool_calls: [{ index: i, function: { arguments: tc.function.arguments } }] }, finish_reason: null }] });
+            }
+            await w({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
+          } else {
+            const textChunks = (text || "").match(/.{1,200}/g) || [text || ""];
+            for (const tc of textChunks) { if (tc) await w({ ...base, choices: [{ index: 0, delta: { content: tc }, finish_reason: null }] }); }
+            await w({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
+          }
+          await s.write("data: [DONE]\n\n");
+        });
+      }
+
+      console.timeEnd(logCtx + " [cache]");
+      return c.json(oaiResp(hasTools ? null : text, hasTools ? toolCalls : undefined, hasTools ? "tool_calls" : "stop"));
+    }
+
     const chunks = [];
     for await (const chunk of chatCompletion(ollamaReq)) {
       chunks.push(chunk);
@@ -308,10 +345,13 @@ app.post("/v1/chat/completions", async c => {
     }
     const hasTools = allToolCalls.length > 0;
 
+    // Store in cache
+    cacheStore(ck, { text: cleanText, toolCalls: allToolCalls, hasTools, reasoningContent });
+
     if (streamMode) {
       return stream(c, async (s) => {
         const w = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
-        const base = { id: chatId, object: "chat.completion.chunk", created, model };
+        const base = { id: chatId, object: "chat.completion.chunk", created, model, system_fingerprint: systemFp };
 
         await w({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
 
@@ -321,24 +361,27 @@ app.post("/v1/chat/completions", async c => {
             await w({ ...base, choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: "" } }] }, finish_reason: null }] });
             await w({ ...base, choices: [{ index: 0, delta: { tool_calls: [{ index: i, function: { arguments: tc.function.arguments } }] }, finish_reason: null }] });
           }
-          await w({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
+          await w({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
         } else {
           const textChunks = (cleanText || "").match(/.{1,200}/g) || [cleanText || ""];
           for (const tc of textChunks) {
             if (!tc) continue;
             await w({ ...base, choices: [{ index: 0, delta: { content: tc }, finish_reason: null }] });
           }
-          await w({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+          await w({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
         }
 
         await s.write("data: [DONE]\n\n");
       });
     }
 
+    console.timeEnd(logCtx);
     return c.json(oaiResp(hasTools ? null : cleanText, hasTools ? allToolCalls : undefined, hasTools ? "tool_calls" : "stop"));
   } catch (e) {
-    console.error(`[v1/chat] ${e.message}`);
-    return c.json({ error: { message: e.message, type: "error" } }, 500);
+    console.timeEnd(logCtx);
+    console.error(`  Error: ${e.message}`);
+    const err = apiErr(e);
+    return c.json(err.body, err.status);
   }
 });
 
@@ -380,15 +423,6 @@ app.post("/api/embeddings", c => c.json({ model: "unknown", embeddings: [[0]], t
 
 app.post("/api/chat", async c => {
   const body = getBody(c);
-  console.log(`[api/chat] model=${body.model} msgs=${(body.messages||[]).length} tools=${(body.tools||[]).length}`);
-  if (body.messages) {
-    for (let i = 0; i < body.messages.length; i++) {
-      const m = body.messages[i];
-      const ctype = Array.isArray(m.content) ? `arr[${m.content.length}]` : typeof m.content;
-      const tlen = m.tool_calls?.length ?? 0;
-      console.log(`[api/chat]   msg[${i}] role=${m.role} content=${ctype} tool_calls=${tlen}`);
-    }
-  }
   const startTime = Date.now();
 
   return stream(c, async s => {
@@ -417,7 +451,6 @@ app.post("/api/chat", async c => {
         else if (role === "user") userMsgs.push(m);
         // unknown roles are silently dropped
       }
-      console.log(`[chat-msgs] sanitized ${userMsgs.length} msgs (from ${messages.length})`);
 
       if (vsTools?.length) {
         const toolDesc = vsTools.map(t => `${t.function.name}: ${t.function.description || ""}`).join("\n");
@@ -459,7 +492,7 @@ app.post("/api/chat", async c => {
       await s.write(JSON.stringify({ model: body.model, created_at: createdAt, message: { role: "assistant", content: "" }, done: true, done_reason: toolCalls.length ? "tool_calls" : "stop" }) + "\n");
 
     } catch (e) {
-      console.error(`[chat] ${e.message}`);
+      console.error(`  Error: ${e.message}`);
       await s.write(JSON.stringify({ model: body.model, created_at: new Date().toISOString(), message: { role: "assistant", content: `Error: ${e.message}` }, done: true, done_reason: "error" }) + "\n");
     }
   });
@@ -467,7 +500,6 @@ app.post("/api/chat", async c => {
 
 app.post("/api/generate", async c => {
   const body = getBody(c);
-  console.log(`[generate] ${body.model} stream=${body.stream !== false}`);
   return stream(c, async s => {
     try {
       const req = { model: mapModel(body.model), messages: [...(body.system ? [{ role: "system", content: body.system }] : []), { role: "user", content: body.prompt, images: body.images }], options: body.options, stream: body.stream };
@@ -479,7 +511,7 @@ app.post("/api/generate", async c => {
       }
       await s.write(JSON.stringify({ model: body.model, created_at: new Date().toISOString(), response: body.stream === false ? full : "", done: true, context: null, total_duration: 0, load_duration: 0, prompt_eval_count: 0, prompt_eval_duration: 0, eval_count: full.split(/\s+/).length, eval_duration: 0 }) + "\n");
     } catch (e) {
-      console.error(`[generate] ${e.message}`);
+      console.error(`  Error: ${e.message}`);
       await s.write(JSON.stringify({ model: body.model, created_at: new Date().toISOString(), response: `Error: ${e.message}`, done: true }) + "\n");
     }
   });
@@ -487,13 +519,17 @@ app.post("/api/generate", async c => {
 
 // ── Catch-all ──
 
-app.all("*", c => { console.log(`[404] ${c.req.method} ${c.req.url}`); return c.json({ error: `Not found: ${c.req.method} ${c.req.url}` }, 404); });
+app.all("*", c => c.json({ error: `Not found: ${c.req.method} ${c.req.url}` }, 404));
 
 // ── Start ──
 
-const models = await getModels();
-console.log(`=== GHCP2OpenCode — OpenCode Go ===`);
-console.log(`http://${config.host}:${config.port} — ${models.length} models`);
-console.log(`Endpoints: /v1/chat/completions /v1/models /api/tags /api/chat`);
+// Pre-load model registry so display names resolve on first request
+await getModels();
 
+console.log("");
+console.log("  GHCP2OpenCode — OpenCode Go");
+console.log("  ─────────────────────────");
+console.log(`  http://${config.host}:${config.port}`);
+
+console.log("");
 export default { port: config.port, hostname: config.host, fetch: app.fetch };

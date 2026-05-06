@@ -1,10 +1,51 @@
 const config = {
-  apiKey: Bun.env.OPENCODE_API_KEY ?? "",
+  get apiKey() { return Bun.env.OPENCODE_API_KEY ?? ""; },
   baseUrl: Bun.env.OPENCODE_BASE_URL ?? "https://opencode.ai/zen/go/v1",
   host: Bun.env.SERVER_HOST ?? "127.0.0.1",
   port: parseInt(Bun.env.SERVER_PORT ?? "11434", 10),
   defaultModel: Bun.env.DEFAULT_MODEL ?? "deepseek-v4-flash",
 };
+
+export function setApiKey(key) { Bun.env.OPENCODE_API_KEY = key; }
+
+// ── Key rotation ──
+
+let _keys = [];
+let _keyIdx = 0;
+const _keyCooldown = new Map(); // key -> cooldownUntil timestamp
+
+function loadKeys() {
+  if (Bun.env.OPENCODE_API_KEYS) {
+    try { _keys = JSON.parse(Bun.env.OPENCODE_API_KEYS); } catch { _keys = []; }
+  }
+  if (_keys.length === 0 && Bun.env.OPENCODE_API_KEY) {
+    _keys = [Bun.env.OPENCODE_API_KEY];
+  }
+}
+
+function withKey() {
+  loadKeys();
+  const now = Date.now();
+  for (let i = 0; i < _keys.length; i++) {
+    const idx = (_keyIdx + i) % _keys.length;
+    const key = _keys[idx];
+    if (!_keyCooldown.has(key) || _keyCooldown.get(key) < now) {
+      _keyIdx = (idx + 1) % _keys.length;
+      return key;
+    }
+  }
+  // All keys on cooldown — try first anyway
+  return _keys[0] || "";
+}
+
+function cooldownKey(key, ms = 30000) {
+  _keyCooldown.set(key, Date.now() + ms);
+}
+
+export function rotateKey() {
+  const bad = _keys[_keyIdx % _keys.length];
+  if (bad) cooldownKey(bad);
+}
 
 // ── Dynamic model list ──
 
@@ -70,7 +111,7 @@ async function fetchModels() {
   }
 
   _models = models;
-  console.log(`[models] Fetched ${models.length} Go models`);
+  console.log(`[models] ${models.length} from Go API`);
   return _models;
 }
 
@@ -91,23 +132,65 @@ function isoNow() { return new Date().toISOString(); }
 
 // ── Direct OpenCode Go API calls ──
 
-async function zenRequest(endpoint, body) {
+// ── API Error ──
+
+export class APIError extends Error {
+  constructor(status, body, message) {
+    super(message || `OpenCode API ${status}`);
+    this.status = status;
+    this.body = body;
+    this.name = "APIError";
+  }
+}
+
+// OpenAI-compatible error codes
+const ERROR_CODES = {
+  400: "invalid_request",
+  401: "invalid_api_key",
+  402: "insufficient_quota",
+  403: "permission_denied",
+  404: "not_found",
+  429: "rate_limit_exceeded",
+  500: "server_error",
+  503: "server_overloaded",
+};
+
+async function zenRequest(endpoint, body, retries = 0) {
   const url = `${config.baseUrl}${endpoint}`;
-  console.log(`[zen] POST ${url} model=${body.model}`);
-  
+  const key = withKey();
+  if (!key) throw new APIError(401, "", "No API key configured");
+  console.log(`[zen] ${body.model}`);
+
   const resp = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${config.apiKey}`,
+      "Authorization": `Bearer ${key}`,
     },
     body: JSON.stringify(body),
   });
 
   if (!resp.ok) {
     const txt = await resp.text().catch(() => "");
-    console.log(`[zen] <- ${resp.status}: ${txt.slice(0, 300)}`);
-    throw new Error(`OpenCode API ${resp.status}: ${txt}`);
+    console.error(`[zen] ${resp.status}`);
+
+    // Rotate key on auth/rate-limit errors
+    if ((resp.status === 401 || resp.status === 429) && retries < _keys.length) {
+      cooldownKey(key, resp.status === 429 ? 15000 : 60000);
+      return zenRequest(endpoint, body, retries + 1);
+    }
+
+    let upstreamMsg = "OpenCode API error";
+    let code = ERROR_CODES[resp.status] || "api_error";
+    let mappedStatus = resp.status;
+    try {
+      const parsed = JSON.parse(txt);
+      upstreamMsg = parsed.error?.message || parsed.message || upstreamMsg;
+      if (parsed.error?.type === "AuthError") { code = "invalid_api_key"; mappedStatus = 401; }
+      if (parsed.error?.type === "ModelError") { code = "model_not_found"; mappedStatus = 404; }
+    } catch {}
+
+    throw new APIError(mappedStatus, txt, upstreamMsg);
   }
 
   return resp;
@@ -201,7 +284,8 @@ export async function* chatCompletion(req) {
       }
     }
   } catch (e) {
-    console.error(`[chat] ${e.message}`);
+    if (e instanceof APIError) throw e; // propagate HTTP errors to server.js
+    console.error(`[stream] ${e.message}`);
     yield {
       model: req.model, created_at: created,
       message: { role: "assistant", content: `Error: ${e.message}` },

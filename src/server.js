@@ -34,31 +34,20 @@ const reasoningCache = new Map(); // model -> last reasoning_content
 
 // Ollama -> Go model mappings (what VS Copilot sends vs what Go API expects)
 const MODEL_MAP = {
-  "deepseek-v4-flash":     "deepseek-v4-flash",
+  "deepseek-chat":         "deepseek-v4-flash",
   "deepseek/deepseek-chat": "deepseek-v4-flash",
   "deepseek/deepseek-chat:free": "deepseek-v4-flash",
-  "deepseek-v4-pro":       "deepseek-v4-pro",
-  "deepseek/deepseek-reasoner": "deepseek-v4-pro",
-  "deepseek-chat":         "deepseek-v4-flash",
-  "deepseek-reasoner":     "deepseek-v4-pro",
-  "kimi-k2.5":             "kimi-k2.5",
-  "kimi-k2.6":             "kimi-k2.6",
-  "qwen3.5-plus":          "qwen3.5-plus",
-  "qwen3.6-plus":          "qwen3.6-plus",
-  "minimax-m2.5":          "minimax-m2.5",
-  "minimax-m2.7":          "minimax-m2.7",
-  "glm-5":                 "glm-5",
-  "glm-5.1":               "glm-5.1",
-  "mimo-v2-omni":          "mimo-v2-omni",
-  "mimo-v2.5":             "mimo-v2.5",
-  "mimo-v2-pro":           "mimo-v2-pro",
-  "mimo-v2.5-pro":         "mimo-v2.5-pro",
 };
 
 function mapModel(name) {
   const clean = (name || "").split(":")[0].trim();
-  return MODEL_MAP[clean] || MODEL_MAP[clean.toLowerCase()] || clean;
+  const mapped = MODEL_MAP[clean] || MODEL_MAP[clean.toLowerCase()];
+  if (mapped) return mapped;
+  return resolveModel(name).id;
 }
+
+// Eager fetch models so _modelMap is populated before first request
+getModels().then(n => console.log(`[startup] ${n.length} models ready`));
 
 // Remove aggressive regex cleanup - just extract explicit tool blocks
 function extractToolCalls(text) {
@@ -121,49 +110,51 @@ app.get("/api/tags", async c => {
 
   // VS-recognized Ollama cloud model names -> maps to Go models
   const cloudModels = [
-    ["deepseek/deepseek-chat", "deepseek-v4-flash", true, false],
-    ["deepseek/deepseek-chat:free", "deepseek-v4-flash", true, false],
-    ["deepseek/deepseek-reasoner", "deepseek-v4-pro", true, false],
-    ["deepseek-v4-flash", "deepseek-v4-flash", true, false],
-    ["deepseek-v4-pro", "deepseek-v4-pro", true, false],
+    ["deepseek/deepseek-chat", "deepseek-v4-flash"],
+    ["deepseek/deepseek-chat:free", "deepseek-v4-flash"],
+    ["deepseek-v4-flash", "deepseek-v4-flash"],
   ];
 
-  for (const [name, goId, tools, vision] of cloudModels) {
-    if (seen.has(name)) continue;
-    seen.add(name);
-    const caps = ["completion", "tools"];
-    if (vision) caps.push("vision");
+  const goModels = await getModels();
+
+  for (const [name, goId] of cloudModels) {
+    if (seen.has(goId)) continue;
+    seen.add(goId);
+    const info = resolveModel(goId);
+    const caps = ["completion"];
+    if (info.tools) caps.push("tools");
+    if (info.vision) caps.push("vision");
 
     models.push({
-      name, model: name,
+      name: info.name, model: goId,
       modified_at: now, size: 0, digest: "",
       details: {
-        parent_model: "", format: "", family: "", families: null, parameter_size: "", quantization_level: "",
+        parent_model: "", format: "", family: info.name, families: null, parameter_size: "", quantization_level: "",
       },
       capabilities: caps,
     });
   }
 
   // Go models directly
-  const goModels = await getModels();
   for (const m of goModels) {
-    const name = m.name.replace(":latest", "");
-    if (seen.has(name)) continue;
-    seen.add(name);
-    const caps = ["completion", "tools"];
+    const id = m.model.replace(":latest", "");
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const caps = ["completion"];
     if (m.details?.vision) caps.push("vision");
+    if (m.details?.tools) caps.push("tools");
 
     models.push({
-      name, model: name,
+      name: m.name, model: id,
       modified_at: now, size: 0, digest: "",
       details: {
-        parent_model: "", format: "", family: "", families: null, parameter_size: "", quantization_level: "",
+        parent_model: "", format: "", family: m.details?.family || m.name, families: null, parameter_size: "", quantization_level: "",
       },
       capabilities: caps,
     });
   }
 
-  return c.json({ models });
+  return c.json({ models: models.sort((a, b) => a.name.localeCompare(b.name)) });
 });
 
 app.get("/api/version", c => c.json({ version: "0.5.7" }));
@@ -176,7 +167,7 @@ app.get("/v1/models", async c => {
   const data = [];
 
   // VS-recognized cloud model names
-  const cloudIds = ["deepseek/deepseek-chat", "deepseek/deepseek-chat:free", "deepseek/deepseek-reasoner", "deepseek-chat", "deepseek-reasoner"];
+  const cloudIds = ["deepseek/deepseek-chat", "deepseek/deepseek-chat:free", "deepseek-chat"];
   for (const id of cloudIds) {
     data.push({ id, object: "model", created: ~~(Date.now() / 1000), owned_by: "opencode-go" });
   }

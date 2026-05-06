@@ -155,29 +155,28 @@ const ERROR_CODES = {
   503: "server_overloaded",
 };
 
-async function zenRequest(endpoint, body, retries = 0) {
+async function zenRequest(endpoint, body, opts = {}) {
   const url = `${config.baseUrl}${endpoint}`;
   const key = withKey();
   if (!key) throw new APIError(401, "", "No API key configured");
-  console.log(`[zen] ${body.model}`);
+  console.log(`[zen] ${body.model?.slice(0, 30)}`);
 
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${key}`,
-    },
-    body: JSON.stringify(body),
-  });
+  const headers = {
+    "Content-Type": "application/json",
+    "Authorization": `Bearer ${key}`,
+  };
+
+  const resp = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
 
   if (!resp.ok) {
     const txt = await resp.text().catch(() => "");
     console.error(`[zen] ${resp.status}`);
 
     // Rotate key on auth/rate-limit errors
+    const retries = opts.retries || 0;
     if ((resp.status === 401 || resp.status === 429) && retries < _keys.length) {
       cooldownKey(key, resp.status === 429 ? 15000 : 60000);
-      return zenRequest(endpoint, body, retries + 1);
+      return zenRequest(endpoint, body, { ...opts, retries: retries + 1 });
     }
 
     let upstreamMsg = "OpenCode API error";

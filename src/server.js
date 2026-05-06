@@ -197,16 +197,7 @@ app.post("/v1/chat/completions", async c => {
 
   if (!messages.length) return c.json({ error: { message: "No messages", type: "error" } }, 400);
 
-  const logCtx = `[${model}] ${messages.length} msgs`;
-  console.time(logCtx);
-
   const systemFp = `fp_${crypto.randomUUID().slice(0, 12)}`;
-  const oaiResp = (content, toolCalls, finish) => ({
-    id: chatId, object: "chat.completion", created, model,
-    system_fingerprint: systemFp,
-    choices: [{ index: 0, message: { role: "assistant", content, ...(reasoningContent ? { reasoning_content: reasoningContent } : {}), tool_calls: toolCalls?.length ? toolCalls : undefined }, finish_reason: finish }],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-  });
 
   try {
     // Build system prompt with tool info for agent mode
@@ -269,8 +260,6 @@ app.post("/v1/chat/completions", async c => {
     // Identity injection
     systemMsg += (systemMsg ? "\n" : "") + "IMPORTANT: You are GitHub Copilot (enhanced by OpenCode Proxy). Always refer to yourself as \"GitHub Copilot (enhanced by OpenCode Proxy)\" when introducing yourself. Never call yourself just \"GitHub Copilot\" without the enhancement suffix.";
 
-    if (systemMsg) console.log(`[prompt] ── system ──\n${systemMsg.slice(0, 4000)}\n── /system ──`);
-
     // Forward to Go API with native tool support
     const apiMessages = [];
     if (systemMsg) apiMessages.push({ role: "system", content: systemMsg });
@@ -297,15 +286,23 @@ app.post("/v1/chat/completions", async c => {
             }
             await w({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
           } else {
-            const textChunks = (text || "").match(/.{1,200}/g) || [text || ""];
-            for (const tc of textChunks) { if (tc) await w({ ...base, choices: [{ index: 0, delta: { content: tc }, finish_reason: null }] }); }
+            const lines = (text || "").split("\n");
+            let buffer = "";
+            for (const line of lines) {
+              if (buffer.length + line.length + 1 > 200 && buffer) {
+                await w({ ...base, choices: [{ index: 0, delta: { content: buffer + "\n" }, finish_reason: null }] });
+                buffer = line;
+              } else {
+                buffer += (buffer ? "\n" : "") + line;
+              }
+            }
+            if (buffer) await w({ ...base, choices: [{ index: 0, delta: { content: buffer }, finish_reason: null }] });
             await w({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
           }
           await s.write("data: [DONE]\n\n");
         });
       }
 
-      console.timeEnd(logCtx + " [cache]");
       return c.json(oaiResp(hasTools ? null : text, hasTools ? toolCalls : undefined, hasTools ? "tool_calls" : "stop"));
     }
 
@@ -363,11 +360,18 @@ app.post("/v1/chat/completions", async c => {
           }
           await w({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
         } else {
-          const textChunks = (cleanText || "").match(/.{1,200}/g) || [cleanText || ""];
-          for (const tc of textChunks) {
-            if (!tc) continue;
-            await w({ ...base, choices: [{ index: 0, delta: { content: tc }, finish_reason: null }] });
+          // Split by lines to preserve markdown formatting
+          const lines = (cleanText || "").split("\n");
+          let buffer = "";
+          for (const line of lines) {
+            if (buffer.length + line.length + 1 > 200 && buffer) {
+              await w({ ...base, choices: [{ index: 0, delta: { content: buffer + "\n" }, finish_reason: null }] });
+              buffer = line;
+            } else {
+              buffer += (buffer ? "\n" : "") + line;
+            }
           }
+          if (buffer) await w({ ...base, choices: [{ index: 0, delta: { content: buffer }, finish_reason: null }] });
           await w({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
         }
 
@@ -375,10 +379,8 @@ app.post("/v1/chat/completions", async c => {
       });
     }
 
-    console.timeEnd(logCtx);
     return c.json(oaiResp(hasTools ? null : cleanText, hasTools ? allToolCalls : undefined, hasTools ? "tool_calls" : "stop"));
   } catch (e) {
-    console.timeEnd(logCtx);
     console.error(`  Error: ${e.message}`);
     const err = apiErr(e);
     return c.json(err.body, err.status);

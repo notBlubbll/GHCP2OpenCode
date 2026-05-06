@@ -1,5 +1,8 @@
 # GHCP2OpenCode
 
+<img width="967" height="493" alt="image" src="https://github.com/user-attachments/assets/8eb08ce8-f934-4327-9a72-91d260ba1279" />
+
+
 <img width="1262" height="809" alt="image" src="https://github.com/user-attachments/assets/6db5f99e-94b4-4dad-a90c-7fa6069bec15" />
 
 Ollama-compatible API proxy that routes **Visual Studio 2026** Copilot Chat requests to the [OpenCode](https://opencode.ai) Go subscription API.

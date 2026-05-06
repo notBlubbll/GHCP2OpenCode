@@ -14,8 +14,11 @@ When you connect VS Copilot to this proxy, you get access to 14 Go models — in
 2. **Set your API key**
 
    ```env
-   # .env
+   # .env — single key
    OPENCODE_API_KEY=your-key
+
+   # or multiple keys with rotation
+   OPENCODE_API_KEYS=["key1","key2"]
    ```
 
 3. **Run the proxy**
@@ -71,10 +74,22 @@ All models support tool calling (agent mode). Vision-capable models are listed b
 
 | Variable | Default |
 |----------|---------|
-| `OPENCODE_API_KEY` | *(required)* |
+| `OPENCODE_API_KEY` | *(single key)* |
+| `OPENCODE_API_KEYS` | *(JSON array)* |
 | `SERVER_PORT` | `11434` |
 | `SERVER_HOST` | `127.0.0.1` |
 | `DEFAULT_MODEL` | `deepseek-v4-flash` |
+| `CACHE_ENABLED` | `true` |
+| `CACHE_MAX_SIZE` | `64` |
+| `CACHE_TTL_SEC` | `300` |
+
+### Prompt Cache
+
+Client-side LRU response cache with TTL expiration. Caches LLM responses by hashing the normalized prompt (model + messages + tools). On cache hit, replays the response as a synthetic SSE stream — zero token cost, zero latency.
+
+Inspired by [OpenCode PR #25997](https://github.com/anomalyco/opencode/pull/25997), [LLM-API-Key-Proxy](https://github.com/Mirrowel/LLM-API-Key-Proxy), and [fluxkv](https://github.com/Kushalk0677/fluxkv).
+
+Cache is cleared on server restart (in-memory).
 
 ## How It Works
 

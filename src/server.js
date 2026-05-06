@@ -424,10 +424,10 @@ app.post("/api/show", async c => {
 
 app.post("/api/pull", c => stream(c, async s => { const b = getBody(c); await s.write(JSON.stringify({ status: `pulling ${b.model ?? b.name}` }) + "\n"); await s.write(JSON.stringify({ status: "success" }) + "\n"); }));
 
-app.delete("/api/delete", c => c.json({ status: "success" }));
-app.post("/api/copy", c => c.json({ status: "success" }));
-app.post("/api/embed", c => c.json({ model: "unknown", embeddings: [[0]], total_duration: 0, load_duration: 0, prompt_eval_count: 0 }));
-app.post("/api/embeddings", c => c.json({ model: "unknown", embeddings: [[0]], total_duration: 0, load_duration: 0, prompt_eval_count: 0 }));
+app.delete("/api/delete", c => { const b = getBody(c); return c.json({ status: "success" }); });
+app.post("/api/copy", c => { const b = getBody(c); return c.json({ status: "success" }); });
+app.post("/api/embed", c => { const b = getBody(c); return c.json({ model: b.model || "unknown", embeddings: [[0]], total_duration: 0, load_duration: 0, prompt_eval_count: 0 }); });
+app.post("/api/embeddings", c => { const b = getBody(c); return c.json({ model: b.model || "unknown", embeddings: [[0]], total_duration: 0, load_duration: 0, prompt_eval_count: 0 }); });
 
 app.post("/api/chat", async c => {
   const body = getBody(c);
@@ -466,7 +466,7 @@ app.post("/api/chat", async c => {
       }
 
       const apiMessages = systemMsg ? [{ role: "system", content: systemMsg }, ...userMsgs] : userMsgs;
-      const reqBody = { model, messages: apiMessages, stream: false };
+      const reqBody = { model, messages: apiMessages, stream: false, options: body.options };
 
       const chunks = [];
       for await (const chunk of chatCompletion(reqBody)) {
@@ -477,12 +477,14 @@ app.post("/api/chat", async c => {
       const { content: cleanText, toolCalls } = vsTools?.length ? extractToolCalls(fullText) : { content: fullText, toolCalls: [] };
 
       const createdAt = new Date().toISOString();
+      const duration = Date.now() - startTime;
 
       if (body.stream === false) {
         await s.write(JSON.stringify({
           model: body.model, created_at: createdAt,
           message: { role: "assistant", content: cleanText, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) },
           done: true, done_reason: toolCalls.length ? "tool_calls" : "stop",
+          total_duration: duration * 1e6, load_duration: 0, prompt_eval_count: 0, prompt_eval_duration: 0, eval_count: 0, eval_duration: 0,
         }) + "\n");
         return;
       }
@@ -497,7 +499,7 @@ app.post("/api/chat", async c => {
           await s.write(JSON.stringify({ model: body.model, created_at: createdAt, message: { role: "assistant", content: w }, done: false }) + "\n");
         }
       }
-      await s.write(JSON.stringify({ model: body.model, created_at: createdAt, message: { role: "assistant", content: "" }, done: true, done_reason: toolCalls.length ? "tool_calls" : "stop" }) + "\n");
+      await s.write(JSON.stringify({ model: body.model, created_at: createdAt, message: { role: "assistant", content: "" }, done: true, done_reason: toolCalls.length ? "tool_calls" : "stop", total_duration: duration * 1e6, load_duration: 0, prompt_eval_count: 0, prompt_eval_duration: 0, eval_count: 0, eval_duration: 0 }) + "\n");
 
     } catch (e) {
       err(`  Error: ${e.message}`);
@@ -508,6 +510,7 @@ app.post("/api/chat", async c => {
 
 app.post("/api/generate", async c => {
   const body = getBody(c);
+  const startTime = Date.now();
   return stream(c, async s => {
     try {
       const req = { model: mapModel(body.model), messages: [...(body.system ? [{ role: "system", content: body.system }] : []), { role: "user", content: body.prompt, images: body.images }], options: body.options, stream: body.stream };
@@ -517,7 +520,8 @@ app.post("/api/generate", async c => {
         if (body.stream === false) continue;
         await s.write(JSON.stringify({ model: body.model, created_at: chunk.created_at, response: chunk.message?.content || "", done: false }) + "\n");
       }
-      await s.write(JSON.stringify({ model: body.model, created_at: new Date().toISOString(), response: body.stream === false ? full : "", done: true, context: null, total_duration: 0, load_duration: 0, prompt_eval_count: 0, prompt_eval_duration: 0, eval_count: full.split(/\s+/).length, eval_duration: 0 }) + "\n");
+      const duration = Date.now() - startTime;
+      await s.write(JSON.stringify({ model: body.model, created_at: new Date().toISOString(), response: body.stream === false ? full : "", done: true, done_reason: "stop", context: null, total_duration: duration * 1e6, load_duration: 0, prompt_eval_count: 0, prompt_eval_duration: 0, eval_count: 0, eval_duration: 0 }) + "\n");
     } catch (e) {
       err(`  Error: ${e.message}`);
       await s.write(JSON.stringify({ model: body.model, created_at: new Date().toISOString(), response: `Error: ${e.message}`, done: true }) + "\n");

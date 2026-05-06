@@ -1,11 +1,5 @@
 # GHCP2OpenCode
 
-```
-┏┓┓┏┏┓┏┓┏┓┏┓┏┓
-┃┓┣┫┃ ┃┃┏┛┃┃┃
-┗┛┛┗┗┛┣┛┗━┗┛┗┛
-```
-
 <img width="1262" height="809" alt="image" src="https://github.com/user-attachments/assets/6db5f99e-94b4-4dad-a90c-7fa6069bec15" />
 
 Ollama-compatible API proxy that routes **Visual Studio 2026** Copilot Chat requests to the [OpenCode](https://opencode.ai) Go subscription API.
@@ -125,4 +119,4 @@ Set `OPENCODE_API_KEYS` as a JSON array. On 401/429 errors the failed key is coo
 
 - [OpenCode PR #25997](https://github.com/anomalyco/opencode/pull/25997) — response caching model
 - [LLM-API-Key-Proxy](https://github.com/Mirrowel/LLM-API-Key-Proxy) — multi-provider proxy patterns
-- [fluxkv](https://github.com/Kushalk0677/fluxkv) — key-value store concepts
+- [Ollama](https://github.com/ollama/ollama) — API compatibility reference

@@ -2,10 +2,11 @@
 
 <img width="1262" height="809" alt="image" src="https://github.com/user-attachments/assets/6db5f99e-94b4-4dad-a90c-7fa6069bec15" />
 
-
 Ollama-compatible API proxy that routes VS Copilot Chat requests to the [OpenCode](https://opencode.ai) Go subscription API.
 
 When you connect VS Copilot to this proxy, you get access to 14 Go models — including DeepSeek, Qwen, Kimi, MiniMax, GLM, and MiMo — with full agent mode (tool calling) support.
+
+> **Tested with Visual Studio 2026**
 
 ## Quick Start
 
@@ -25,6 +26,15 @@ When you connect VS Copilot to this proxy, you get access to 14 Go models — in
    ```
 
 4. **Configure VS Code** — set `github.copilot.chat.advanced.debug.overrideProxyUrl` to `http://localhost:3000` and `overrideEngineUrl` to `http://localhost:3000/v1`
+
+### Connect via Ollama
+
+You can register the proxy as an Ollama instance using the project port:
+
+```json
+// settings.json
+"ollama.endpoint": "http://localhost:3000"
+```
 
 ## Endpoints
 

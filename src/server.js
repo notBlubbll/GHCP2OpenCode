@@ -3,7 +3,13 @@ import { stream } from "hono/streaming";
 import { config, getModels, resolveModel, chatCompletion, APIError } from "./opencode-client.js";
 import { check as cacheCheck, store as cacheStore, cacheKey } from "./cache.js";
 
-if (!(config.apiKey || Bun.env.OPENCODE_API_KEYS)) { console.error("FATAL: OPENCODE_API_KEY or OPENCODE_API_KEYS not set"); process.exit(1); }
+// ── Logging ──
+
+const ts = () => new Date().toLocaleTimeString("en-US", { hour12: false });
+const log = (msg) => process.stdout.write(`\x1b[90m${ts()}\x1b[0m ${msg}\n`);
+const err = (msg) => process.stderr.write(`\x1b[90m${ts()}\x1b[0m \x1b[31m${msg}\x1b[0m\n`);
+
+if (!(config.apiKey || Bun.env.OPENCODE_API_KEYS)) { err("OPENCODE_API_KEY or OPENCODE_API_KEYS not set"); process.exit(1); }
 
 const app = new Hono();
 
@@ -381,7 +387,7 @@ app.post("/v1/chat/completions", async c => {
 
     return c.json(oaiResp(hasTools ? null : cleanText, hasTools ? allToolCalls : undefined, hasTools ? "tool_calls" : "stop"));
   } catch (e) {
-    console.error(`  Error: ${e.message}`);
+    err(`  Error: ${e.message}`);
     const err = apiErr(e);
     return c.json(err.body, err.status);
   }
@@ -494,7 +500,7 @@ app.post("/api/chat", async c => {
       await s.write(JSON.stringify({ model: body.model, created_at: createdAt, message: { role: "assistant", content: "" }, done: true, done_reason: toolCalls.length ? "tool_calls" : "stop" }) + "\n");
 
     } catch (e) {
-      console.error(`  Error: ${e.message}`);
+      err(`  Error: ${e.message}`);
       await s.write(JSON.stringify({ model: body.model, created_at: new Date().toISOString(), message: { role: "assistant", content: `Error: ${e.message}` }, done: true, done_reason: "error" }) + "\n");
     }
   });
@@ -513,7 +519,7 @@ app.post("/api/generate", async c => {
       }
       await s.write(JSON.stringify({ model: body.model, created_at: new Date().toISOString(), response: body.stream === false ? full : "", done: true, context: null, total_duration: 0, load_duration: 0, prompt_eval_count: 0, prompt_eval_duration: 0, eval_count: full.split(/\s+/).length, eval_duration: 0 }) + "\n");
     } catch (e) {
-      console.error(`  Error: ${e.message}`);
+      err(`  Error: ${e.message}`);
       await s.write(JSON.stringify({ model: body.model, created_at: new Date().toISOString(), response: `Error: ${e.message}`, done: true }) + "\n");
     }
   });
@@ -528,10 +534,21 @@ app.all("*", c => c.json({ error: `Not found: ${c.req.method} ${c.req.url}` }, 4
 // Pre-load model registry so display names resolve on first request
 await getModels();
 
-console.log("");
-console.log("  GHCP2OpenCode — OpenCode Go");
-console.log("  ─────────────────────────");
-console.log(`  http://${config.host}:${config.port}`);
+// Console title
+process.stdout.write("\x1b]2;GHCP2OpenCode — OpenCode Go Proxy\x07");
 
-console.log("");
+const B = "\x1b[1m";
+const R = "\x1b[0m";
+const C = "\x1b[36m";
+const S = "\x1b[90m";
+
+log("");
+log(`${S}   ┏┓┓┏┏┓┏┓┏┓┏┓┏┓${R}`);
+log(`${C}${B}   ┃┓┣┫┃ ┃┃┏┛┃┃┃${R}`);
+log(`${C}   ┗┛┛┗┗┛┣┛┗━┗┛┗┛${R}`);
+log("");
+log(`${S}   http://${config.host}:${config.port}  │  vs2026  │  models.dev${R}`);
+log("");
+
 export default { port: config.port, hostname: config.host, fetch: app.fetch };
+

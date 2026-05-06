@@ -1,5 +1,8 @@
 # GHCP2OpenCode
 
+<img width="1262" height="809" alt="image" src="https://github.com/user-attachments/assets/6db5f99e-94b4-4dad-a90c-7fa6069bec15" />
+
+
 Ollama-compatible API proxy that routes VS Copilot Chat requests to the [OpenCode](https://opencode.ai) Go subscription API.
 
 When you connect VS Copilot to this proxy, you get access to 14 Go models — including DeepSeek, Qwen, Kimi, MiniMax, GLM, and MiMo — with full agent mode (tool calling) support.

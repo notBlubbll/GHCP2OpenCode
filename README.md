@@ -37,7 +37,7 @@ Ollama-emulating proxy that connects **Visual Studio 2026 Copilot Chat** to the 
 | Client | Status |
 |--------|--------|
 | VS 2026 Insiders | ✓ Supported |
-| VS 2026 (regular) | ✗ Needs Insiders |
+| VS 2026 (regular) | ✗ Needs Insiders or LocalPilot |
 | VS 2026 (LocalPilot) | ✓ Supported |
 | VS Code | ✓ Supported |
 | SQL Server Management Studio | ✗ No Ollama provider |

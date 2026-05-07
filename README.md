@@ -15,8 +15,8 @@ Ollama-compatible proxy that bridges **Visual Studio 2026 Copilot Chat** with th
 **Agent mode** — tool calling with free and paid models:
 
 <table><tr>
-<td><img width="400" alt="Free model agent mode" src="https://github.com/user-attachments/assets/eb27e58e-0b64-4634-a50b-ae4cf2a8dd77"></td>
-<td><img width="400" alt="Paid model agent mode" src="https://github.com/user-attachments/assets/72e41978-1da3-42d5-8ad3-73a84d88254f"></td>
+<td><img width="720" alt="Free model agent mode" src="https://github.com/user-attachments/assets/eb27e58e-0b64-4634-a50b-ae4cf2a8dd77"></td>
+<td><img width="720" alt="Paid model agent mode" src="https://github.com/user-attachments/assets/72e41978-1da3-42d5-8ad3-73a84d88254f"></td>
 </tr></table>
 
 ---

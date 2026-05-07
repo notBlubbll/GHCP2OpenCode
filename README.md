@@ -66,18 +66,32 @@ npm run node       # Node.js fallback
 4. Leave the endpoint at `http://localhost:11434` (unless your port differs)
 5. Click **Add** — VS fetches models and validates them automatically:
 
-<img width="634" height="752" alt="image" src="https://github.com/user-attachments/assets/d5810075-3f1f-4326-a6c8-89b2b0fed482" />
-
-Or Free:
-<img width="631" height="757" alt="image" src="https://github.com/user-attachments/assets/32b0be79-4664-441f-8bc4-3b154218964f" />
-
+<table><tr>
+<td><img width="634" height="752" alt="paid" src="https://github.com/user-attachments/assets/d5810075-3f1f-4326-a6c8-89b2b0fed482"></td>
+<td><img width="631" height="757" alt="free" src="https://github.com/user-attachments/assets/32b0be79-4664-441f-8bc4-3b154218964f"></td>
+</tr></table>
 
 You can now select any model from the dropdown. No model IDs to configure — the proxy resolves display names to the correct API IDs.
-Just don't select the `══ FREE: ══` or `══ PREMIUM: ══` headers... I don't know what would happen then 😅
+
+### 3. Add to VS Code
+
+1. Install GitHub Copilot extension
+2. Open Copilot Chat → model dropdown → **Manage Models**
+3. Click **Select Provider** → **Ollama**
+4. Enter `http://localhost:11434` as the endpoint
+5. Click **Add** — models appear with `[FREE]` / `[GO]` prefixes:
+
+| Prefix | Meaning |
+|--------|---------|
+| `[FREE]` | Free tier — always available, no key needed |
+| `[GO]` | Premium — requires `OPENCODE_API_KEY` in `.env` |
 
 
+in VSCode:
+<img width="1392" height="525" alt="image" src="https://github.com/user-attachments/assets/bc6a2a58-776b-4d2e-8fd8-bcf5f15b7bfa" />
 
-### 3. (Optional) Unlock paid models
+
+### 4. (Optional) Unlock paid models
 
 ```env
 # .env

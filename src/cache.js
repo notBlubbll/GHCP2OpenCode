@@ -1,3 +1,12 @@
+// Cross-runtime compatibility polyfill
+if (typeof Bun === 'undefined') {
+  globalThis.Bun = {
+    env: process.env,
+    // Add other Bun-specific globals if needed
+  };
+}
+
+
 // ── Prompt Response Cache — LRU + TTL ──
 // Inspired by https://github.com/anomalyco/opencode/pull/25997
 

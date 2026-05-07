@@ -1,6 +1,46 @@
+// 1. Bun.env bridge
+if (typeof Bun === 'undefined') {
+  globalThis.Bun = { env: process.env };
+}
+
+// 1b. Crypto polyfill (Node.js < 19)
+if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
+  const nodeCrypto = await import("node:crypto");
+  globalThis.crypto = globalThis.crypto || {};
+  globalThis.crypto.randomUUID = nodeCrypto.randomUUID;
+}
+
+// 2. Fetch Polyfill (Try native, then undici)
+if (typeof fetch === 'undefined') {
+  try {
+    const mod = await import('undici');
+    globalThis.fetch = mod.fetch;
+    globalThis.Request = mod.Request;
+    globalThis.Response = mod.Response;
+    globalThis.Headers = mod.Headers;
+    if (!globalThis.TransformStream && mod.TransformStream) {
+      globalThis.TransformStream = mod.TransformStream;
+    }
+    if (!globalThis.ReadableStream && mod.ReadableStream) {
+      globalThis.ReadableStream = mod.ReadableStream;
+    }
+  } catch (e) {
+    console.error("\n[FATAL] Missing 'undici' package. Please run: npm install undici\n");
+    process.exit(1);
+  }
+}
+
+// 2b. Stream polyfills (Node.js < 18)
+if (typeof TransformStream === 'undefined') {
+  try { const { TransformStream: TS } = await import("node:stream/web"); globalThis.TransformStream = TS; } catch {}
+}
+if (typeof ReadableStream === 'undefined') {
+  try { const { ReadableStream: RS } = await import("node:stream/web"); globalThis.ReadableStream = RS; } catch {}
+}
+
 import { Hono } from "hono";
 import { stream } from "hono/streaming";
-import { config, getModels, resolveModel, chatCompletion, APIError } from "./opencode-client.js";
+import { config, getModels, initModels, resolveModel, chatCompletion, APIError, isSeparator, isFreeTierModel, SEP_PAID, SEP_FREE, refreshModels, validateFreeModels } from "./opencode-client.js";
 import { check as cacheCheck, store as cacheStore, cacheKey } from "./cache.js";
 
 // ── Logging ──
@@ -9,28 +49,20 @@ const ts = () => new Date().toLocaleTimeString("en-US", { hour12: false });
 const log = (msg) => process.stdout.write(`\x1b[90m${ts()}\x1b[0m ${msg}\n`);
 const err = (msg) => process.stderr.write(`\x1b[90m${ts()}\x1b[0m \x1b[31m${msg}\x1b[0m\n`);
 
-if (!(config.apiKey || Bun.env.OPENCODE_API_KEYS)) { err("OPENCODE_API_KEY or OPENCODE_API_KEYS not set"); process.exit(1); }
+// No API key needed — free tier works without
 
 const app = new Hono();
 
-// Body parser that works with any Content-Type (VS Copilot sends weird variants)
-app.use("*", async (c, next) => {
-  if (c.req.method === "POST" || c.req.method === "PUT" || c.req.method === "PATCH") {
-    try {
-      const text = await c.req.raw.clone().text();
-      if (text) {
-        try { c.set("body", JSON.parse(text)); } catch { c.set("body", {}); }
-      } else {
-        c.set("body", {});
-      }
-    } catch {
-      c.set("body", {});
-    }
+// Body parser — works on Bun + raw Node.js HTTP (body pre-read)
+async function getBody(c) {
+  try {
+    const text = await c.req.text();
+    return text ? JSON.parse(text) : {};
+  } catch {
+    return {};
   }
-  await next();
-});
+}
 
-function getBody(c) { return c.get("body") || {}; }
 
 // ── Helpers ──
 
@@ -47,11 +79,7 @@ const apiErr = (e) => {
 const reasoningCache = new Map(); // model -> last reasoning_content
 
 // Ollama -> Go model mappings (what VS Copilot sends vs what Go API expects)
-const MODEL_MAP = {
-  "deepseek-chat":         "deepseek-v4-flash",
-  "deepseek/deepseek-chat": "deepseek-v4-flash",
-  "deepseek/deepseek-chat:free": "deepseek-v4-flash",
-};
+const MODEL_MAP = {};
 
 function mapModel(name) {
   const clean = (name || "").split(":")[0].trim();
@@ -114,53 +142,46 @@ function extractToolCalls(text) {
 
 app.get("/", c => c.json({ service: "GHCP2OpenCode", status: "running" }));
 
-app.get("/api/tags", async c => {
+app.get("/api/tags", handleTags);
+app.get("/api/list", handleTags);
+
+async function handleTags(c) {
+  if (Date.now() - _lastRefresh > 60000) {
+    _lastRefresh = Date.now();
+    await refreshModels();
+  }
+  
+  const goModels = await getModels();
   const now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
   const seen = new Set();
   const models = [];
 
-  // VS-recognized Ollama cloud model names -> maps to Go models
-  const cloudModels = [
-    ["deepseek/deepseek-chat", "deepseek-v4-flash"],
-    ["deepseek/deepseek-chat:free", "deepseek-v4-flash"],
-    ["deepseek-v4-flash", "deepseek-v4-flash"],
-  ];
-
-  const goModels = await getModels();
-
-  for (const [name, goId] of cloudModels) {
-    if (seen.has(goId)) continue;
-    seen.add(goId);
-    const info = resolveModel(goId);
-
-    models.push({
-      name: info.name, model: goId,
-      modified_at: now, size: 0, digest: "",
-      details: {
-        parent_model: "", format: "", family: info.name, families: null, parameter_size: "", quantization_level: "",
-      },
-    });
-  }
-
-  // Go models directly
   for (const m of goModels) {
     const id = m.model.replace(":latest", "");
+    const sep = isSeparator(m.model);
     if (seen.has(id)) continue;
     seen.add(id);
 
     models.push({
       name: m.name, model: id,
-      modified_at: now, size: 0, digest: "",
+      modified_at: now, size: m.size || 0,
       details: {
-        parent_model: "", format: "", family: m.details?.family || m.name, families: null, parameter_size: "", quantization_level: "",
+        parent_model: m.details?.parent_model || "",
+        format: m.details?.format || "gguf",
+        ...(sep ? {} : { family: id }),
+        parameter_size: sep ? "" : (m.details?.parameter_size || ""),
+        quantization_level: m.details?.quantization_level || "F16",
       },
     });
   }
 
-  return c.json({ models: models.sort((a, b) => a.name.localeCompare(b.name)) });
-});
+  log(`/api/tags → ${models.length} models`);
+  return c.json({ models });
+}
 
 app.get("/api/version", c => c.json({ version: "0.5.7" }));
+
+let _lastRefresh = 0;
 app.get("/api/ps", c => c.json({ models: [] }));
 
 // ── OpenAI-compatible v1 endpoints (VS Copilot uses these) ──
@@ -170,13 +191,13 @@ app.get("/v1/models", async c => {
   const data = [];
 
   // VS-recognized cloud model names
-  const cloudIds = ["deepseek/deepseek-chat", "deepseek/deepseek-chat:free", "deepseek-chat"];
+  const cloudIds = [];
   for (const id of cloudIds) {
     data.push({ id, object: "model", created: ~~(Date.now() / 1000), owned_by: "opencode-go" });
   }
   // Go model IDs
   for (const m of models) {
-    const id = m.name.replace(":latest", "");
+    const id = m.model.replace(":latest", "");
     data.push({ id, object: "model", created: ~~(Date.now() / 1000), owned_by: "opencode-go" });
   }
 
@@ -184,7 +205,7 @@ app.get("/v1/models", async c => {
 });
 
 app.post("/v1/chat/completions", async c => {
-  const body = getBody(c);
+  const body = await getBody(c);
   const model = body.model || config.defaultModel;
   const messages = body.messages || [];
   const streamMode = body.stream === true;
@@ -256,7 +277,7 @@ app.post("/v1/chat/completions", async c => {
     }
 
     // Identity injection
-    systemMsg += (systemMsg ? "\n" : "") + "IMPORTANT: You are GitHub Copilot (enhanced by OpenCode Proxy). Always refer to yourself as \"GitHub Copilot (enhanced by OpenCode Proxy)\" when introducing yourself. Never call yourself just \"GitHub Copilot\" without the enhancement suffix.";
+    systemMsg += (systemMsg ? "\n" : "") + `IMPORTANT: You are GitHub Copilot (enhanced by OpenCode Proxy) running the ${goModel} model. When asked what model you are or what model you're running, respond with the actual model: "${goModel}" via OpenCode Proxy. Always refer to yourself as "GitHub Copilot (enhanced by OpenCode Proxy)" when introducing yourself. Never call yourself just "GitHub Copilot" without the enhancement suffix.`;
 
     // Forward to Go API with native tool support
     const apiMessages = [];
@@ -380,16 +401,17 @@ app.post("/v1/chat/completions", async c => {
     return c.json(oaiResp(hasTools ? null : cleanText, hasTools ? allToolCalls : undefined, hasTools ? "tool_calls" : "stop"));
   } catch (e) {
     err(`  Error: ${e.message}`);
-    const err = apiErr(e);
-    return c.json(err.body, err.status);
+    const errResp = apiErr(e);
+    return c.json(errResp.body, errResp.status);
   }
 });
 
 // ── Ollama-native endpoints ──
 
 app.post("/api/show", async c => {
-  const b = getBody(c);
+  const b = await getBody(c);
   const raw = (b.model ?? "").split(":")[0].trim();
+  if (isSeparator(raw)) return c.json({ error: "This is a category header, not a model." }, 400);
   const goId = mapModel(raw);
   const info = resolveModel(goId);
   const caps = ["completion", "tools"];
@@ -418,15 +440,15 @@ app.post("/api/show", async c => {
   });
 });
 
-app.post("/api/pull", c => stream(c, async s => { const b = getBody(c); await s.write(JSON.stringify({ status: `pulling ${b.model ?? b.name}` }) + "\n"); await s.write(JSON.stringify({ status: "success" }) + "\n"); }));
+app.post("/api/pull", c => stream(c, async s => { const b = await getBody(c); await s.write(JSON.stringify({ status: `pulling ${b.model ?? b.name}` }) + "\n"); await s.write(JSON.stringify({ status: "success" }) + "\n"); }));
 
-app.delete("/api/delete", c => { const b = getBody(c); return c.json({ status: "success" }); });
-app.post("/api/copy", c => { const b = getBody(c); return c.json({ status: "success" }); });
-app.post("/api/embed", c => { const b = getBody(c); return c.json({ model: b.model || "unknown", embeddings: [[0]], total_duration: 0, load_duration: 0, prompt_eval_count: 0 }); });
-app.post("/api/embeddings", c => { const b = getBody(c); return c.json({ model: b.model || "unknown", embeddings: [[0]], total_duration: 0, load_duration: 0, prompt_eval_count: 0 }); });
+app.delete("/api/delete", async c => { const b = await getBody(c); return c.json({ status: "success" }); });
+app.post("/api/copy", async c => { const b = await getBody(c); return c.json({ status: "success" }); });
+app.post("/api/embed", async c => { const b = await getBody(c); return c.json({ model: b.model || "unknown", embeddings: [[0]], total_duration: 0, load_duration: 0, prompt_eval_count: 0 }); });
+app.post("/api/embeddings", async c => { const b = await getBody(c); return c.json({ model: b.model || "unknown", embeddings: [[0]], total_duration: 0, load_duration: 0, prompt_eval_count: 0 }); });
 
 app.post("/api/chat", async c => {
-  const body = getBody(c);
+  const body = await getBody(c);
   const startTime = Date.now();
 
   return stream(c, async s => {
@@ -460,6 +482,8 @@ app.post("/api/chat", async c => {
         const toolDesc = vsTools.map(t => `${t.function.name}: ${t.function.description || ""}`).join("\n");
         systemMsg += (systemMsg ? "\n\n" : "") + `Tools: ${toolDesc}\nTo use a tool, reply with:\n\`\`\`tool\n{"name": "...", "arguments": {...}}\n\`\`\`\nOr create files with:\n## \`path/file.ext\`\n\`\`\`lang\ncontent\n\`\`\``;
       }
+
+      systemMsg += (systemMsg ? "\n" : "") + `IMPORTANT: You are GitHub Copilot (enhanced by OpenCode Proxy) running the ${model} model. When asked what model you are or what model you're running, respond with the actual model: "${model}" via OpenCode Proxy.`;
 
       const apiMessages = systemMsg ? [{ role: "system", content: systemMsg }, ...userMsgs] : userMsgs;
       const reqBody = { model, messages: apiMessages, stream: false, options: body.options };
@@ -509,7 +533,7 @@ app.post("/api/chat", async c => {
 });
 
 app.post("/api/generate", async c => {
-  const body = getBody(c);
+  const body = await getBody(c);
   const startTime = Date.now();
   return stream(c, async s => {
     try {
@@ -529,6 +553,14 @@ app.post("/api/generate", async c => {
   });
 });
 
+// ── Stop server ──
+
+app.get("/stop", c => {
+  log("Shutdown requested via /stop");
+  setTimeout(() => process.exit(0), 100);
+  return c.json({ status: "shutting down" });
+});
+
 // ── Catch-all ──
 
 app.all("*", c => c.json({ error: `Not found: ${c.req.method} ${c.req.url}` }, 404));
@@ -536,7 +568,7 @@ app.all("*", c => c.json({ error: `Not found: ${c.req.method} ${c.req.url}` }, 4
 // ── Start ──
 
 // Pre-load model registry so display names resolve on first request
-const models = await getModels();
+const models = await initModels();
 
 // Console title
 process.stdout.write("\x1b]2;GHCP2OpenCode — OpenCode Go Proxy\x07");
@@ -555,19 +587,124 @@ const line = (l) => {
 };
 const hr = S + "\u2500".repeat(boxW - 2) + R;
 
+const hasPaid = models.some(m => m.model === `${SEP_PAID}:latest`);
+if (hasPaid) log("Go API key valid - free & paid models");
+else log("No Go API key - free mode only");
+
 P("");
 P(W + "\u256d" + hr + W + "\u256e" + R);
-P(line(C + B + "┏┓┓┏┏┓┏┓┏┓┏┓┏┓" + R));
-P(line(C + B + "┃┓┣┫┃ ┃┃┏┛┃┃┃ " + R + " " + S + "github copilot proxy" + R));
-P(line(C + B + "┗┛┛┗┗┛┣┛┗━┗┛┗┛" + R));
+P(line(C + B + "\u250f\u2513\u2513\u250f\u250f\u2513\u250f\u2513\u250f\u2513\u250f\u2513\u250f\u2513" + R));
+P(line(C + B + "\u2503\u2513\u2523\u252b\u2503 \u2503\u2503\u250f\u251b\u2503\u2503\u2503 " + R + " " + S + "github copilot proxy" + (hasPaid ? " \x1b[32m(free&go mode)\x1b[90m" : " \x1b[33m(free mode)\x1b[90m") + R));
+P(line(C + B + "\u2517\u251b\u251b\u2517\u2517\u251b\u2523\u251b\u2517\u2501\u2517\u251b\u2517\u251b" + R));
 P(W + "\u251c" + hr + W + "\u2524" + R);
-P(line(S + "http://" + config.host + ":" + config.port + "  │  vs2026  │  models.dev" + R));
+const portLabel = config.port === 11434 ? `port: ${config.port} (default)` : `port: ${config.port}`;
+P(line(S + portLabel + "  │  vs2026  │  models.dev" + R));
 P(W + "\u251c" + hr + W + "\u2524" + R);
-for (let i = 0; i < models.length; i += 3) {
-  P(line(models.slice(i, i + 3).map(m => m.name.padEnd(20)).join("")));
+
+// Split models into free / paid by separators
+const freeStart = models.findIndex(m => m.model === `${SEP_FREE}:latest`);
+const paidStart = models.findIndex(m => m.model === `${SEP_PAID}:latest`);
+const freeModels = models.slice(freeStart + 1, paidStart >= 0 ? paidStart : models.length);
+const paidModels = paidStart >= 0 ? models.slice(paidStart + 1) : [];
+
+function printTable(list) {
+  for (const m of list) {
+    const name = m.name.length > 20 ? m.name.slice(0, 19) + "\u2026" : m.name.padEnd(20);
+    const id = (m.model.replace(":latest", "")).length > 24
+      ? (m.model.replace(":latest", "")).slice(0, 23) + "\u2026"
+      : (m.model.replace(":latest", "")).padEnd(24);
+    const params = m.maxParams ? m.maxParams.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".").padEnd(9) : "-".padEnd(9);
+    P(line(S + name + " \u2502 " + id + " \u2502 " + params + R));
+  }
+}
+
+if (freeModels.length) {
+  P(line(S + "Free: " + S + `(${freeModels.length})` + R));
+  P(line(S + "Name".padEnd(20) + " \u2502 " + "ID".padEnd(24) + " \u2502 " + "Context" + R));
+  printTable(freeModels);
+}
+
+if (hasPaid) {
+  P(line(""));
+  P(line(S + "Premium: " + S + `(${paidModels.length})` + R));
+  P(line(S + "Name".padEnd(20) + " \u2502 " + "ID".padEnd(24) + " \u2502 " + "Context" + R));
+  printTable(paidModels);
 }
 P(W + "\u2570" + hr + W + "\u256f" + R);
 P("");
 
-export default { port: config.port, hostname: config.host, fetch: app.fetch };
+let serverRef = null;
+
+// Start HTTP server
+if (typeof Bun !== 'undefined' && typeof Bun.serve === 'function') {
+  serverRef = Bun.serve({ port: config.port, hostname: config.host, fetch: app.fetch });
+  log(`Listening on http://${config.host}:${serverRef.port}`);
+} else if (typeof process !== 'undefined' && process.versions?.node) {
+  const http = await import("http");
+  serverRef = http.createServer({}, (req, res) => {
+    let raw = "";
+    req.on("data", chunk => raw += chunk);
+    req.on("end", () => {
+      // Build web Request with pre-read body
+      const headers = new Headers();
+      for (const [k, v] of Object.entries(req.headers)) {
+        if (v) headers.set(k, Array.isArray(v) ? v.join(", ") : v);
+      }
+      const url = `http://${req.headers.host || config.host}${req.url}`;
+      const init = { method: req.method, headers };
+      if (raw && (req.method === "POST" || req.method === "PUT" || req.method === "PATCH")) {
+        init.body = raw;
+      }
+      const webReq = new Request(url, init);
+
+      app.fetch(webReq).then(webRes => {
+        res.statusCode = webRes.status;
+        webRes.headers.forEach((v, k) => res.setHeader(k, v));
+        if (webRes.body) {
+          const reader = webRes.body.getReader();
+          const pump = () => reader.read().then(({ done, value }) => {
+            if (done) { res.end(); return; }
+            res.write(value);
+            pump();
+          });
+          pump();
+        } else {
+          res.end();
+        }
+      }).catch(err => {
+        res.statusCode = 500;
+        res.end(String(err));
+      });
+    });
+  });
+  await new Promise((resolve) => {
+    serverRef.listen(config.port, config.host, () => {
+      log(`Listening on http://${config.host}:${config.port}`);
+      resolve();
+    });
+  });
+}
+
+// Console commands
+if (process.stdin.isTTY && typeof process.stdin.on === "function") {
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (data) => {
+    const cmd = data.trim().toLowerCase();
+    if (cmd === "stop" || cmd === "s" || cmd === "exit" || cmd === "e" || cmd === "quit" || cmd === "q") {
+      log("Shutting down...");
+      if (serverRef?.stop) serverRef.stop(true);
+      else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(() => process.exit(0)); }
+      setTimeout(() => process.exit(0), 2000);
+    } else if (cmd === "restart" || cmd === "r") {
+      log("Restarting...");
+      if (serverRef?.stop) serverRef.stop(true);
+      else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(() => process.exit(42)); }
+      setTimeout(() => process.exit(42), 2000);
+    } else if (cmd) {
+      err(`Unknown command: ${cmd}`);
+    }
+  });
+  process.stdin.resume();
+  log("\x1b[34mr/restart\x1b[90m | \x1b[34ms/stop\x1b[90m | \x1b[34me/exit\x1b[0m");
+}
 

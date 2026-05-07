@@ -15,6 +15,19 @@ const FREE_TIER_MODELS = [
   { id: "trinity-large-preview-free", name: "Trinity Large Preview", family: "trinity", tools: true, vision: true },
 ];
 
+function fmtParamSize(val) {
+  if (!val) return "";
+  const s = String(val).trim();
+  // Already formatted (contains M, B, K, etc.)
+  if (/[MBK]/.test(s.toUpperCase())) return s;
+  const n = parseFloat(s);
+  if (isNaN(n)) return "";
+  if (n >= 1e9) return `${(n / 1e9).toFixed(n >= 1e10 ? 0 : 1)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(n >= 1e7 ? 0 : 1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+  return s;
+}
+
 function buildFreeTierModels() {
   const now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
   const allModels = { ...((_mdCache && _mdCache["opencode-go"]?.models) || {}), ...((_mdCache && _mdCache["opencode"]?.models) || {}) };
@@ -25,7 +38,7 @@ function buildFreeTierModels() {
   });
   return active
     .slice()
-    .sort((a, b) => a.name.localeCompare(b.name))
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }))
     .map(m => {
       const mdModel = allModels[m.id];
       return {
@@ -40,7 +53,7 @@ function buildFreeTierModels() {
         format: "gguf",
         family: m.family,
         families: [m.family],
-        parameter_size: "",
+              parameter_size: fmtParamSize(mdModel?.parameter_size || mdModel?.parameter_count) || "",
         quantization_level: "F16",
         tools: m.tools,
         vision: m.vision,
@@ -106,7 +119,8 @@ export function isFreeTierModel(id) {
 
 export function isSeparator(id) {
   const clean = (id || "").split(":")[0].trim().toLowerCase();
-  return clean === SEP_FREE || clean === SEP_PAID;
+  return clean === SEP_FREE || clean === SEP_PAID ||
+    clean === "== free ==" || clean === "== premium ==";
 }
 
 const SEP_FREE = "(free)";
@@ -129,6 +143,13 @@ const config = {
   get defaultTemperature() {
     const t = parseFloat(Bun.env.DEFAULT_TEMPERATURE);
     return isNaN(t) ? null : t;
+  },
+  get requestLog() {
+    const v = Bun.env.REQUEST_LOG;
+    return v === undefined ? true : v === "true" || v === "1";
+  },
+  get hideFree() {
+    return Bun.env.HIDE_FREE === "true" || Bun.env.HIDE_FREE === "1";
   },
 };
 
@@ -206,17 +227,23 @@ function keyHash() {
   if (Bun.env.OPENCODE_API_KEYS) {
     try { keys.push(...JSON.parse(Bun.env.OPENCODE_API_KEYS)); } catch {}
   }
+  // Also parse .env file directly (Node.js might not auto-load it)
   try {
     if (_fs) {
-      const envRaw = _fs.readFileSync(".env", "utf8");
-      for (const line of envRaw.split("\n")) {
-        const m = line.match(/^\s*OPENCODE_API_KEYS?\s*=\s*(.+)/);
-        if (m) {
-          const val = m[1].replace(/^["']|["']$/g, "").trim();
-          if (val.startsWith("[")) {
-            try { keys.push(...JSON.parse(val)); } catch { keys.push(val); }
-          } else if (val.length > 5) {
-            keys.push(val);
+      const envPath = `${process?.cwd?.() || "."}/.env`;
+      if (_fs.existsSync(envPath)) {
+        const envRaw = _fs.readFileSync(envPath, "utf8");
+        for (const line of envRaw.split("\n")) {
+          const m = line.match(/^\s*OPENCODE_API_KEYS?\s*=\s*(.+)/);
+          if (m) {
+            const val = m[1].replace(/^["']|["']$/g, "").trim();
+            if (val && val !== '""' && val !== "''") {
+              if (val.startsWith("[")) {
+                try { keys.push(...JSON.parse(val)); } catch { keys.push(val); }
+              } else {
+                keys.push(val);
+              }
+            }
           }
         }
       }
@@ -289,10 +316,6 @@ function loadModelsFromDisk() {
     }
     const data = JSON.parse(_fs.readFileSync(getDiskPath(), "utf8"));
     if (data._models?.length) {
-      if (data._keyHash !== undefined && data._keyHash !== keyHash()) {
-        console.log("[models] API key changed, ignoring disk cache");
-        return false;
-      }
       _models = data._models;
       _modelMap = data._modelMap || {};
       _nameToId = data._nameToId || {};
@@ -307,6 +330,7 @@ async function saveModelsToDisk() {
   try {
     await _loadFs();
     const path = getDiskPath();
+    if (!_models?.length) return;
     _fs.writeFileSync(path, JSON.stringify({ _models, _modelMap, _nameToId, _keyHash: keyHash() }));
     console.log(`[cache] saved to ${path}`);
   } catch (e) {
@@ -316,11 +340,18 @@ async function saveModelsToDisk() {
 
 async function fetchModelsDev() {
   if (_mdCache) return _mdCache;
-  const resp = await fetch("https://models.dev/api.json");
-  if (!resp.ok) return {};
-  const data = await resp.json();
-  _mdCache = data;
-  return data;
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 5000);
+    const resp = await fetch("https://models.dev/api.json", { signal: ctrl.signal });
+    clearTimeout(t);
+    if (!resp.ok) return {};
+    const data = await resp.json();
+    _mdCache = data;
+    return data;
+  } catch {
+    return {};
+  }
 }
 
 async function fetchModels() {
@@ -332,8 +363,10 @@ async function fetchModels() {
 
   // Always start with free tier models (alphabetical)
   const models = [];
-  models.push(sepModel(SEP_FREE, "\u2550\u2550 FREE: \u2550\u2550"));
-  models.push(...buildFreeTierModels());
+  if (!config.hideFree) {
+    models.push(sepModel(SEP_FREE, "== FREE =="));
+    models.push(...buildFreeTierModels());
+  }
   const freeSet = new Set(FREE_TIER_MODELS.map(m => m.id));
   let paidFrom = "";
   let paidCount = 0;
@@ -365,7 +398,7 @@ async function fetchModels() {
               format: "gguf",
               family: displayName,
               families: [displayName],
-              parameter_size: mdModel?.parameter_size || mdModel?.parameter_count || "",
+        parameter_size: fmtParamSize(mdModel?.parameter_size || mdModel?.parameter_count) || "",
               quantization_level: "F16",
               tools,
               vision,
@@ -382,11 +415,11 @@ async function fetchModels() {
           _nameToId[displayName.toLowerCase()] = m.id;
         }
 
-        paidModels.sort((a, b) => a.name.localeCompare(b.name));
+        paidModels.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
         paidCount = paidModels.length;
         paidFrom = "OpenCode API";
 
-        models.push(sepModel(SEP_PAID, "\u2550\u2550 PREMIUM: \u2550\u2550"));
+        models.push(sepModel(SEP_PAID, "== PREMIUM =="));
         models.push(...paidModels);
       } catch (e) {
         console.error(`[models] Failed to build paid models: ${e.message}`);
@@ -401,9 +434,9 @@ async function fetchModels() {
 
   _models = models;
   const elapsed = Date.now() - start;
-  const freeCount = FREE_TIER_MODELS.length;
+  const freeCount = config.hideFree ? 0 : FREE_TIER_MODELS.length;
   const totalReal = models.filter(m => !isSeparator(m.model)).length;
-  const paidLabel = paidCount > 0 ? ` (${freeCount} free + ${paidCount} paid)` : "";
+  const paidLabel = paidCount > 0 ? (freeCount > 0 ? ` (${freeCount} free + ${paidCount} paid)` : ` (${paidCount} paid)`) : "";
   const sourceLabel = paidFrom ? ` from ${paidFrom}` : "";
   console.log(`[models] ${totalReal} total${paidLabel}${sourceLabel} (${elapsed}ms)`);
   return _models;
@@ -412,20 +445,22 @@ async function fetchModels() {
 export async function initModels() {
   await _loadFs();
   await _loadCrypto();
-  const changed = await checkKeyChanged();
-  if (!changed && loadModelsFromDisk()) {
-    console.log("[models] keys unchanged, using disk cache");
-    return _models;
+  await checkKeyChanged();
+  // Always try disk cache first — better than empty
+  if (loadModelsFromDisk()) {
+    console.log("[models] using disk cache, updating in background");
+  } else {
+    console.log("[models] no cache — building from built-in data");
+    await fetchModels();
   }
-  // No valid cache, or key changed — fresh fetch
-  if (!changed) console.log("[models] no cache or key hash missing — fresh fetch");
-  await Promise.all([
-    validateFreeModels(),
-    fetchGoModelsRaw(),
-  ]);
-  await fetchModels();
-  await saveModelsToDisk();
-  saveKeyHashToDisk(keyHash());
+  // Fetch paid models async (don't block startup)
+  fetchGoModelsRaw().then(async () => {
+    if (_paidGoData?.data?.length) {
+      await fetchModels();
+      await saveModelsToDisk();
+      saveKeyHashToDisk(keyHash());
+    }
+  });
   return _models;
 }
 
@@ -446,27 +481,18 @@ async function fetchGoModelsRaw() {
 
   for (const k of keys) {
     try {
-      // Validate key with a real chat request (models endpoint is public)
-      const ping = await fetch(`${config.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${k}` },
-        body: JSON.stringify({ model: "deepseek-v4-flash", messages: [{ role: "user", content: "hi" }], max_tokens: 1, stream: false }),
-      });
-      if (ping.status === 401) {
-        console.error(`[models] Go key invalid (${k.slice(0, 8)}...)`);
-        continue;
-      }
-
+      console.log(`[models] fetching ${config.baseUrl}/models ...`);
       const goResp = await fetch(`${config.baseUrl}/models`, {
         headers: { Authorization: `Bearer ${k}` },
       });
+      console.log(`[models] fetch done — status ${goResp.status}`);
       if (goResp.ok) {
         _paidGoData = await goResp.json();
-        console.log(`[models] Go key valid (${k.slice(0, 8)}...) — ${_paidGoData?.data?.length || 0} paid models`);
+        console.log(`[models] Go key valid — ${_paidGoData?.data?.length || 0} paid models`);
         return _paidGoData;
       }
     } catch (e) {
-      console.error(`[models] Go API error for key ${k.slice(0, 8)}...: ${e.message}`);
+      console.error(`[models] Go API error: ${e.message}`);
     }
   }
 
@@ -479,12 +505,19 @@ export async function refreshModels() {
   console.log("[models] refreshing from API...");
   const start = Date.now();
   await checkKeyChanged();
+  if (config.hideFree) console.log("[models] HIDE_FREE=true — skipping free model validation");
   await Promise.all([
-    validateFreeModels(),
+    config.hideFree ? Promise.resolve() : validateFreeModels(),
     fetchGoModelsRaw(),
   ]);
-  await fetchModels();
-  await saveModelsToDisk();
+  if (_paidGoData) {
+    await fetchModels();
+    await saveModelsToDisk();
+  } else if (!loadModelsFromDisk()) {
+    _models = [];
+    await fetchModels();
+  }
+  saveKeyHashToDisk(keyHash());
   console.log(`[models] refresh done (${Date.now() - start}ms)`);
 }
 
@@ -544,7 +577,9 @@ async function zenRequest(endpoint, body, opts = {}) {
   const lastMsg = body.messages?.[body.messages.length - 1];
   const prompt = typeof lastMsg?.content === "string" ? lastMsg.content : "";
   const preview = prompt.replace(/\s+/g, " ").trim().slice(0, 60);
-  console.log(`[zen] ${body.model || "?"}${isFree ? " (free)" : ""} — "${preview}${prompt.length > 60 ? "\u2026" : ""}"`);
+  if (config.requestLog) {
+    console.log(`[zen] ${body.model || "?"}${isFree ? " (free)" : ""} — "${preview}${prompt.length > 60 ? "\u2026" : ""}"`);
+  }
 
   const headers = {
     "Content-Type": "application/json",

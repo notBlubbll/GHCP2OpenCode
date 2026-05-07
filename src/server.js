@@ -40,6 +40,7 @@ if (typeof ReadableStream === 'undefined') {
 
 import { Hono } from "hono";
 import { stream } from "hono/streaming";
+import { cors } from "hono/cors";
 import { config, getModels, initModels, resolveModel, chatCompletion, APIError, isSeparator, isFreeTierModel, SEP_PAID, SEP_FREE, refreshModels, validateFreeModels } from "./opencode-client.js";
 import { check as cacheCheck, store as cacheStore, cacheKey } from "./cache.js";
 
@@ -49,9 +50,23 @@ const ts = () => new Date().toLocaleTimeString("en-US", { hour12: false });
 const log = (msg) => process.stdout.write(`\x1b[90m${ts()}\x1b[0m ${msg}\n`);
 const err = (msg) => process.stderr.write(`\x1b[90m${ts()}\x1b[0m \x1b[31m${msg}\x1b[0m\n`);
 
+// Auto-create .env if missing
+(async () => {
+  try {
+    const fs = await import("node:fs");
+    if (!fs.existsSync(".env")) {
+      fs.writeFileSync(".env", "# OpenCode API key (optional — free models work without it)\n# Get yours at: https://opencode.ai\nOPENCODE_API_KEY=\n\n# Multi-key rotation (optional)\n# OPENCODE_API_KEYS=[\\\"key1\\\",\\\"key2\\\"]\n\n# Hide free models from the list (default false)\nHIDE_FREE=false\n");
+      log("Created .env — add your OPENCODE_API_KEY there to unlock paid models");
+    }
+  } catch { /* fs not available, ignore */ }
+})();
+
 // No API key needed — free tier works without
 
 const app = new Hono();
+
+// CORS — VS Code Copilot sends requests from file:// / vscode-file:// origins
+app.use(cors({ origin: "*", allowMethods: ["GET", "POST", "DELETE", "OPTIONS"], allowHeaders: ["Content-Type", "Authorization"] }));
 
 // Body parser — works on Bun + raw Node.js HTTP (body pre-read)
 async function getBody(c) {
@@ -75,6 +90,11 @@ const apiErr = (e) => {
   return { status, body: { error: { message: e.message, type, code, ...(param ? { param } : {}) } } };
 };
 
+const isVSCode = (c) => {
+  const ua = c.req.header("User-Agent") || "";
+  return /githubcopilot/i.test(ua);
+};
+
 // Cache reasoning_content from DeepSeek thinking mode (VS doesn't relay it)
 const reasoningCache = new Map(); // model -> last reasoning_content
 
@@ -82,10 +102,11 @@ const reasoningCache = new Map(); // model -> last reasoning_content
 const MODEL_MAP = {};
 
 function mapModel(name) {
-  const clean = (name || "").split(":")[0].trim();
+  let clean = (name || "").split(":")[0].trim();
+  clean = clean.replace(/^\s*\[(?:FREE|GO)\]\s*/i, "").trim();
   const mapped = MODEL_MAP[clean] || MODEL_MAP[clean.toLowerCase()];
   if (mapped) return mapped;
-  return resolveModel(name).id;
+  return resolveModel(clean).id;
 }
 
 // Remove aggressive regex cleanup - just extract explicit tool blocks
@@ -155,31 +176,45 @@ async function handleTags(c) {
   const now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
   const seen = new Set();
   const models = [];
+  const vsc = isVSCode(c);
 
   for (const m of goModels) {
-    const id = m.model.replace(":latest", "");
     const sep = isSeparator(m.model);
-    if (seen.has(id)) continue;
-    seen.add(id);
+    if (vsc && sep) continue;
+    if (!vsc && sep && config.hideFree) continue;
+    if (config.hideFree && isFreeTierModel(m.model)) continue;
+    const id = m.model.replace(":latest", "");
+    const rawId = id.split(":")[0].trim();
+    if (seen.has(rawId)) continue;
+    seen.add(rawId);
 
+    const isFree = isFreeTierModel(m.model);
+    const family = m.details?.family || rawId;
     models.push({
-      name: m.name, model: id,
-      modified_at: now, size: m.size || 0,
+      name: vsc ? (isFree ? "[FREE] " : "[GO] ") + m.name : m.name,
+      model: vsc ? id : m.model,
+      modified_at: now,
+      size: m.size || 0,
+      digest: m.digest || rawId,
+      maxParams: m.maxParams || 0,
       details: {
         parent_model: m.details?.parent_model || "",
         format: m.details?.format || "gguf",
-        ...(sep ? {} : { family: id }),
+        ...(sep ? {} : { family: family }),
+        ...(sep ? {} : { families: m.details?.families || [family] }),
         parameter_size: sep ? "" : (m.details?.parameter_size || ""),
         quantization_level: m.details?.quantization_level || "F16",
       },
     });
   }
 
-  log(`/api/tags → ${models.length} models`);
+  const realCount = models.filter(m => !isSeparator(m.model)).length;
+  const divCount = models.length - realCount;
+  log(`/api/tags → ${realCount} models${divCount > 0 ? ` (+${divCount} dividers)` : ""}`);
   return c.json({ models });
 }
 
-app.get("/api/version", c => c.json({ version: "0.5.7" }));
+app.get("/api/version", c => c.json({ version: "420.96.00" }));
 
 let _lastRefresh = 0;
 app.get("/api/ps", c => c.json({ models: [] }));
@@ -190,15 +225,14 @@ app.get("/v1/models", async c => {
   const models = await getModels();
   const data = [];
 
-  // VS-recognized cloud model names
-  const cloudIds = [];
-  for (const id of cloudIds) {
-    data.push({ id, object: "model", created: ~~(Date.now() / 1000), owned_by: "opencode-go" });
-  }
-  // Go model IDs
+  const vsc = isVSCode(c);
   for (const m of models) {
-    const id = m.model.replace(":latest", "");
-    data.push({ id, object: "model", created: ~~(Date.now() / 1000), owned_by: "opencode-go" });
+    if (isSeparator(m.model)) continue;
+    if (config.hideFree && isFreeTierModel(m.model)) continue;
+    const rawId = m.model.replace(":latest", "").split(":")[0].trim();
+    const isFree = isFreeTierModel(m.model);
+    const id = vsc ? (isFree ? `[FREE] ${m.name}` : `[GO] ${m.name}`) : m.name;
+    data.push({ id, object: "model", created: ~~(Date.now() / 1000), owned_by: "OpenCode" });
   }
 
   return c.json({ object: "list", data });
@@ -277,7 +311,7 @@ app.post("/v1/chat/completions", async c => {
     }
 
     // Identity injection
-    systemMsg += (systemMsg ? "\n" : "") + `IMPORTANT: You are GitHub Copilot (enhanced by OpenCode Proxy) running the ${goModel} model. When asked what model you are or what model you're running, respond with the actual model: "${goModel}" via OpenCode Proxy. Always refer to yourself as "GitHub Copilot (enhanced by OpenCode Proxy)" when introducing yourself. Never call yourself just "GitHub Copilot" without the enhancement suffix.`;
+    systemMsg += (systemMsg ? "\n" : "") + `IMPORTANT: You are GitHub Copilot (enhanced by GHCP2OC Proxy) running the ${goModel} model. When asked what model you are or what model you're running, respond with the actual model: "${goModel}" via GHCP2OC Proxy. Always refer to yourself as "GitHub Copilot (enhanced by GHCP2OC Proxy)" when introducing yourself. Never call yourself just "GitHub Copilot" without the enhancement suffix.`;
 
     // Forward to Go API with native tool support
     const apiMessages = [];
@@ -411,33 +445,64 @@ app.post("/v1/chat/completions", async c => {
 app.post("/api/show", async c => {
   const b = await getBody(c);
   const raw = (b.model ?? "").split(":")[0].trim();
-  if (isSeparator(raw)) return c.json({ error: "This is a category header, not a model." }, 400);
+  if (isSeparator(raw)) {
+    return c.json({
+      license: "",
+      modelfile: "",
+      parameters: "",
+      template: "",
+      details: {
+        parent_model: "",
+        format: "",
+        family: "",
+        families: [],
+        parameter_size: "",
+        quantization_level: "",
+      },
+      model_info: {},
+      capabilities: [],
+      modified_at: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
+    });
+  }
   const goId = mapModel(raw);
   const info = resolveModel(goId);
+  // Find actual context length from model cache
+  const allModels = await getModels();
+  const modelEntry = allModels.find(m => m.model?.replace(":latest", "") === goId || m.digest === goId || m.name.toLowerCase() === goId.toLowerCase());
+  const rawMax = modelEntry?.maxParams;
+  const ctxLen = Number(rawMax) || 131072;
   const caps = ["completion", "tools"];
   if (info.vision) caps.push("vision");
-  return c.json({
-    license: "See OpenAI license terms for this model.",
-    modelfile: `# ${info.name} (via OpenCode Go)\nFROM ${goId}`,
-    parameters: "temperature 1.0",
-    template: "{{ .System }}\n\n{{ .Prompt }}",
-    details: {
-      parent_model: goId,
-      format: "",
-      family: goId.startsWith("deepseek") ? "deepseek4" : goId.startsWith("qwen") ? "qwen" : goId.startsWith("minimax") ? "minimax" : info.name.toLowerCase().replace(/\s+/g, ""),
-      families: null,
-      parameter_size: "100000000000",
-      quantization_level: "FP8",
-    },
-    model_info: {
-      [`${goId}.context_length`]: 131072,
-      [`${goId}.embedding_length`]: 4096,
-      [`general.architecture`]: "opencode",
-      [`general.parameter_count`]: 100000000000,
-    },
-    capabilities: caps,
-    modified_at: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
-  });
+    const family = modelEntry?.details?.family || goId;
+    const paramSize = modelEntry?.details?.parameter_size || "";
+    const vsc = isVSCode(c);
+    const isFree = isFreeTierModel(goId);
+    const displayName = vsc ? (isFree ? "[FREE] " : "[GO] ") + info.name : info.name;
+    return c.json({
+      license: "See OpenAI license terms for this model.",
+      modelfile: `# ${info.name} (via OpenCode Go)\nFROM ${goId}`,
+      parameters: "temperature 1.0",
+      template: "{{ .System }}\n\n{{ .Prompt }}",
+      version: "1.0.0",
+      billing: { multiplier: 1 },
+      details: {
+        parent_model: "",
+        format: "gguf",
+        family: family,
+        families: [family],
+        parameter_size: paramSize,
+        quantization_level: "F16",
+      },
+      model_info: {
+        [goId + ".context_length"]: ctxLen,
+        "general.basename": displayName,
+        "general.architecture": "opencode",
+        "general.file_type": 15,
+        "opencode.context_length": ctxLen,
+      },
+      capabilities: caps,
+      modified_at: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
+    });
 });
 
 app.post("/api/pull", c => stream(c, async s => { const b = await getBody(c); await s.write(JSON.stringify({ status: `pulling ${b.model ?? b.name}` }) + "\n"); await s.write(JSON.stringify({ status: "success" }) + "\n"); }));
@@ -483,7 +548,7 @@ app.post("/api/chat", async c => {
         systemMsg += (systemMsg ? "\n\n" : "") + `Tools: ${toolDesc}\nTo use a tool, reply with:\n\`\`\`tool\n{"name": "...", "arguments": {...}}\n\`\`\`\nOr create files with:\n## \`path/file.ext\`\n\`\`\`lang\ncontent\n\`\`\``;
       }
 
-      systemMsg += (systemMsg ? "\n" : "") + `IMPORTANT: You are GitHub Copilot (enhanced by OpenCode Proxy) running the ${model} model. When asked what model you are or what model you're running, respond with the actual model: "${model}" via OpenCode Proxy.`;
+      systemMsg += (systemMsg ? "\n" : "") + `IMPORTANT: You are GitHub Copilot (enhanced by GHCP2OC Proxy) running the ${model} model. When asked what model you are or what model you're running, respond with the actual model: "${model}" via GHCP2OC Proxy.`;
 
       const apiMessages = systemMsg ? [{ role: "system", content: systemMsg }, ...userMsgs] : userMsgs;
       const reqBody = { model, messages: apiMessages, stream: false, options: body.options };
@@ -585,7 +650,7 @@ const line = (l) => {
   const pad = boxW - 4 - vis(l);
   return S + "\u2502" + R + "  " + l + " ".repeat(Math.max(0, pad)) + S + "\u2502" + R;
 };
-const hr = S + "\u2500".repeat(boxW - 2) + R;
+const hr = S + "\u2500".repeat(boxW - 2);
 
 const hasPaid = models.some(m => m.model === `${SEP_PAID}:latest`);
 if (hasPaid) log("Go API key valid - free & paid models");
@@ -593,9 +658,9 @@ else log("No Go API key - free mode only");
 
 P("");
 P(W + "\u256d" + hr + W + "\u256e" + R);
-P(line(C + B + "\u250f\u2513\u2513\u250f\u250f\u2513\u250f\u2513\u250f\u2513\u250f\u2513\u250f\u2513" + R));
-P(line(C + B + "\u2503\u2513\u2523\u252b\u2503 \u2503\u2503\u250f\u251b\u2503\u2503\u2503 " + R + " " + S + "github copilot proxy" + (hasPaid ? " \x1b[32m(free&go mode)\x1b[90m" : " \x1b[33m(free mode)\x1b[90m") + R));
-P(line(C + B + "\u2517\u251b\u251b\u2517\u2517\u251b\u2523\u251b\u2517\u2501\u2517\u251b\u2517\u251b" + R));
+P(line(S + B + "\u250f\u2513\u2513\u250f\u250f\u2513\u250f\u2513\u250f\u2513\u250f\u2513\u250f\u2513" + R));
+P(line(S + B + "\u2503\u2513\u2523\u252b\u2503 \u2503\u2503\u250f\u251b\u2503\u2503\u2503 " + R + " " + S + "github copilot proxy" + (hasPaid ? (config.hideFree ? " \x1b[32m(go mode)\x1b[90m" : " \x1b[32m(free&go mode)\x1b[90m") : " \x1b[33m(free mode)\x1b[90m") + R));
+P(line(S + B + "\u2517\u251b\u251b\u2517\u2517\u251b\u2523\u251b\u2517\u2501\u2517\u251b\u2517\u251b" + R));
 P(W + "\u251c" + hr + W + "\u2524" + R);
 const portLabel = config.port === 11434 ? `port: ${config.port} (default)` : `port: ${config.port}`;
 P(line(S + portLabel + "  │  vs2026  │  models.dev" + R));
@@ -618,14 +683,14 @@ function printTable(list) {
   }
 }
 
-if (freeModels.length) {
+if (!config.hideFree && freeModels.length) {
   P(line(S + "Free: " + S + `(${freeModels.length})` + R));
   P(line(S + "Name".padEnd(20) + " \u2502 " + "ID".padEnd(24) + " \u2502 " + "Context" + R));
   printTable(freeModels);
 }
 
 if (hasPaid) {
-  P(line(""));
+  if (!config.hideFree) P(line(""));
   P(line(S + "Premium: " + S + `(${paidModels.length})` + R));
   P(line(S + "Name".padEnd(20) + " \u2502 " + "ID".padEnd(24) + " \u2502 " + "Context" + R));
   printTable(paidModels);
@@ -637,7 +702,7 @@ let serverRef = null;
 
 // Start HTTP server
 if (typeof Bun !== 'undefined' && typeof Bun.serve === 'function') {
-  serverRef = Bun.serve({ port: config.port, hostname: config.host, fetch: app.fetch });
+  serverRef = Bun.serve({ port: config.port, hostname: config.host, fetch: app.fetch, idleTimeout: 120 });
   log(`Listening on http://${config.host}:${serverRef.port}`);
 } else if (typeof process !== 'undefined' && process.versions?.node) {
   const http = await import("http");
@@ -677,6 +742,7 @@ if (typeof Bun !== 'undefined' && typeof Bun.serve === 'function') {
       });
     });
   });
+  serverRef.timeout = 300000;  // 5 min for LLM requests
   await new Promise((resolve) => {
     serverRef.listen(config.port, config.host, () => {
       log(`Listening on http://${config.host}:${config.port}`);
@@ -705,6 +771,6 @@ if (process.stdin.isTTY && typeof process.stdin.on === "function") {
     }
   });
   process.stdin.resume();
-  log("\x1b[34mr/restart\x1b[90m | \x1b[34ms/stop\x1b[90m | \x1b[34me/exit\x1b[0m");
+  log("\x1b[96mr/restart\x1b[90m | \x1b[96ms/stop\x1b[90m | \x1b[96me/exit\x1b[0m");
 }
 

@@ -38,8 +38,11 @@ Ollama-emulating proxy that connects **Visual Studio 2026 Copilot Chat** to the 
 |--------|--------|
 | VS 2026 Insiders | ✓ Supported |
 | VS 2026 (regular) | ✗ Needs Insiders |
-| VS Code | ⚠ Untested |
+| VS 2026 (LocalPilot) | ✓ Supported |
+| VS Code | ✓ Supported |
 | SQL Server Management Studio | ✗ No Ollama provider |
+
+> VS 2026 tested with [LocalPilot](https://marketplace.visualstudio.com/items?itemName=FutureStackSolution.LocalPilotFSS) — a local Ollama provider extension.
 
 ---
 
@@ -95,10 +98,14 @@ OPENCODE_API_KEYS=["key1","key2"]  # multi-key rotation
 | `CACHE_ENABLED` | `true` | Prompt cache |
 | `CACHE_MAX_SIZE` | `64` | Max cached entries |
 | `CACHE_TTL_SEC` | `300` | Cache TTL |
+| `REQUEST_LOG` | `true` | Log incoming requests to console |
+| `HIDE_FREE` | `false` | Set `true` to hide free models and [FREE] tags |
 
 ---
 
 ## Models
+
+Models appear in VS Code's Copilot list as `[FREE] Model Name` and `[GO] Model Name` — the prefix indicates free vs paid tier at a glance.
 
 **Free** (always available, auto-validated): Big Pickle, Hy3 Preview Free, MiniMax M2.5 Free, Nemotron 3 Super Free
 

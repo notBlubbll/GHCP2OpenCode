@@ -11,7 +11,8 @@ Ollama-compatible proxy that bridges **Visual Studio 2026 Copilot Chat** with th
 **Console** — model table with context lengths, key status, commands:
 
 <table><tr>
-<td><img alt="Console free mode" src="https://github.com/user-attachments/assets/74e2bfc3-deed-425f-baac-1185cabae6a7"></td>
+<td><img ale="Console free mode" src="https://github.com/user-attachments/assets/534e36a9-9028-42a7-b1a4-ac8a0ff6a128" />
+</td>
 <td><img alt="Console paid mode" src="https://github.com/user-attachments/assets/dbb734c3-0f2e-4d9b-84b8-f11a2fc6fb1e"></td>
 </tr></table>
 

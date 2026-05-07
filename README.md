@@ -41,9 +41,18 @@ npm run node       # Node.js fallback
 2. Click the model dropdown (next to the agent selector) → **Manage Models**
 3. Click **Select Provider** → **Ollama**
 4. Leave the endpoint at `http://localhost:11434` (unless your port differs)
-5. Click **Add** — VS fetches models and validates them automatically
+5. Click **Add** — VS fetches models and validates them automatically:
 
-You can now select any model from the dropdown. No model IDs to configure — the proxy resolves display names to the correct API IDs. Just don't select the `══ FREE: ══` or `══ PREMIUM: ══` headers... I don't know what would happen then 😅
+<img width="634" height="752" alt="image" src="https://github.com/user-attachments/assets/d5810075-3f1f-4326-a6c8-89b2b0fed482" />
+
+Or Free:
+<img width="631" height="757" alt="image" src="https://github.com/user-attachments/assets/32b0be79-4664-441f-8bc4-3b154218964f" />
+
+
+You can now select any model from the dropdown. No model IDs to configure — the proxy resolves display names to the correct API IDs.
+Just don't select the `══ FREE: ══` or `══ PREMIUM: ══` headers... I don't know what would happen then 😅
+
+
 
 ### 3. (Optional) Unlock paid models
 

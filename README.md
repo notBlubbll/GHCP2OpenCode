@@ -17,9 +17,30 @@ Ollama proxy that connects **Visual Studio 2026 Copilot Chat** to the [OpenCode]
 
 **Agent mode** — tool calling with free and paid models:
 
-<p align="center"><img alt="Free model agent mode" src="https://github.com/user-attachments/assets/eb27e58e-0b64-4634-a50b-ae4cf2a8dd77"></p>
+<table><tr>
+<td><img alt="Free model agent mode" src="https://github.com/user-attachments/assets/eb27e58e-0b64-4634-a50b-ae4cf2a8dd77"></td>
+<td><img alt="Paid model agent mode" src="https://github.com/user-attachments/assets/72e41978-1da3-42d5-8ad3-73a84d88254f"></td>
+</tr></table>
 
-<p align="center"><img alt="Paid model agent mode" src="https://github.com/user-attachments/assets/72e41978-1da3-42d5-8ad3-73a84d88254f"></p>
+---
+
+## Requirements
+
+| What | Why |
+|------|-----|
+| [Bun](https://bun.sh) or [Node.js](https://nodejs.org) | Runtime (Bun preferred, Node as fallback) |
+| Visual Studio 2026 **Insiders** | Ollama provider is Insiders-only |
+
+---
+
+## Supported Platforms
+
+| Client | Status |
+|--------|--------|
+| VS 2026 Insiders | ✓ Supported |
+| VS 2026 (regular) | ✗ Needs Insiders |
+| VS Code | ⚠ Untested |
+| SQL Server Management Studio | ✗ No Ollama provider |
 
 ---
 

@@ -1,124 +1,120 @@
 # GHCP2OpenCode
 
-<img width="598" height="461" alt="image" src="https://github.com/user-attachments/assets/679e6447-9b4c-4554-93fb-028bc5b8ba62" />
+Ollama-compatible proxy that bridges **Visual Studio 2026 Copilot Chat** with the [OpenCode](https://opencode.ai) Zen + Go APIs.
 
-<img width="1262" height="809" alt="image" src="https://github.com/user-attachments/assets/6db5f99e-94b4-4dad-a90c-7fa6069bec15" />
+**Free models** work out of the box — no API key needed. Add a Go key in `.env` to unlock paid models. All models appear in the VS model selector with tool calling and streaming.
 
-Ollama-compatible API proxy that routes **Visual Studio 2026** Copilot Chat requests to the [OpenCode](https://opencode.ai) Go subscription API.
-
-When connected, you get access to 14 Go models — DeepSeek, Qwen, Kimi, MiniMax, GLM, MiMo — with full agent mode (tool calling).
-
-## Compatibility
-
-| Client | Supported |
-|--------|-----------|
-| Visual Studio 2026 (18.6+) | ✓ |
-| Visual Studio Code | ✗ |
-| SQL Server Management Studio | ✗ |
-
-Only **Visual Studio 2026 Enterprise/Professional** is tested and supported.
+---
 
 ## Quick Start
 
-1. **Install [Bun](https://bun.sh)**
+### 1. Run the proxy
 
-2. **Set your API key** in `.env`:
-
-   ```env
-   # single key
-   OPENCODE_API_KEY=your-key
-
-   # or multiple keys with rotation
-   OPENCODE_API_KEYS=["key1","key2"]
-   ```
-
-3. **Run the proxy**:
-
-   ```bash
-   bun run start
-   # Windows: start.cmd
-   ```
-
-4. **Configure Visual Studio 2026** — set `overrideProxyUrl` to `http://localhost:11434` and `overrideEngineUrl` to `http://localhost:11434/v1` in VS Copilot debug settings.
-
-### Ollama Endpoint
-
-```json
-"ollama.endpoint": "http://localhost:11434"
+```bash
+start.cmd          # Windows
+bun run start      # Bun (preferred)
+npm run node       # Node.js (fallback)
 ```
+
+### 2. Configure Visual Studio
+
+**Requires VS 2026 Insiders.** Add a new Ollama provider pointing to `http://localhost:11434` (or the port shown in console). The supported models appear automatically.
+
+- `overrideProxyUrl` → `http://localhost:11434`
+- `overrideEngineUrl` → `http://localhost:11434/v1`
+
+### 3. (Optional) Add your API key
+
+```env
+# .env
+OPENCODE_API_KEY=your-key
+# or multi-key rotation:
+OPENCODE_API_KEYS=["key1","key2"]
+```
+
+---
+
+## Compatibility
+
+| Client | Status |
+|--------|--------|
+| VS 2026 Insiders (18.6+) | Supported |
+| VS 2026 (regular) | No — needs Insiders |
+| VS Code / SSMS | No |
+
+---
 
 ## Configuration
 
-| Variable | Default |
-|----------|---------|
-| `OPENCODE_API_KEY` | *(single key)* |
-| `OPENCODE_API_KEYS` | *(JSON array, auto-rotates)* |
-| `SERVER_PORT` | `11434` |
-| `SERVER_HOST` | `127.0.0.1` |
-| `DEFAULT_MODEL` | `deepseek-v4-flash` |
-| `CACHE_ENABLED` | `true` |
-| `CACHE_MAX_SIZE` | `64` |
-| `CACHE_TTL_SEC` | `300` |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENCODE_API_KEY` | — | API key |
+| `OPENCODE_API_KEYS` | — | JSON array, auto-rotates on 401/429 |
+| `SERVER_PORT` | `11434` | Listen port |
+| `SERVER_HOST` | `127.0.0.1` | Listen host |
+| `DEFAULT_MODEL` | `qwen3.6-plus-free` | Fallback model |
+| `DEFAULT_TEMPERATURE` | — | Global temperature (e.g. `0.1`) |
+| `CACHE_ENABLED` | `true` | Prompt response cache |
+| `CACHE_MAX_SIZE` | `64` | Max cached entries |
+| `CACHE_TTL_SEC` | `300` | Cache TTL |
 
-## Endpoints
-
-| Endpoint | Format | Purpose |
-|----------|--------|---------|
-| `/api/tags` | Ollama | Model discovery |
-| `/api/chat` | Ollama | Legacy chat |
-| `/api/generate` | Ollama | Legacy completion |
-| `/api/show` | Ollama | Model info |
-| `/v1/chat/completions` | OpenAI | Chat (primary) |
-| `/v1/models` | OpenAI | Model listing |
+---
 
 ## Models
 
-All models support tool calling. Vision-capable marked with ✓.
+All support tool calling. Free models work without a key and are validated (pinged) before appearing. Paid models require a Go API key.
 
-| Model | Agent | Vision |
-|-------|-------|--------|
-| DeepSeek V4 Flash | ✓ | |
-| Qwen3.5 Plus | ✓ | ✓ |
-| Qwen3.6 Plus | ✓ | ✓ |
-| MiniMax M2.5 | ✓ | |
-| MiniMax M2.7 | ✓ | |
-| Kimi K2.5 | ✓ | ✓ |
-| Kimi K2.6 | ✓ | ✓ |
-| GLM-5 | ✓ | |
-| GLM-5.1 | ✓ | |
-| MiMo V2 Omni | ✓ | ✓ |
-| MiMo V2.5 | ✓ | ✓ |
-| MiMo V2 Pro | ✓ | ✓ |
-| MiMo V2.5 Pro | ✓ | ✓ |
+**Free** — Big Pickle, Hy3 Preview Free, MiniMax M2.5 Free, Nemotron 3 Super Free (+ 2 deprecated: Ling 2.6 Flash Free, Trinity Large Preview)
 
-Models and metadata are fetched dynamically from [models.dev](https://models.dev/api.json).
+**Paid** — fetched dynamically from OpenCode Go API when a key is set.
 
-## Prompt Cache
+---
 
-LRU in-memory cache with TTL. Responses are stored by hashed prompt (model + messages + tools). Cache hits replay as synthetic SSE — zero tokens, zero latency.
+## Commands
 
-Cache is cleared on server restart. Disable with `CACHE_ENABLED=false`.
+Type in the console window:
 
-## Key Rotation
+| Command | Action |
+|---------|--------|
+| `r` / `restart` | Restart proxy |
+| `s` / `stop` | Shut down |
+| `e` / `exit` | Shut down |
 
-Set `OPENCODE_API_KEYS` as a JSON array. On 401/429 errors the failed key is cooled down and the next key is tried automatically.
+Or HTTP: `curl http://localhost:11434/stop`
+
+---
+
+## Caching
+
+### Key validation
+
+On startup, the proxy tests every configured key (`OPENCODE_API_KEY` + each key in `OPENCODE_API_KEYS`) against the Go API with a real chat request. If a 401 is returned for ALL keys, the proxy stays in free-tier mode. If any key passes, paid models are loaded. The cache is keyed by a hash of the working key — changing keys + restart invalidates it.
+
+### Model validation (pinging)
+
+In parallel, each free model is pinged with a minimal request to `/zen/v1/chat/completions`. Only models that respond (`200`) appear in the model selector. Models flagged as `deprecated` by [models.dev](https://models.dev) are auto-hidden. Go paid models are fetched from `/zen/go/v1/models` with the validated key.
+
+Results are saved to `.ghcp2oc_models.json` for fast restart.
+
+### Prompt cache
+
+LRU in-memory with TTL. Responses keyed by hashed prompt (model + messages + tools). Cache hits replay instantly — zero tokens, zero latency. Cleared on restart. Disable with `CACHE_ENABLED=false`.
+
+---
 
 ## How It Works
 
-1. VS Copilot discovers models via `/api/tags` (Ollama format)
-2. Chat requests are forwarded to OpenCode Go API (`/zen/go/v1/chat/completions`)
-3. Responses streamed in OpenAI SSE format with tool call normalization
-4. DeepSeek `reasoning_content` cached and re-injected (VS strips non-standard fields)
-5. Identity injected — model says "GitHub Copilot (enhanced by OpenCode Proxy)"
+1. VS discovers models via `/api/tags` (Ollama format)
+2. Chat → OpenCode API (`/zen/go/v1/chat/completions`)
+3. Responses streamed in OpenAI SSE with tool call normalization
+4. Identity: "GitHub Copilot (enhanced by OpenCode Proxy)"
+
+---
 
 ## Tech Stack
 
-- [Bun](https://bun.sh) runtime
-- [Hono](https://hono.dev) web framework
-- Direct fetch — no AI SDK overhead
+**[Bun](https://bun.sh)** (fast, preferred) → **[Node.js](https://nodejs.org)** (fallback for Windows Server 2016 etc.) · [Hono](https://hono.dev) · direct fetch
 
-## Inspiration
+## Credits
 
-- [OpenCode PR #25997](https://github.com/anomalyco/opencode/pull/25997) — response caching model
-- [LLM-API-Key-Proxy](https://github.com/Mirrowel/LLM-API-Key-Proxy) — multi-provider proxy patterns
-- [Ollama](https://github.com/ollama/ollama) — API compatibility reference
+- [copilot-proxy](https://github.com/modpotato/copilot-proxy) · [OpenCode #25997](https://github.com/anomalyco/opencode/pull/25997) · [LLM-API-Key-Proxy](https://github.com/Mirrowel/LLM-API-Key-Proxy) · [Ollama](https://github.com/ollama/ollama)

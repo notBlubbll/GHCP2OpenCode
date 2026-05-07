@@ -194,14 +194,18 @@ function getDiskPath() {
   return _diskCachePath;
 }
 
+let _crypto = null;
+async function _loadCrypto() {
+  if (!_crypto) _crypto = await import("node:crypto");
+  return _crypto;
+}
+
 function keyHash() {
   const keys = [];
-  // Read from process env
   if (Bun.env.OPENCODE_API_KEY) keys.push(Bun.env.OPENCODE_API_KEY);
   if (Bun.env.OPENCODE_API_KEYS) {
     try { keys.push(...JSON.parse(Bun.env.OPENCODE_API_KEYS)); } catch {}
   }
-  // Also read .env file directly (catches mid-run changes before restart)
   try {
     if (_fs) {
       const envRaw = _fs.readFileSync(".env", "utf8");
@@ -221,6 +225,7 @@ function keyHash() {
   const deduped = [...new Set(keys)].sort();
   if (!deduped.length) return "no-key";
   const combined = deduped.join("");
+  if (_crypto) return _crypto.createHash("sha256").update(combined).digest("hex");
   let h = 0;
   for (let i = 0; i < combined.length; i++) {
     h = ((h << 5) - h + combined.charCodeAt(i)) | 0;
@@ -238,7 +243,7 @@ function loadKeyHashFromDisk() {
     if (!_fs) { console.log("[keys] no fs module loaded"); return null; }
     const path = getKeyHashPath();
     const data = JSON.parse(_fs.readFileSync(path, "utf8"));
-    console.log(`[keys] loaded hash from ${path}: ${data.h}`);
+    console.log(`[keys] loaded hash from ${path}: ${(data.h || "").slice(0, 5)}`);
     return data.h || null;
   } catch (e) {
     console.log(`[keys] no hash file yet (${e.message})`);
@@ -251,7 +256,7 @@ function saveKeyHashToDisk(h) {
   try {
     const path = getKeyHashPath();
     _fs.writeFileSync(path, JSON.stringify({ h }));
-    console.log(`[keys] saved hash ${h} to ${path}`);
+    console.log(`[keys] saved hash ${h.slice(0, 5)} to ${path}`);
   } catch (e) {
     console.log(`[keys] save failed: ${e.message}`);
   }
@@ -259,12 +264,13 @@ function saveKeyHashToDisk(h) {
 
 let _lastKeyHash = null;
 async function checkKeyChanged() {
+  await _loadCrypto();
   const h = keyHash();
   if (!_lastKeyHash) {
     _lastKeyHash = loadKeyHashFromDisk();
   }
   if (_lastKeyHash !== null && _lastKeyHash !== h) {
-    console.log(`[keys] changed: ${_lastKeyHash} → ${h}`);
+    console.log(`[keys] changed: ${(_lastKeyHash || "").slice(0, 5)} → ${h.slice(0, 5)}`);
     _lastKeyHash = h;
     saveKeyHashToDisk(h);
     return true;
@@ -405,6 +411,7 @@ async function fetchModels() {
 
 export async function initModels() {
   await _loadFs();
+  await _loadCrypto();
   const changed = await checkKeyChanged();
   if (!changed && loadModelsFromDisk()) {
     console.log("[models] keys unchanged, using disk cache");

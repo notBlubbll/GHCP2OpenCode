@@ -4,6 +4,24 @@ Ollama-compatible proxy that bridges **Visual Studio 2026 Copilot Chat** with th
 
 **Free models** work out of the box — no API key needed. Add a Go key in `.env` to unlock paid models. All models appear in the VS model selector with tool calling and streaming.
 
+<img width="604" height="622" alt="image" src="https://github.com/user-attachments/assets/dbb734c3-0f2e-4d9b-84b8-f11a2fc6fb1e" />
+
+<img width="576" height="643" alt="image" src="https://github.com/user-attachments/assets/c41fc13d-32fb-4374-bea0-e05dc2dbd0ad" />
+
+In VS Model Picker:
+
+<img width="416" height="245" alt="image" src="https://github.com/user-attachments/assets/fe08109e-459e-43df-b720-6eb57d0c8b2a" />
+
+<img width="378" height="677" alt="image" src="https://github.com/user-attachments/assets/f2ba73d1-35ed-455a-992d-edb7a7b13185" />
+
+in Agent mode:
+Free:
+<img width="1442" height="904" alt="image" src="https://github.com/user-attachments/assets/eb27e58e-0b64-4634-a50b-ae4cf2a8dd77" />
+
+And paid:
+<img width="1526" height="727" alt="image" src="https://github.com/user-attachments/assets/72e41978-1da3-42d5-8ad3-73a84d88254f" />
+
+
 ---
 
 ## Quick Start

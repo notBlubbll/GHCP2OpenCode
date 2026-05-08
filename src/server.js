@@ -1803,7 +1803,7 @@ function printTable(list) {
       ? (m.model.replace(":latest", "")).slice(0, 23) + "\u2026"
       : (m.model.replace(":latest", "")).padEnd(24);
     const params = m.maxParams ? m.maxParams.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".").padEnd(9) : "-".padEnd(9);
-    P(line("\x1b[30m" + name + S + " \u2502 " + R + "\x1b[30m" + id + S + " \u2502 " + R + "\x1b[30m" + params + R));
+    P(line(name + S + " \u2502 " + R + id + S + " \u2502 " + R + params + R));
   }
 }
 

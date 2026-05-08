@@ -2,8 +2,36 @@
 if (typeof Bun === 'undefined') {
   globalThis.Bun = {
     env: process.env,
-    // Add other Bun-specific globals if needed
   };
+}
+
+import { ModelConcurrencyManager } from "./concurrency.js";
+import { compressToolDefinitions } from "./token-optimizer.js";
+
+// ── Optimized HTTP client with connection pooling (copilot-proxy pattern) ──
+let _globalAgent = null;
+
+async function _getAgent() {
+  if (_globalAgent) return _globalAgent;
+  try {
+    const undici = await import("undici");
+    _globalAgent = new undici.Agent({
+      connections: 50,              // MaxIdleConnsPerHost equivalent
+      keepAliveTimeout: 90_000,     // 90s IdleConnTimeout
+      keepAliveMaxTimeout: 600_000, // 10min max
+      pipelining: 1,
+    });
+    return _globalAgent;
+  } catch {
+    return null;
+  }
+}
+
+function _fetchWithAgent(url, init = {}) {
+  return _getAgent().then(agent => {
+    if (agent) init.dispatcher = agent;
+    return fetch(url, init);
+  });
 }
 
 const FREE_TIER_MODELS = [
@@ -53,8 +81,8 @@ function buildFreeTierModels() {
         format: "gguf",
         family: m.family,
         families: [m.family],
-              parameter_size: fmtParamSize(mdModel?.parameter_size || mdModel?.parameter_count) || "",
-        quantization_level: "F16",
+              parameter_size: fmtParamSize(mdModel?.parameter_size || mdModel?.parameter_count || inferParameterSize(m.id)) || "",
+        quantization_level: inferQuantization(m.id),
         tools: m.tools,
         vision: m.vision,
         supports_tools: m.tools,
@@ -151,6 +179,33 @@ const config = {
   get hideFree() {
     return Bun.env.HIDE_FREE === "true" || Bun.env.HIDE_FREE === "1";
   },
+  get forceAllCapabilities() {
+    return (Bun.env.FORCE_ALL_CAPABILITIES ?? "true") !== "false";
+  },
+  get forceContextLength() {
+    const v = Bun.env.FORCE_CONTEXT_LENGTH;
+    return v ? Number(v) : 0;
+  },
+  get defaultContextLength() {
+    return Number(Bun.env.DEFAULT_CONTEXT_LENGTH ?? "131072");
+  },
+  get modelMetadataOverrides() {
+    const raw = Bun.env.MODEL_METADATA_JSON;
+    if (!raw?.trim()) return {};
+    try {
+      const parsed = JSON.parse(raw);
+      return typeof parsed === "object" && parsed !== null ? parsed : {};
+    } catch { return {}; }
+  },
+  get passthroughBaseUrl() {
+    return Bun.env.PASSTHROUGH_BASE_URL ?? "";
+  },
+  get maxRetries() {
+    return Math.max(0, parseInt(Bun.env.RETRY_MAX || "3", 10));
+  },
+  get keyRevalidationMs() {
+    return parseInt(Bun.env.KEY_REVALIDATION_INTERVAL || "300000", 10);
+  },
 };
 
 export function setApiKey(key) { Bun.env.OPENCODE_API_KEY = key; }
@@ -187,6 +242,33 @@ function withKey() {
 
 function cooldownKey(key, ms = 30000) {
   _keyCooldown.set(key, Date.now() + ms);
+}
+
+const _keyValidated = new Map();
+
+function markKeyValid(key) {
+  if (key) _keyValidated.set(key, Date.now());
+}
+
+function lastKeyValidation(key) {
+  return _keyValidated.get(key) || 0;
+}
+
+function isKeyStale(key) {
+  const last = lastKeyValidation(key);
+  return last === 0 || (Date.now() - last) > config.keyRevalidationMs;
+}
+
+export function getKeyStatus() {
+  loadKeys();
+  const now = Date.now();
+  return _keys.map(k => ({
+    keyPrefix: k ? `${k.slice(0, 6)}...${k.slice(-4)}` : "none",
+    onCooldown: _keyCooldown.has(k) && _keyCooldown.get(k) > now,
+    cooldownUntil: _keyCooldown.get(k) || 0,
+    lastValidated: lastKeyValidation(k),
+    stale: isKeyStale(k),
+  }));
 }
 
 export function rotateKey() {
@@ -396,10 +478,10 @@ async function fetchModels() {
             details: {
               parent_model: "",
               format: "gguf",
-              family: displayName,
-              families: [displayName],
-        parameter_size: fmtParamSize(mdModel?.parameter_size || mdModel?.parameter_count) || "",
-              quantization_level: "F16",
+              family: mdModel?.name || inferFamily(m.id),
+              families: [mdModel?.name || inferFamily(m.id)],
+        parameter_size: fmtParamSize(mdModel?.parameter_size || mdModel?.parameter_count || inferParameterSize(m.id)) || "",
+              quantization_level: inferQuantization(m.id),
               tools,
               vision,
               supports_tools: tools,
@@ -492,22 +574,23 @@ async function fetchGoModelsRaw() {
   }
   console.log(`[keys] found ${keys.length} key(s) in env`);
 
-  for (const k of keys) {
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
     try {
       const goResp = await fetch(`${config.baseUrl}/models`, {
         headers: { Authorization: `Bearer ${k}` },
       });
       if (goResp.status === 401) {
-        console.error(`[models] Go key invalid`);
+        console.error(`[models] key[${i}] invalid (401)`);
         continue;
       }
       if (goResp.ok) {
         _paidGoData = await goResp.json();
-        console.log(`[models] Go key valid — ${_paidGoData?.data?.length || 0} paid models`);
+        console.log(`[models] key[${i}] valid — ${_paidGoData?.data?.length || 0} paid models`);
         return _paidGoData;
       }
     } catch (e) {
-      console.error(`[models] Go API error: ${e.message}`);
+      console.error(`[models] key[${i}] API error: ${e.message}`);
     }
   }
 
@@ -549,7 +632,18 @@ export function resolveModel(name) {
   const freeMatch = FREE_TIER_MODELS.find(m => m.id === clean);
   if (freeMatch) return { id: freeMatch.id, name: freeMatch.name, tools: freeMatch.tools, vision: freeMatch.vision };
   
-  return { id: clean, name: clean, tools: true, vision: false };
+  return { id: clean, name: clean, tools: true, vision: false, unverified: true };
+}
+
+export function isKnownModel(id) {
+  if (!id) return false;
+  let clean = id.split(":")[0].trim().toLowerCase();
+  clean = clean.replace(/\s*\(free\)$/i, "");
+  if (isSeparator(clean)) return true;
+  if (_modelMap[clean]) return true;
+  if (_nameToId[clean]) return true;
+  if (FREE_TIER_MODELS.find(m => m.id === clean)) return true;
+  return false;
 }
 
 function isoNow() { return new Date().toISOString(); }
@@ -576,7 +670,9 @@ const ERROR_CODES = {
   404: "not_found",
   429: "rate_limit_exceeded",
   500: "server_error",
+  502: "bad_gateway",
   503: "server_overloaded",
+  504: "gateway_timeout",
 };
 
 async function zenRequest(endpoint, body, opts = {}) {
@@ -607,33 +703,171 @@ async function zenRequest(endpoint, body, opts = {}) {
     throw new APIError(401, "", "No API key configured. Free tier models can be used without a key.");
   }
 
-  const resp = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  const resp = await _fetchWithAgent(url, { method: "POST", headers, body: JSON.stringify(body), signal: opts?.signal });
 
   if (!resp.ok) {
     const txt = await resp.text().catch(() => "");
     console.error(`[zen] ${resp.status}`);
 
-    // Rotate key on auth/rate-limit errors
-    const retries = opts.retries || 0;
-    if (key && (resp.status === 401 || resp.status === 429) && retries < _keys.length) {
-      cooldownKey(key, resp.status === 429 ? 15000 : 60000);
-      return zenRequest(endpoint, body, { ...opts, retries: retries + 1 });
-    }
-
+    // Extract detailed error from upstream JSON responses
     let upstreamMsg = "OpenCode API error";
     let code = ERROR_CODES[resp.status] || "api_error";
     let mappedStatus = resp.status;
     try {
       const parsed = JSON.parse(txt);
-      upstreamMsg = parsed.error?.message || parsed.message || upstreamMsg;
+      upstreamMsg = parsed.error?.message || parsed.error?.code || parsed.message || parsed.detail || upstreamMsg;
       if (parsed.error?.type === "AuthError") { code = "invalid_api_key"; mappedStatus = 401; }
       if (parsed.error?.type === "ModelError") { code = "model_not_found"; mappedStatus = 404; }
+      if (parsed.error?.code) code = parsed.error.code;
     } catch {}
+
+    // Retry: rotate key on auth/rate-limit errors, up to configurable max
+    const retries = opts.retries || 0;
+    const maxRetries = opts.maxRetries ?? config.maxRetries;
+    if (key && (resp.status === 401 || resp.status === 429) && retries < maxRetries && retries < _keys.length) {
+      cooldownKey(key, resp.status === 429 ? 15000 : 60000);
+      if (config.requestLog) console.log(`[zen] retry ${retries + 1}/${maxRetries} after ${resp.status}`);
+      return zenRequest(endpoint, body, { ...opts, retries: retries + 1 });
+    }
+
+    // Network errors also retry up to max
+    if (resp.status === 502 || resp.status === 503 || resp.status === 504) {
+      if (retries < maxRetries) {
+        if (config.requestLog) console.log(`[zen] retry ${retries + 1}/${maxRetries} on upstream ${resp.status}`);
+        return zenRequest(endpoint, body, { ...opts, retries: retries + 1 });
+      }
+    }
 
     throw new APIError(mappedStatus, txt, upstreamMsg);
   }
 
+  // Mark key as validated on success
+  if (key) markKeyValid(key);
+
   return resp;
+}
+
+// ── Model-specific request defaults ──
+const MODEL_REQUEST_DEFAULTS = [
+  // DeepSeek models with thinking mode — default to enabled with budget
+  { pattern: /deepseek|deep-seek/i, overrides: { chat_template_kwargs: { thinking: true } }, minMaxTokens: 1024, toolStream: true },
+  // QwOpus — thinking disabled by default for faster response
+  { pattern: /qwopus/i, id: "disable_qwopus_thinking", overrides: { chat_template_kwargs: { enable_thinking: false } }, minMaxTokens: 1024, toolStream: true },
+];
+
+function _supportsToolStream(modelId) {
+  for (const def of MODEL_REQUEST_DEFAULTS) {
+    if (def.pattern.test(modelId) && def.toolStream) return true;
+  }
+  return false;
+}
+
+function applyModelDefaults(modelId, body) {
+  for (const def of MODEL_REQUEST_DEFAULTS) {
+    if (def.pattern.test(modelId)) {
+      for (const [key, value] of Object.entries(def.overrides)) {
+        if (body[key] === undefined) body[key] = value;
+      }
+      if (def.minMaxTokens && (body.max_tokens == null || body.max_tokens < def.minMaxTokens)) {
+        body.max_tokens = def.minMaxTokens;
+      }
+    }
+  }
+}
+
+// ── Model metadata inference (fallback when models.dev unreachable) ──
+function inferFamily(modelId) {
+  const clean = (modelId || "").replace(/:.*/, "").trim();
+  const patterns = [
+    [/\bqwen/i, "Qwen"],
+    [/\bdeepseek/i, "DeepSeek"],
+    [/\bllama/i, "Llama"],
+    [/\bmistral/i, "Mistral"],
+    [/\bmixtral/i, "Mixtral"],
+    [/\bclaude/i, "Claude"],
+    [/\bgpt/i, "GPT"],
+    [/\bgemini/i, "Gemini"],
+    [/\bgemma/i, "Gemma"],
+    [/\bcodestral/i, "Codestral"],
+    [/\bphi/i, "Phi"],
+    [/\bcommand/i, "Command"],
+    [/\byi/i, "Yi"],
+    [/\bnemotron/i, "Nemotron"],
+    [/\bminimax/i, "MiniMax"],
+    [/\btrinity/i, "Trinity"],
+  ];
+  for (const [re, family] of patterns) {
+    if (re.test(clean)) return family;
+  }
+  return clean;
+}
+
+function inferParameterSize(modelId) {
+  const clean = (modelId || "").replace(/:.*/, "").trim();
+  const match = clean.match(/(\d+(?:\.\d+)?)\s*([bBmMkK])/);
+  if (match) {
+    const unit = match[2].toUpperCase();
+    if (unit === "B") return `${match[1]}B`;
+    if (unit === "M") return `${match[1]}M`;
+    if (unit === "K") return `${match[1]}K`;
+  }
+  return "";
+}
+
+function inferQuantization(modelId) {
+  const clean = (modelId || "").replace(/:.*/, "").trim();
+  const match = clean.match(/(Q\d+[_.]\w+|F\d+|BF\d+|INT\d+|IQ\d+[\w_]*)/i);
+  return match ? match[0] : "F16";
+}
+
+function inferCapabilities(modelId) {
+  if (config.forceAllCapabilities) {
+    return ["chat", "completion", "vision", "tools", "agent"];
+  }
+  const lower = modelId.toLowerCase();
+  if (lower.includes("embed") || lower.includes("embedding")) return ["embedding"];
+  const caps = ["chat", "completion", "tools"];
+  if (lower.includes("vision") || lower.includes("image") || lower.includes("vl")) caps.push("vision");
+  return caps;
+}
+
+export function resolveModelMetadata(modelId) {
+  const clean = (modelId || "").replace(/:.*/, "").trim();
+  const override = config.modelMetadataOverrides[clean] || config.modelMetadataOverrides[modelId] || {};
+  const allModels = { ...((_mdCache && _mdCache["opencode-go"]?.models) || {}), ...((_mdCache && _mdCache["opencode"]?.models) || {}) };
+  const mdModel = allModels[clean] || allModels[modelId];
+
+  const contextLength = override.context_length
+    || (config.forceContextLength || 0)
+    || mdModel?.limit?.context
+    || config.defaultContextLength;
+
+  const capabilities = override.capabilities
+    || inferCapabilities(clean);
+
+  const family = override.family
+    || mdModel?.name
+    || inferFamily(clean);
+
+  const parameterSize = override.parameter_size
+    || fmtParamSize(mdModel?.parameter_size || mdModel?.parameter_count || inferParameterSize(clean))
+    || "";
+
+  const quantizationLevel = override.quantization_level
+    || inferQuantization(clean);
+
+  const size = override.size ?? 0;
+  const sizeVram = override.size_vram ?? 0;
+
+  return {
+    context_length: contextLength,
+    capabilities,
+    family,
+    parameter_size: parameterSize,
+    quantization_level: quantizationLevel,
+    size,
+    size_vram: sizeVram,
+  };
 }
 
 // ── Chat completion ──
@@ -661,10 +895,7 @@ export async function* chatCompletion(req) {
   };
 
   if (req.tools?.length) {
-    body.tools = req.tools.map(t => ({
-      type: "function",
-      function: { name: t.function.name, description: t.function.description, parameters: t.function.parameters },
-    }));
+    body.tools = compressToolDefinitions(req.tools);
   }
 
   if (req.options?.temperature != null) body.temperature = req.options.temperature;
@@ -672,9 +903,31 @@ export async function* chatCompletion(req) {
   if (req.options?.top_p != null) body.top_p = req.options.top_p;
   if (req.options?.seed != null) body.seed = req.options.seed;
   if (req.options?.num_predict != null) body.max_tokens = req.options.num_predict;
+  if (req.options?.stop != null) body.stop = req.options.stop;
+  if (req.chat_template_kwargs != null) body.chat_template_kwargs = req.chat_template_kwargs;
+  if (req.thinking_token_budget != null) body.thinking_token_budget = req.thinking_token_budget;
+  if (req.format === 'json') body.response_format = { type: 'json_object' };
+
+  applyModelDefaults(info.id, body);
+
+  // Auto-enable tool_stream for compatible models (copilot-proxy pattern)
+  if (_supportsToolStream(info.id) && body.tools?.length && body.stream !== false) {
+    body.tool_stream = true;
+  }
+
+  // Per-model request timeout (from antigravity-copilot enrichment)
+  let timeoutMs = 0;
+  let ac = null;
+  if (!req._noTimeout) {
+    timeoutMs = ModelConcurrencyManager.getInstance().getTimeoutMs(info.id);
+    if (timeoutMs > 0) {
+      ac = new AbortController();
+      setTimeout(() => { try { ac.abort(); } catch {} }, timeoutMs);
+    }
+  }
 
   try {
-    const resp = await zenRequest("/chat/completions", body);
+    const resp = await zenRequest("/chat/completions", body, { signal: ac?.signal });
 
     if (req.stream === false) {
       const data = await resp.json();
@@ -688,6 +941,7 @@ export async function* chatCompletion(req) {
           reasoning_content: choice.message.reasoning_content,
         },
         done: true, done_reason: choice.finish_reason ?? "stop",
+        usage: data.usage,
       };
       return;
     }
@@ -715,11 +969,30 @@ export async function* chatCompletion(req) {
         try {
           const data = JSON.parse(dataStr);
           const choice = data.choices[0];
-          if (choice?.delta?.content) {
-            yield { model: req.model, created_at: created, message: { role: "assistant", content: choice.delta.content }, done: false };
+          const delta = choice?.delta;
+          if (!delta) continue;
+          const msg = { role: "assistant" };
+          let hasMsg = false;
+
+          if (delta.content != null) {
+            msg.content = delta.content;
+            hasMsg = true;
           }
-          if (choice?.delta?.tool_calls) {
-            yield { model: req.model, created_at: created, message: { role: "assistant", content: "", tool_calls: choice.delta.tool_calls }, done: false };
+          if (delta.tool_calls?.length) {
+            msg.tool_calls = delta.tool_calls;
+            hasMsg = true;
+          }
+          if (delta.reasoning_content) {
+            msg.reasoning_content = delta.reasoning_content;
+            hasMsg = true;
+          }
+          if (delta.reasoning) {
+            msg.reasoning = delta.reasoning;
+            hasMsg = true;
+          }
+
+          if (hasMsg) {
+            yield { model: req.model, created_at: created, message: msg, done: false };
           }
         } catch {}
       }

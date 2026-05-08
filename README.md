@@ -115,7 +115,7 @@ Key validation uses `GET https://opencode.ai/zen/go/v1/models` — returns 200 i
 | `CACHE_MAX_SIZE` | `64` | Max cached entries |
 | `CACHE_TTL_SEC` | `300` | Cache TTL |
 | `REQUEST_LOG` | `true` | Log incoming requests to console |
-| `HIDE_FREE` | `false` | Set `true` to hide free models and `[FREE]`/`[GO]` tags & dividers |
+| `HIDE_FREE` | `false` | Hide free models and `[FREE]`/`[GO]` tags & dividers |
 
 ---
 
@@ -126,6 +126,36 @@ Models appear in VS Code's Copilot list as `[FREE] Model Name` and `[GO] Model N
 **Free** (always available, auto-validated): Big Pickle, Hy3 Preview Free, MiniMax M2.5 Free, Nemotron 3 Super Free
 
 **Paid** (requires Go API key): fetched dynamically from OpenCode — all support tool calling
+
+---
+
+## VS 2026 File Creation
+
+When using VS 2026 agent mode, the proxy handles file creation and project integration:
+
+- **New files** (`.css`, `.js`, `.py`, etc.) are created via tool calls — written to disk with absolute workspace paths
+- **Project files** (`.csproj`, `.vbproj`, `.fsproj`, etc.) are handled natively — markdown code blocks pass through for VS to edit in-place
+- **Auto-injection**: new files are automatically added to the project's `.csproj` with the correct `<Content Include="..." />` entry
+- **Workspace root** is extracted from VS 2026's IDE state context — relative file paths are resolved automatically
+
+To create a new file, just ask Copilot (e.g. "create me a css file called test.css"). The AI will:
+1. Create the file
+2. Read the project file
+3. Add the file reference to the project
+
+---
+
+## API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/tags` | GET | Ollama model list |
+| `/v1/chat/completions` | POST | Chat with tool calling, streaming, cache |
+| `/v1/engines/copilot-codex/completions` | POST | Inline code completions |
+| `/api/stats` | GET | Proxy metrics (uptime, model counts, concurrency, reasoning cache, key status) |
+| `/health` | GET | Health check with model counts |
+| `/api/version` | GET | Returns `420.96.00` |
+| `/stop` | GET | Shutdown |
 
 ---
 
@@ -165,4 +195,21 @@ LRU in-memory with TTL. Responses keyed by hashed prompt. Hits replay instantly 
 
 ## Credits
 
-[copilot-proxy](https://github.com/modpotato/copilot-proxy) · [Qwen-Copilot-Proxy](https://github.com/edwardgj/Qwen-Copilot-Proxy) · [OpenCode #25997](https://github.com/anomalyco/opencode/pull/25997) · [LLM-API-Key-Proxy](https://github.com/Mirrowel/LLM-API-Key-Proxy) · [Ollama](https://github.com/ollama/ollama)
+This project incorporates patterns and features from the following open-source projects:
+
+| Project | Key Contributions |
+|---------|-------------------|
+| [copilot-proxy](https://github.com/chew-z/copilot-proxy) | Ollama provider pattern, `/api/tags` + `/api/show`, optimized HTTP client (connection pooling), true upstream SSE streaming (per-chunk delta piping), graceful shutdown (SIGINT/SIGTERM/SIGHUP), per-message role validation, auto-enable `tool_stream` |
+| [Qwen-Copilot-Proxy](https://github.com/edwardgj/Qwen-Copilot-Proxy) | Health status granularity (`healthy`/`degraded`/`unhealthy`), key freshness tracking, `/version` endpoint, configurable `MAX_RETRIES`, input validation |
+| [raven](https://github.com/nocoo/raven) | Bun+Hono architecture, SQLite tracking pattern |
+| [Proxllama](https://github.com/Michediana/Proxllama) | SSE→NDJSON streaming conversion, `num_ctx`/`num_predict` in `/api/show`, chat template, `format`→`response_format` mapping, `stop` parameter forwarding, streaming token counting, real upstream usage stats propagation |
+| [GHCOllamaMiniMaxProxy](https://github.com/jaggerjack61/GHCOllamaMiniMaxProxy) | Configurable model names, thinking budgets, per-model defaults |
+| [vLLM-proxy-for-VS-Code](https://github.com/nbuckley/vLLM-proxy-for-VS-Code) | Parameter normalization (camelCase→snake_case), think tag parsing, special token sanitization, reasoning field aliasing, port availability check, model metadata inference |
+| [copilot-ollama](https://github.com/andydixon/copilot-ollama) | Inline code completions endpoint, Copilot-compatible `/v1/models` capabilities |
+| [OpenCode #25997](https://github.com/anomalyco/opencode/pull/25997) | OpenCode skills integration |
+| [LLM-API-Key-Proxy](https://github.com/Mirrowel/LLM-API-Key-Proxy) | Key rotation patterns |
+| [Ollama](https://github.com/ollama/ollama) | API interface specification |
+| [ghcp-proxy](https://github.com/kylercai/ghcp-proxy) | User auth/identity extraction, structured request logging, stats endpoint |
+| [antigravity-copilot](https://github.com/punal100/antigravity-copilot) | Concurrency queue (semaphore-based, thinking/standard separation), aggressive retry with exponential backoff (Antigravity IDE-style), per-model request timeouts, tool output truncation, request body size limit, client abort propagation, configurable concurrency limits |
+| [lmstudio-ollama-proxy](https://github.com/NeoTech/lmstudio-ollama-proxy) | Per-model metadata overrides (`MODEL_METADATA_JSON`), configurable context length (`FORCE_CONTEXT_LENGTH`/`DEFAULT_CONTEXT_LENGTH`), force capabilities (`FORCE_ALL_CAPABILITIES`), passthrough proxy, improved `/api/ps`, capabilities inference |
+| [copilot-plugin-mcp-server](https://github.com/barrersoftware/copilot-plugin-mcp-server) | Token optimization — 25-65% token reduction via description compression, schema simplification, and compact identity/tool prompts |

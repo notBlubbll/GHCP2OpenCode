@@ -247,6 +247,9 @@ All route through the same Pollinations `openai` backend — no API key required
 
 You can route chat requests through your company's **Microsoft 365 Copilot** (the web chat at [m365.cloud.microsoft](https://m365.cloud.microsoft/chat)) as an additional model. Two models appear: `[M365] M365 Copilot Quick` and `[M365] M365 Copilot Think`.
 
+<img alt="image" src="https://github.com/user-attachments/assets/65773e57-dbfb-4818-99e7-21c58c31683a" />
+
+
 ### How it works
 
 The proxy connects to a **WebSocket relay server** that runs a browser-automated M365 Copilot session. The relay intercepts the M365 substrate WebSocket (`substrate.office.com`) and forwards chat requests/responses. This is the same approach used by [m365-copilot-openai-proxy](https://github.com/kuchris/m365-copilot-openai-proxy).

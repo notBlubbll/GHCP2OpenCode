@@ -1,4 +1,4 @@
-# GHCP2OpenCode
+# GHCP2OpenCode Proxy
 
 Ollama-emulating proxy that connects **GitHub Copilot Chat&Agent** to the [OpenCode](https://opencode.ai) Zen + Go APIs + models.
 

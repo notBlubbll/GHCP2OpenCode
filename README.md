@@ -113,7 +113,7 @@ OPENCODE_API_KEYS=["key1","key2"]  # multi-key rotation
 | `CACHE_MAX_SIZE` | `64` | Max cached entries |
 | `CACHE_TTL_SEC` | `300` | Cache TTL |
 | `REQUEST_LOG` | `true` | Log incoming requests to console |
-| `HIDE_FREE` | `false` | Set `true` to hide free models and [FREE] tags |
+| `HIDE_FREE` | `false` | Set `true` to hide free models and `[FREE]`/`[GO]` tags & dividers |
 
 ---
 

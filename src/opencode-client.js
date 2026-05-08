@@ -453,16 +453,29 @@ export async function initModels() {
     console.log("[models] no cache — building from built-in data");
     await fetchModels();
   }
+  // Quick connectivity ping with free model
+  try {
+    const p = await fetch(`${config.baseUrlFree}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {}) },
+      body: JSON.stringify({ model: "big-pickle", messages: [{ role: "user", content: "tell me a joke" }], max_tokens: 80 }),
+    });
+    const txt = p.ok ? "ok" : (p.status === 401 ? "key denied" : "offline");
+    console.log(`[models] ping big-pickle → ${p.status} ${txt}`);
+  } catch { console.log("[models] ping big-pickle → unreachable"); }
   // Fetch paid models async (don't block startup)
-  fetchGoModelsRaw().then(async () => {
+  _bgFetch = fetchGoModelsRaw().then(async () => {
     if (_paidGoData?.data?.length) {
       await fetchModels();
       await saveModelsToDisk();
       saveKeyHashToDisk(keyHash());
     }
-  });
+  }).catch(() => {});
   return _models;
 }
+
+let _bgFetch = null;
+export function bgFetchDone() { return _bgFetch; }
 
 export function getModels() {
   if (_models) return _models;
@@ -481,11 +494,13 @@ async function fetchGoModelsRaw() {
 
   for (const k of keys) {
     try {
-      console.log(`[models] fetching ${config.baseUrl}/models ...`);
       const goResp = await fetch(`${config.baseUrl}/models`, {
         headers: { Authorization: `Bearer ${k}` },
       });
-      console.log(`[models] fetch done — status ${goResp.status}`);
+      if (goResp.status === 401) {
+        console.error(`[models] Go key invalid`);
+        continue;
+      }
       if (goResp.ok) {
         _paidGoData = await goResp.json();
         console.log(`[models] Go key valid — ${_paidGoData?.data?.length || 0} paid models`);

@@ -41,7 +41,7 @@ if (typeof ReadableStream === 'undefined') {
 import { Hono } from "hono";
 import { stream } from "hono/streaming";
 import { cors } from "hono/cors";
-import { config, getModels, initModels, resolveModel, chatCompletion, APIError, isSeparator, isFreeTierModel, SEP_PAID, SEP_FREE, refreshModels, validateFreeModels } from "./opencode-client.js";
+import { config, getModels, initModels, resolveModel, chatCompletion, APIError, isSeparator, isFreeTierModel, SEP_PAID, SEP_FREE, refreshModels, validateFreeModels, bgFetchDone } from "./opencode-client.js";
 import { check as cacheCheck, store as cacheStore, cacheKey } from "./cache.js";
 
 // ── Logging ──
@@ -55,7 +55,7 @@ const err = (msg) => process.stderr.write(`\x1b[90m${ts()}\x1b[0m \x1b[31m${msg}
   try {
     const fs = await import("node:fs");
     if (!fs.existsSync(".env")) {
-      fs.writeFileSync(".env", "# OpenCode API key (optional — free models work without it)\n# Get yours at: https://opencode.ai\nOPENCODE_API_KEY=\n\n# Multi-key rotation (optional)\n# OPENCODE_API_KEYS=[\\\"key1\\\",\\\"key2\\\"]\n\n# Hide free models from the list (default false)\nHIDE_FREE=false\n");
+      fs.writeFileSync(".env", "# OpenCode API key (optional — free models work without it)\n# Get yours at: https://opencode.ai\nOPENCODE_API_KEY=\n\n# Multi-key rotation (optional)\n# OPENCODE_API_KEYS=[\\\"key1\\\",\\\"key2\\\"]\n\n# Hide free models from the list (default false)\nHIDE_FREE=false\n\n# Log incoming requests (default true)\nREQUEST_LOG=true\n");
       log("Created .env — add your OPENCODE_API_KEY there to unlock paid models");
     }
   } catch { /* fs not available, ignore */ }
@@ -162,6 +162,20 @@ function extractToolCalls(text) {
 // ── GET endpoints ──
 
 app.get("/", c => c.json({ service: "GHCP2OpenCode", status: "running" }));
+
+app.get("/health", async c => {
+  const models = await getModels();
+  const real = models.filter(m => !isSeparator(m.model));
+  const free = real.filter(m => isFreeTierModel(m.model));
+  const paid = real.filter(m => !isFreeTierModel(m.model));
+  return c.json({
+    status: "healthy",
+    authenticated: paid.length > 0,
+    models_total: real.length,
+    models_free: free.length,
+    models_paid: paid.length,
+  });
+});
 
 app.get("/api/tags", handleTags);
 app.get("/api/list", handleTags);
@@ -653,8 +667,8 @@ const line = (l) => {
 const hr = S + "\u2500".repeat(boxW - 2);
 
 const hasPaid = models.some(m => m.model === `${SEP_PAID}:latest`);
-if (hasPaid) log("Go API key valid - free & paid models");
-else log("No Go API key - free mode only");
+if (hasPaid) log("\x1b[32m[status] Authenticated — free & paid models\x1b[0m");
+else log("\x1b[33m[status] Free mode — no API key\x1b[0m");
 
 P("");
 P(W + "\u256d" + hr + W + "\u256e" + R);
@@ -771,6 +785,7 @@ if (process.stdin.isTTY && typeof process.stdin.on === "function") {
     }
   });
   process.stdin.resume();
+  await bgFetchDone();
   log("\x1b[96mr/restart\x1b[90m | \x1b[96ms/stop\x1b[90m | \x1b[96me/exit\x1b[0m");
 }
 

@@ -91,13 +91,15 @@ in VSCode:
 <img width="1392" height="525" alt="image" src="https://github.com/user-attachments/assets/bc6a2a58-776b-4d2e-8fd8-bcf5f15b7bfa" />
 
 
-### 4. (Optional) Unlock paid models
+### 3. (Optional) Unlock paid models
 
 ```env
 # .env
 OPENCODE_API_KEY=your-go-key
 OPENCODE_API_KEYS=["key1","key2"]  # multi-key rotation
 ```
+
+Key validation uses `GET https://opencode.ai/zen/go/v1/models` — returns 200 if valid, 401 if invalid.
 
 ---
 
@@ -145,6 +147,8 @@ Or `curl http://localhost:11434/stop`
 
 Keys from `.env` are validated against the Go API via a real chat request. Free models are pinged in parallel. Only working models appear. Results cached to disk for instant restart.
 
+A quick `big-pickle` ping runs at startup to verify connectivity: `200 ok`, `401 key denied`, or `unreachable`.
+
 ### On tags query
 
 When VS fetches `/api/tags`, the proxy re-checks `.env` for key changes (SHA256 hash comparison). If keys changed, re-validates and rebuilds the model list automatically. Otherwise, serves from cache.
@@ -161,4 +165,4 @@ LRU in-memory with TTL. Responses keyed by hashed prompt. Hits replay instantly 
 
 ## Credits
 
-[copilot-proxy](https://github.com/modpotato/copilot-proxy) · [OpenCode #25997](https://github.com/anomalyco/opencode/pull/25997) · [LLM-API-Key-Proxy](https://github.com/Mirrowel/LLM-API-Key-Proxy) · [Ollama](https://github.com/ollama/ollama)
+[copilot-proxy](https://github.com/modpotato/copilot-proxy) · [Qwen-Copilot-Proxy](https://github.com/edwardgj/Qwen-Copilot-Proxy) · [OpenCode #25997](https://github.com/anomalyco/opencode/pull/25997) · [LLM-API-Key-Proxy](https://github.com/Mirrowel/LLM-API-Key-Proxy) · [Ollama](https://github.com/ollama/ollama)

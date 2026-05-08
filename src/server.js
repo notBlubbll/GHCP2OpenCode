@@ -41,7 +41,7 @@ if (typeof ReadableStream === 'undefined') {
 import { Hono } from "hono";
 import { stream } from "hono/streaming";
 import { cors } from "hono/cors";
-import { config, getModels, initModels, resolveModel, resolveModelMetadata, isKnownModel, chatCompletion, APIError, isSeparator, isFreeTierModel, SEP_PAID, SEP_FREE, refreshModels, validateFreeModels, bgFetchDone, getKeyStatus } from "./opencode-client.js";
+import { config, getModels, initModels, resolveModel, resolveModelMetadata, isKnownModel, chatCompletion, APIError, isSeparator, isFreeTierModel, isPollModel, SEP_PAID, SEP_FREE, SEP_FREE_P, refreshModels, validateFreeModels, bgFetchDone, getKeyStatus } from "./opencode-client.js";
 import { check as cacheCheck, store as cacheStore, cacheKey } from "./cache.js";
 import { ModelConcurrencyManager, RateLimitError, truncateToolMessagesInPayload, checkRequestBodySize } from "./concurrency.js";
 import { compactIdentity, compactToolInstructions, compactOllamaToolInstructions, compactCodeCompletionPrompt } from "./token-optimizer.js";
@@ -101,7 +101,7 @@ const err = (msg) => process.stderr.write(`\x1b[90m${ts()}\x1b[0m \x1b[31m${msg}
   try {
     const fs = await import("node:fs");
     if (!fs.existsSync(".env")) {
-      fs.writeFileSync(".env", "# OpenCode API key (optional — free models work without it)\n# Get yours at: https://opencode.ai\nOPENCODE_API_KEY=\n\n# Multi-key rotation (optional)\n# OPENCODE_API_KEYS=[\\\"key1\\\",\\\"key2\\\"]\n\n# Hide free models from the list (default false)\nHIDE_FREE=false\n\n# Log incoming requests (default true)\nREQUEST_LOG=true\n\n# ── DLP / Content Blocklist (ghcp-proxy enrichment) ──\n# Enable prompt content filtering (default false)\nBLOCKLIST_ENABLED=false\n\n# Blocklist mode: \"block\" (deny with 403) or \"report\" (allow but log)\nBLOCKLIST_MODE=block\n\n# Comma-separated keywords to block (case-insensitive)\n# BLOCKLIST_KEYWORDS=secret,confidential,password\n\n# Comma-separated file name patterns to block\n# BLOCKLIST_FILEPATTERNS=passwords.txt,.env.production\n\n# Comma-separated regex patterns to block\n# BLOCKLIST_REGEX=sk-[A-Za-z0-9]{20,}\n\n# ── Concurrency & Rate Limiting (antigravity-copilot enrichment) ──\n# Maximum concurrent requests for thinking models (keep low to avoid upstream 429s)\n# CONCURRENCY_THINKING=1\n\n# Maximum concurrent requests for standard models\n# CONCURRENCY_STANDARD=3\n\n# Retry attempts for 429 / RESOURCE_EXHAUSTED errors (0 to disable)\n# RETRY_MAX=3\n\n# Base delay before first retry in ms (exponential backoff follows)\n# RETRY_BASE_DELAY_MS=100\n\n# Abort thinking model requests after this many ms (prevents quota exhaustion)\n# THINKING_TIMEOUT_MS=60000\n\n# Abort standard model requests after this many ms\n# REQUEST_TIMEOUT_MS=120000\n\n# Truncate large tool outputs (e.g., git diff) to reduce context size\n# TRUNCATE_TOOL_OUTPUT=true\n\n# Max chars kept per tool output after truncation\n# MAX_TOOL_OUTPUT_CHARS=12000\n\n# Chars kept from start of tool output when truncating\n# TOOL_OUTPUT_HEAD_CHARS=6000\n\n# Chars kept from end of tool output when truncating\n# TOOL_OUTPUT_TAIL_CHARS=2000\n\n# Absolute max request body size in bytes (returns 413 if exceeded)\n# MAX_REQUEST_BODY_BYTES=10485760\n\n# ── User Auth (ghcp-proxy allowed_users pattern) ──\n# Comma-separated list of allowed users (Proxy-Authorization or X-User-ID header)\n# ALLOWED_USERS=dev1,dev2\n\n# ── Model metadata (lmstudio-ollama-proxy enrichment) ──\n# Force all models to report full capabilities (chat/completion/vision/tools/agent)\nFORCE_ALL_CAPABILITIES=true\n\n# Force a specific context length for all models (0 = use auto-detection)\n# FORCE_CONTEXT_LENGTH=131072\n\n# Default context length fallback when not available from models.dev\nDEFAULT_CONTEXT_LENGTH=131072\n\n# Per-model metadata overrides (JSON). Example:\n# MODEL_METADATA_JSON={\"my-model\":{\"context_length\":32768,\"capabilities\":[\"chat\",\"tools\"],\"family\":\"my-family\",\"parameter_size\":\"7B\"}}\n\n# Passthrough base URL — forward unmatched paths to this upstream\n# PASSTHROUGH_BASE_URL=https://opencode.ai/zen/go/v1\n# Passthrough path prefixes (comma-separated, default /v1)\n# PASSTHROUGH_PREFIXES=/v1,/api/v0\n");
+      fs.writeFileSync(".env", "# OpenCode API key (optional — free models work without it)\n# Get yours at: https://opencode.ai\nOPENCODE_API_KEY=\n\n# Multi-key rotation (optional)\n# OPENCODE_API_KEYS=[\\\"key1\\\",\\\"key2\\\"]\n\n# Hide free models from the list (default false)\nHIDE_FREE=false\n\n# Enable Pollinations free models (pol/ prefix) — true by default\nUSE_POLL_MODELS=true\n\n# Pollinations API base URL (default: text.pollinations.ai OpenAI-compatible endpoint)\n# POLLINATIONS_BASE_URL=https://text.pollinations.ai/openai\n\n# Hide Pollinations models from the list (default false)\nHIDE_POLL=false\n\n# Hide Pollinations cosplay aliases (GPT-5, Claude, Gemini, DeepSeek, Llama-4, Mistral)\n# — true by default, shows only the real GPT-OSS 20B model. Set to false to show all 7.\n# HIDE_POLL_COSPLAY=true\n\n# Log incoming requests (default true)\nREQUEST_LOG=true\n\n# ── DLP / Content Blocklist (ghcp-proxy enrichment) ──\n# Enable prompt content filtering (default false)\nBLOCKLIST_ENABLED=false\n\n# Blocklist mode: \"block\" (deny with 403) or \"report\" (allow but log)\nBLOCKLIST_MODE=block\n\n# Comma-separated keywords to block (case-insensitive)\n# BLOCKLIST_KEYWORDS=secret,confidential,password\n\n# Comma-separated file name patterns to block\n# BLOCKLIST_FILEPATTERNS=passwords.txt,.env.production\n\n# Comma-separated regex patterns to block\n# BLOCKLIST_REGEX=sk-[A-Za-z0-9]{20,}\n\n# ── Concurrency & Rate Limiting (antigravity-copilot enrichment) ──\n# Maximum concurrent requests for thinking models (keep low to avoid upstream 429s)\n# CONCURRENCY_THINKING=1\n\n# Maximum concurrent requests for standard models\n# CONCURRENCY_STANDARD=3\n\n# Retry attempts for 429 / RESOURCE_EXHAUSTED errors (0 to disable)\n# RETRY_MAX=3\n\n# Base delay before first retry in ms (exponential backoff follows)\n# RETRY_BASE_DELAY_MS=100\n\n# Abort thinking model requests after this many ms (prevents quota exhaustion)\n# THINKING_TIMEOUT_MS=60000\n\n# Abort standard model requests after this many ms\n# REQUEST_TIMEOUT_MS=120000\n\n# Truncate large tool outputs (e.g., git diff) to reduce context size\n# TRUNCATE_TOOL_OUTPUT=true\n\n# Max chars kept per tool output after truncation\n# MAX_TOOL_OUTPUT_CHARS=12000\n\n# Chars kept from start of tool output when truncating\n# TOOL_OUTPUT_HEAD_CHARS=6000\n\n# Chars kept from end of tool output when truncating\n# TOOL_OUTPUT_TAIL_CHARS=2000\n\n# Absolute max request body size in bytes (returns 413 if exceeded)\n# MAX_REQUEST_BODY_BYTES=10485760\n\n# ── User Auth (ghcp-proxy allowed_users pattern) ──\n# Comma-separated list of allowed users (Proxy-Authorization or X-User-ID header)\n# ALLOWED_USERS=dev1,dev2\n\n# ── Model metadata (lmstudio-ollama-proxy enrichment) ──\n# Force all models to report full capabilities (chat/completion/vision/tools/agent)\nFORCE_ALL_CAPABILITIES=true\n\n# Force a specific context length for all models (0 = use auto-detection)\n# FORCE_CONTEXT_LENGTH=131072\n\n# Default context length fallback when not available from models.dev\nDEFAULT_CONTEXT_LENGTH=131072\n\n# Per-model metadata overrides (JSON). Example:\n# MODEL_METADATA_JSON={\"my-model\":{\"context_length\":32768,\"capabilities\":[\"chat\",\"tools\"],\"family\":\"my-family\",\"parameter_size\":\"7B\"}}\n\n# Passthrough base URL — forward unmatched paths to this upstream\n# PASSTHROUGH_BASE_URL=https://opencode.ai/zen/go/v1\n# Passthrough path prefixes (comma-separated, default /v1)\n# PASSTHROUGH_PREFIXES=/v1,/api/v0\n");
       log("Created .env — add your OPENCODE_API_KEY there to unlock paid models");
     }
   } catch { /* fs not available, ignore */ }
@@ -278,7 +278,7 @@ const MODEL_MAP = {};
 
 function mapModel(name) {
   let clean = (name || "").split(":")[0].trim();
-  clean = clean.replace(/^\s*\[(?:FREE|GO)\]\s*/i, "").trim();
+  clean = clean.replace(/^\s*\[(?:FREE_P|FREE|GO)\]\s*/i, "").trim();
   const mapped = MODEL_MAP[clean] || MODEL_MAP[clean.toLowerCase()];
   if (mapped) return mapped;
   return resolveModel(clean).id;
@@ -287,10 +287,56 @@ function mapModel(name) {
 function getWorkspaceRoot(messages) {
   for (const m of messages) {
     const c = typeof m.content === "string" ? m.content : "";
+    // VS Code Copilot: "workspace root path is: ..."
     const m2 = c.match(/workspace root path is:\s*(\S+)/i);
     if (m2) return m2[1].replace(/\\+$/, "").replace(/\\/g, "/");
+    // VS 2026 Copilot: "Path to the workspace root: ..."
+    const m3 = c.match(/path to (the )?workspace root:?\s*(\S+)/i);
+    if (m3) return (m3[2] || m3[1] || "").replace(/\\+$/, "").replace(/\\/g, "/");
+    // VS 2026: <CurrentWorkingDirectory>...</CurrentWorkingDirectory>
+    const m4 = c.match(/<CurrentWorkingDirectory>\s*([^<]+)\s*<\/CurrentWorkingDirectory>/i);
+    if (m4) return m4[1].trim().replace(/\\/g, "/");
+    // VS 2026: file path at start of user message
+    const m5 = c.match(/^([A-Za-z]:[\\/][^\n]+?)(?:\n|$)/);
+    if (m5 && (m5[1].includes("\\") || m5[1].includes("/"))) {
+      const p = m5[1].replace(/\\/g, "/");
+      const dir = p.lastIndexOf("/");
+      if (dir > 0) return p.substring(0, dir);
+    }
   }
   return "";
+}
+
+function getActiveFile(messages) {
+  for (const m of messages) {
+    const c = typeof m.content === "string" ? m.content : "";
+    // VS 2026: currently opened file
+    const m2 = c.match(/currently opened file:?\s*(\S+)/i);
+    if (m2) return m2[1].replace(/\\/g, "/");
+    // VS Code: active file
+    const m3 = c.match(/active file:?\s*(\S+)/i);
+    if (m3) return m3[1].replace(/\\/g, "/");
+  }
+  return "";
+}
+
+function getSelectedCode(messages) {
+  for (const m of messages) {
+    const c = typeof m.content === "string" ? m.content : "";
+    const m2 = c.match(/selected (?:code|text):?\s*\n?```[\w-]*\n?([\s\S]*?)```/i);
+    if (m2) return m2[1].trim();
+    const m3 = c.match(/<SelectedCode>([\s\S]*?)<\/SelectedCode>/i);
+    if (m3) return m3[1].trim();
+  }
+  return "";
+}
+
+function extractVSContext(messages) {
+  return {
+    workspace_root: getWorkspaceRoot(messages),
+    active_file: getActiveFile(messages),
+    selected_code: getSelectedCode(messages),
+  };
 }
 
 function _injectProjectUpdate(calls, messages, workspaceRoot) {
@@ -301,6 +347,9 @@ function extractToolCalls(text, workspaceRoot = "", messages = []) {
   if (!text) return { content: text || "", toolCalls: [] };
   const calls = [];
   let remaining = text;
+
+  // 0. Detect VS context from messages for better path resolution
+  const vsCtx = workspaceRoot ? { workspace_root: workspaceRoot } : extractVSContext(messages);
 
   // 1. Explicit ```tool blocks
   const toolBlockRe = /```tool\n(\{[\s\S]*?\})\n```/g;
@@ -325,21 +374,19 @@ function extractToolCalls(text, workspaceRoot = "", messages = []) {
     if (!fp || codeContent.length < 3 || codeContent.length > 200000) continue;
     // Skip project files — VS 2026 handles these natively
     if (/\.(csproj|vbproj|fsproj|jsproj|sln|xproj|dcproj|vcxproj|wsproj|njsproj)$/i.test(fp)) continue;
-    if (workspaceRoot && !/^[A-Za-z]:[/\\]/.test(fp)) {
-      fp = workspaceRoot.replace(/\\/g, "/").replace(/\/$/, "") + "/" + fp;
+    if (vsCtx.workspace_root && !/^[A-Za-z]:[/\\]/.test(fp)) {
+      fp = vsCtx.workspace_root.replace(/\/$/, "") + "/" + fp;
     }
     calls.push({
       id: callId(), type: "function",
       function: { name: "create_file", arguments: JSON.stringify({ filePath: fp, content: codeContent }) },
     });
-    // Keep the markdown visible — don't strip it from remaining
   }
 
   // Auto-inject project file update for created files
-  _injectProjectUpdate(calls, messages, workspaceRoot);
+  _injectProjectUpdate(calls, messages, vsCtx.workspace_root);
 
   if (calls.length === 0) return { content: text, toolCalls: [] };
-  // Only strip explicit ```tool blocks from content, keep markdown file creation visible
   return { content: remaining.replace(/\n{3,}/g, "\n\n").trim(), toolCalls: calls };
 }
 
@@ -420,20 +467,30 @@ async function handleTags(c) {
     if (vsc && sep) continue;
     if (!vsc && sep && config.hideFree) continue;
     if (config.hideFree && isFreeTierModel(m.model)) continue;
+    if (config.hidePoll && isPollModel(m.model)) continue;
     const id = m.model.replace(":latest", "");
     const rawId = id.split(":")[0].trim();
     if (seen.has(rawId)) continue;
     seen.add(rawId);
 
     const isFree = isFreeTierModel(m.model);
+    const isPoll = isPollModel(m.model);
+    const prefix = isPoll ? "[FREE_P] " : (isFree ? "[FREE] " : "[GO] ");
     const family = m.details?.family || rawId;
+    const metadata = resolveModelMetadata(rawId);
+    const caps = metadata.capabilities || [];
+    const ctxLen = metadata.context_length || config.defaultContextLength;
     models.push({
-      name: vsc ? (isFree ? "[FREE] " : "[GO] ") + m.name : m.name,
+      name: vsc ? prefix + m.name : m.name,
       model: vsc ? id : m.model,
       modified_at: now,
       size: m.size || 0,
       digest: m.digest || rawId,
       maxParams: m.maxParams || 0,
+      capabilities: caps,
+      context_length: ctxLen,
+      max_output_tokens: 4096,
+      pricing: isPoll ? "free_poll" : (isFree ? "free" : "premium"),
       details: {
         parent_model: m.details?.parent_model || "",
         format: m.details?.format || "gguf",
@@ -508,7 +565,158 @@ app.get("/api/stats", async c => {
   });
 });
 
+// ── Force model refresh endpoint (like wienans refreshModels command) ──
+app.post("/api/refresh", async c => {
+  log("Force model refresh requested");
+  const start = Date.now();
+  await refreshModels();
+  const models = await getModels();
+  const real = models.filter(m => !isSeparator(m.model));
+  return c.json({
+    status: "refreshed",
+    elapsed_ms: Date.now() - start,
+    model_count: real.length,
+    models: real.map(m => m.name).sort(),
+  });
+});
+
+// ── Diagnostics / self-test endpoint (like wienans selfTest command) ──
+app.post("/api/diagnostics", async c => {
+  const body = await getBody(c);
+  const testModel = body.model || config.defaultModel;
+  const testModelId = mapModel(testModel);
+  const info = resolveModel(testModelId);
+  const metadata = resolveModelMetadata(testModelId);
+
+  const results = {
+    proxy: "GHCP2OpenCode",
+    version: "420.96.00",
+    timestamp: new Date().toISOString(),
+    authenticated: config.hasKey,
+    concurrency_manager: ModelConcurrencyManager.getInstance().getStats(),
+    models_cached: (await getModels()).filter(m => !isSeparator(m.model)).length,
+  };
+
+  const diagnostics = {
+    connectivity: { status: "unknown", latency_ms: 0, error: null },
+    streaming: { status: "unknown", chunks: 0, error: null },
+    tool_calling: { status: "unknown", tool_calls: 0, error: null },
+    model_info: {
+      id: info.id,
+      name: info.name,
+      family: metadata.family,
+      context_length: metadata.context_length,
+      capabilities: metadata.capabilities,
+      is_free: isFreeTierModel(testModelId),
+    },
+  };
+
+  // Step 1: Connectivity check
+  try {
+    const start = Date.now();
+    const cm = ModelConcurrencyManager.getInstance();
+    const toolDef = {
+      type: "function",
+      function: {
+        name: "diagnostics_get_time",
+        description: "Returns the current server time",
+        parameters: { type: "object", properties: {}, additionalProperties: false },
+      },
+    };
+    const req = {
+      model: testModelId,
+      messages: [
+        { role: "system", content: compactIdentity(testModelId) + "\nRun a diagnostics check. Call the diagnostics_get_time tool exactly once." },
+        { role: "user", content: "Run diagnostics: call the provided tool exactly once and respond with 'Diagnostics OK' plus the tool result." },
+      ],
+      tools: [toolDef],
+      stream: true,
+    };
+
+    let fullText = "";
+    let chunkCount = 0;
+    let allToolCalls = [];
+    let hasToolCalls = false;
+    let reasoningContent = null;
+    const tcBuilders = new Map();
+
+    await cm.acquireModel(testModelId);
+    try {
+      for await (const chunk of chatCompletion(req)) {
+        const msg = chunk.message;
+        if (!msg) continue;
+        chunkCount++;
+
+        if (msg.content) fullText += msg.content;
+        if (msg.reasoning_content) reasoningContent = msg.reasoning_content;
+        if (msg.reasoning) reasoningContent = msg.reasoning;
+
+        if (msg.tool_calls?.length) {
+          for (const tc of msg.tool_calls) {
+            const idx = tc.index ?? 0;
+            let b = tcBuilders.get(idx);
+            if (!b) {
+              b = { id: tc.id || `call_${crypto.randomUUID().slice(0, 8)}`, type: tc.type || "function", function: { name: "", arguments: "" } };
+              tcBuilders.set(idx, b);
+            }
+            if (tc.id) b.id = tc.id;
+            if (tc.type) b.type = tc.type;
+            if (tc.function?.name) b.function.name = tc.function.name;
+            if (tc.function?.arguments) b.function.arguments += tc.function.arguments;
+          }
+        }
+      }
+    } finally {
+      cm.releaseModel(testModelId);
+    }
+
+    allToolCalls = [...tcBuilders.values()];
+    hasToolCalls = allToolCalls.length > 0;
+
+    diagnostics.connectivity = { status: "ok", latency_ms: Date.now() - start, error: null };
+    diagnostics.streaming = { status: "ok", chunks: chunkCount, error: null };
+    diagnostics.tool_calling = { status: hasToolCalls ? "ok" : "not_detected", tool_calls: allToolCalls.length, error: null };
+
+    if (fullText) {
+      diagnostics.response_sample = fullText.slice(0, 300);
+    }
+    if (reasoningContent) {
+      diagnostics.reasoning = reasoningContent.slice(0, 300);
+    }
+    if (hasToolCalls) {
+      diagnostics.tool_calling.tools_called = allToolCalls.map(tc => ({
+        name: tc.function.name,
+        call_id: tc.id,
+        args_preview: (tc.function.arguments || "").slice(0, 200),
+      }));
+    }
+
+    results.status = "ok";
+    if (!hasToolCalls) {
+      results.status = "degraded";
+      diagnostics.tool_calling.error = "No tool calls detected — check model capabilities";
+    }
+  } catch (e) {
+    diagnostics.connectivity = { status: "failed", latency_ms: 0, error: e.message };
+    diagnostics.streaming = { status: "skipped", chunks: 0, error: "connectivity failed" };
+    diagnostics.tool_calling = { status: "skipped", tool_calls: 0, error: "connectivity failed" };
+    results.status = "failed";
+    results.error = e.message;
+  }
+
+  results.diagnostics = diagnostics;
+  return c.json(results);
+});
+
 // ── OpenAI-compatible v1 endpoints (VS Copilot uses these) ──
+
+function inferPromptCaching(modelId) {
+  const lower = (modelId || "").toLowerCase();
+  if (lower.includes("claude") || lower.includes("anthropic")) return "anthropic";
+  if (lower.includes("gpt-4") || lower.includes("gpt-5") || lower.includes("o3") || lower.includes("o4") || lower.includes("o1")) return "openai";
+  if (lower.includes("gemini")) return "google";
+  return "none";
+}
 
 function inferTokenizer(family) {
   const f = (family || "").toLowerCase();
@@ -534,9 +742,12 @@ app.get("/v1/models", async c => {
   for (const m of models) {
     if (isSeparator(m.model)) continue;
     if (config.hideFree && isFreeTierModel(m.model)) continue;
+    if (config.hidePoll && isPollModel(m.model)) continue;
     const rawId = m.model.replace(":latest", "").split(":")[0].trim();
     const isFree = isFreeTierModel(m.model);
-    const id = vsc ? (isFree ? `[FREE] ${m.name}` : `[GO] ${m.name}`) : m.name;
+    const isPoll = isPollModel(m.model);
+    const prefix = isPoll ? "[FREE_P] " : (isFree ? "[FREE] " : "[GO] ");
+    const id = vsc ? prefix + m.name : m.name;
     const metadata = resolveModelMetadata(rawId);
     const family = metadata.family;
     const caps = metadata.capabilities || [];
@@ -556,6 +767,11 @@ app.get("/v1/models", async c => {
         supports: {
           tool_calls: supportsTools,
           parallel_tool_calls: supportsTools,
+          vision: caps.includes("vision"),
+          agent: caps.includes("agent"),
+          streaming: true,
+          prompt_caching: caps.includes("tools") || caps.includes("agent"),
+          prompt_caching_type: inferPromptCaching(rawId),
         },
         limits: {
           max_prompt_tokens: maxPrompt,
@@ -566,6 +782,9 @@ app.get("/v1/models", async c => {
         type: "chat",
         family,
       },
+      pricing: isPoll ? "free_poll" : (isFree ? "free" : "premium"),
+      context_length: ctxLen,
+      max_output_tokens: 4096,
     });
   }
 
@@ -1101,7 +1320,9 @@ app.post("/api/show", async c => {
   const vsc = isVSCode(c);
   const vs2026 = isVS2026(c);
   const isFree = isFreeTierModel(goId);
-  const displayName = vsc ? (isFree ? "[FREE] " : "[GO] ") + info.name : info.name;
+  const isPoll = isPollModel(goId);
+  const prefix = isPoll ? "[FREE_P] " : (isFree ? "[FREE] " : "[GO] ");
+  const displayName = vsc ? prefix + info.name : info.name;
   return c.json({
     license: "See OpenAI license terms for this model.",
     modelfile: `# ${info.name} (via OpenCode Go)\nFROM ${goId}`,
@@ -1109,6 +1330,10 @@ app.post("/api/show", async c => {
     template: '{{ if .System }}<|im_start|>system\n{{ .System }}<|im_end|>\n{{ end }}{{ range .Messages }}<|im_start|>{{ .Role }}\n{{ .Content }}<|im_end|>\n{{ end }}<|im_start|>assistant\n',
     version: "1.0.0",
     billing: { multiplier: 1 },
+    pricing: isPoll ? "free_poll" : (isFree ? "free" : "premium"),
+    context_length: ctxLen,
+    max_output_tokens: 4096,
+    capabilities: caps,
     details: {
       parent_model: "",
       format: "gguf",
@@ -1123,8 +1348,8 @@ app.post("/api/show", async c => {
       "general.architecture": "opencode",
       "general.file_type": 15,
       "opencode.context_length": ctxLen,
+      "opencode.capabilities": caps.join(", "),
     },
-    capabilities: caps,
     modified_at: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
   });
 });
@@ -1451,23 +1676,30 @@ const line = (l) => {
 const hr = S + "\u2500".repeat(boxW - 2);
 
 const hasPaid = models.some(m => m.model === `${SEP_PAID}:latest`);
+const hasPoll = models.some(m => m.model === `${SEP_FREE_P}:latest`);
+const modeLabel = hasPaid
+  ? (config.hideFree ? " \x1b[32m(go mode)\x1b[90m" : " \x1b[32m(free&go mode)\x1b[90m")
+  : (hasPoll ? " \x1b[33m(free+poll mode)\x1b[90m" : " \x1b[33m(free mode)\x1b[90m");
 if (hasPaid) log("\x1b[32m[status] Authenticated — free & paid models\x1b[0m");
+else if (hasPoll) log("\x1b[33m[status] Free mode — OpenCode free + Pollinations\x1b[0m");
 else log("\x1b[33m[status] Free mode — no API key\x1b[0m");
 
 P("");
 P(W + "\u256d" + hr + W + "\u256e" + R);
 P(line(S + B + "\u250f\u2513\u2513\u250f\u250f\u2513\u250f\u2513\u250f\u2513\u250f\u2513\u250f\u2513" + R));
-P(line(S + B + "\u2503\u2513\u2523\u252b\u2503 \u2503\u2503\u250f\u251b\u2503\u2503\u2503 " + R + " " + S + "github copilot proxy" + (hasPaid ? (config.hideFree ? " \x1b[32m(go mode)\x1b[90m" : " \x1b[32m(free&go mode)\x1b[90m") : " \x1b[33m(free mode)\x1b[90m") + R));
+P(line(S + B + "\u2503\u2513\u2523\u252b\u2503 \u2503\u2503\u250f\u251b\u2503\u2503\u2503 " + R + " " + S + "github copilot proxy" + modeLabel + R));
 P(line(S + B + "\u2517\u251b\u251b\u2517\u2517\u251b\u2523\u251b\u2517\u2501\u2517\u251b\u2517\u251b" + R));
 P(W + "\u251c" + hr + W + "\u2524" + R);
 const portLabel = port === 11434 ? `port: ${port} (default)` : `port: ${port}`;
 P(line(S + portLabel + "  │  vs2026  │  models.dev" + R));
 P(W + "\u251c" + hr + W + "\u2524" + R);
 
-// Split models into free / paid by separators
+// Split models into free / poll / paid by separators
 const freeStart = models.findIndex(m => m.model === `${SEP_FREE}:latest`);
+const pollStart = models.findIndex(m => m.model === `${SEP_FREE_P}:latest`);
 const paidStart = models.findIndex(m => m.model === `${SEP_PAID}:latest`);
-const freeModels = models.slice(freeStart + 1, paidStart >= 0 ? paidStart : models.length);
+const freeModels = freeStart >= 0 ? models.slice(freeStart + 1, pollStart >= 0 ? pollStart : (paidStart >= 0 ? paidStart : models.length)) : [];
+const pollModels = pollStart >= 0 ? models.slice(pollStart + 1, paidStart >= 0 ? paidStart : models.length) : [];
 const paidModels = paidStart >= 0 ? models.slice(paidStart + 1) : [];
 
 function printTable(list) {
@@ -1485,6 +1717,13 @@ if (!config.hideFree && freeModels.length) {
   P(line(S + "Free: " + S + `(${freeModels.length})` + R));
   P(line(S + "Name".padEnd(20) + " \u2502 " + "ID".padEnd(24) + " \u2502 " + "Context" + R));
   printTable(freeModels);
+}
+
+if (!config.hidePoll && pollModels.length) {
+  if (!config.hideFree && freeModels.length) P(line(""));
+  P(line(S + "Pollinations: " + S + `(${pollModels.length})` + R));
+  P(line(S + "Name".padEnd(20) + " \u2502 " + "ID".padEnd(24) + " \u2502 " + "Context" + R));
+  printTable(pollModels);
 }
 
 if (hasPaid) {

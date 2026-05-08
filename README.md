@@ -151,10 +151,13 @@ To create a new file, just ask Copilot (e.g. "create me a css file called test.c
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/tags` | GET | Ollama model list |
+| `/api/tags` | GET | Ollama model list with capabilities, context length, pricing |
 | `/v1/chat/completions` | POST | Chat with tool calling, streaming, cache |
 | `/v1/engines/copilot-codex/completions` | POST | Inline code completions |
+| `/api/show` | POST | Model detail with full capabilities, context, pricing |
 | `/api/stats` | GET | Proxy metrics (uptime, model counts, concurrency, reasoning cache, key status) |
+| `/api/refresh` | POST | Force refresh model list from upstream APIs |
+| `/api/diagnostics` | POST | Self-test with tool-calling roundtrip (connectivity, streaming, tool verification) |
 | `/health` | GET | Health check with model counts |
 | `/api/version` | GET | Returns `420.96.00` |
 | `/stop` | GET | Shutdown |
@@ -203,6 +206,55 @@ When VS fetches `/api/tags`, the proxy re-checks `.env` for key changes (SHA256 
 
 LRU in-memory with TTL. Responses keyed by hashed prompt. Hits replay instantly with zero tokens. Disable with `CACHE_ENABLED=false`.
 
+### Disk cache invalidation
+
+When `FREE_TIER_MODELS` changes in code (new providers added), the disk cache auto-invalidates via a hash of all free tier model IDs. No manual cache clearing needed.
+
+---
+
+## Pollinations Free Models
+
+6 free models via [Pollinations](https://text.pollinations.ai) (GPT-OSS 20B backend, reasoning + tools):
+
+| Model ID | Display Name | Context |
+|----------|-------------|---------|
+| `pol/openai-fast` | Pollinations GPT-OSS 20B | 131K |
+| `pol/GPT-5` | Pollinations GPT-5 | 131K |
+| `pol/Claude` | Pollinations Claude | 200K |
+| `pol/Gemini` | Pollinations Gemini | 1M |
+| `pol/DeepSeek` | Pollinations DeepSeek | 131K |
+| `pol/Llama-4` | Pollinations Llama 4 | 131K |
+| `pol/Mistral` | Pollinations Mistral | 131K |
+
+All route through the same Pollinations `openai` backend — no API key required. By default, only the clean `pol/openai-fast` model is shown. The 6 cosplay aliases are hidden unless `HIDE_POLL_COSPLAY=false` is set.
+
+### Pollinations env vars
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `USE_POLL_MODELS` | `true` | Enable Pollinations models |
+| `HIDE_POLL` | `false` | Hide all Pollinations models |
+| `HIDE_POLL_COSPLAY` | `true` | Hide cosplay aliases (GPT-5, Claude, Gemini, DeepSeek, Llama-4, Mistral) — only show GPT-OSS 20B |
+| `POLLINATIONS_BASE_URL` | `https://text.pollinations.ai/openai` | Pollinations API endpoint |
+
+---
+
+## Prompt Compression
+
+Enriched from [OmniRoute](https://github.com/diegosouzapw/OmniRoute) (RTK+Caveman stacked compression) and [caveman](https://github.com/JuliusBrussee/caveman). 7 compression levels available:
+
+| Level | Savings | Description |
+|-------|---------|-------------|
+| `off` | 0% | No compression |
+| `lite` | ~15% | Whitespace collapse, dedup system prompts |
+| `caveman` / `standard` | ~30% | 30+ regex rules: filler removal, context condensation, structural compression, multi-turn dedup |
+| `aggressive` | ~50% | All Caveman + progressive message aging + tool result summarization |
+| `ultra` | ~75% | All Aggressive + heuristic token pruning + stopword removal |
+| `rtk` | 60-90% | Command-aware filters for shell/test/build/git output |
+| `stacked` | 78-95% | RTK first, then Caveman — best for mixed prompts with tool logs + prose |
+
+Functions available in `token-optimizer.js`: `compressContent()`, `compressMessages()`, `compressBest()`, `estimatedSavings()`.
+
 ---
 
 ## Tech Stack
@@ -211,21 +263,6 @@ LRU in-memory with TTL. Responses keyed by hashed prompt. Hits replay instantly 
 
 ## Credits
 
-This project incorporates patterns and features from the following open-source projects:
+See **[credits.md](credits.md)** for the full list of open-source projects that inspired patterns and features in GHCP2OpenCode.
 
-| Project | Key Contributions |
-|---------|-------------------|
-| [copilot-proxy](https://github.com/chew-z/copilot-proxy) | Ollama provider pattern, `/api/tags` + `/api/show`, optimized HTTP client (connection pooling), true upstream SSE streaming (per-chunk delta piping), graceful shutdown (SIGINT/SIGTERM/SIGHUP), per-message role validation, auto-enable `tool_stream` |
-| [Qwen-Copilot-Proxy](https://github.com/edwardgj/Qwen-Copilot-Proxy) | Health status granularity (`healthy`/`degraded`/`unhealthy`), key freshness tracking, `/version` endpoint, configurable `MAX_RETRIES`, input validation |
-| [raven](https://github.com/nocoo/raven) | Bun+Hono architecture, SQLite tracking pattern |
-| [Proxllama](https://github.com/Michediana/Proxllama) | SSE→NDJSON streaming conversion, `num_ctx`/`num_predict` in `/api/show`, chat template, `format`→`response_format` mapping, `stop` parameter forwarding, streaming token counting, real upstream usage stats propagation |
-| [GHCOllamaMiniMaxProxy](https://github.com/jaggerjack61/GHCOllamaMiniMaxProxy) | Configurable model names, thinking budgets, per-model defaults |
-| [vLLM-proxy-for-VS-Code](https://github.com/nbuckley/vLLM-proxy-for-VS-Code) | Parameter normalization (camelCase→snake_case), think tag parsing, special token sanitization, reasoning field aliasing, port availability check, model metadata inference |
-| [copilot-ollama](https://github.com/andydixon/copilot-ollama) | Inline code completions endpoint, Copilot-compatible `/v1/models` capabilities |
-| [OpenCode #25997](https://github.com/anomalyco/opencode/pull/25997) | OpenCode skills integration |
-| [LLM-API-Key-Proxy](https://github.com/Mirrowel/LLM-API-Key-Proxy) | Key rotation patterns |
-| [Ollama](https://github.com/ollama/ollama) | API interface specification |
-| [ghcp-proxy](https://github.com/kylercai/ghcp-proxy) | User auth/identity extraction, structured request logging, stats endpoint |
-| [antigravity-copilot](https://github.com/punal100/antigravity-copilot) | Concurrency queue (semaphore-based, thinking/standard separation), aggressive retry with exponential backoff (Antigravity IDE-style), per-model request timeouts, tool output truncation, request body size limit, client abort propagation, configurable concurrency limits |
-| [lmstudio-ollama-proxy](https://github.com/NeoTech/lmstudio-ollama-proxy) | Per-model metadata overrides (`MODEL_METADATA_JSON`), configurable context length (`FORCE_CONTEXT_LENGTH`/`DEFAULT_CONTEXT_LENGTH`), force capabilities (`FORCE_ALL_CAPABILITIES`), passthrough proxy, improved `/api/ps`, capabilities inference |
-| [copilot-plugin-mcp-server](https://github.com/barrersoftware/copilot-plugin-mcp-server) | Token optimization — 25-65% token reduction via description compression, schema simplification, and compact identity/tool prompts |
+Key inspirations include [copilot-proxy](https://github.com/chew-z/copilot-proxy), [Qwen-Copilot-Proxy](https://github.com/edwardgj/Qwen-Copilot-Proxy), [Proxllama](https://github.com/Michediana/Proxllama), [vLLM-proxy-for-VS-Code](https://github.com/nbuckley/vLLM-proxy-for-VS-Code), [antigravity-copilot](https://github.com/punal100/antigravity-copilot), [OmniRoute](https://github.com/diegosouzapw/OmniRoute), [OpenCode Zen Provider](https://github.com/wienans/vsc-opencode-zen-chat-provider), and many more.

@@ -41,6 +41,15 @@ const FREE_TIER_MODELS = [
   { id: "minimax-m2.5-free", name: "MiniMax M2.5 Free", family: "minimax-free", tools: true, vision: true },
   { id: "nemotron-3-super-free", name: "Nemotron 3 Super Free", family: "nemotron-free", tools: true, vision: true },
   { id: "trinity-large-preview-free", name: "Trinity Large Preview", family: "trinity", tools: true, vision: true },
+  // Pollinations (pol/) — free, no key needed — all map to openai backend
+  { id: "pol/openai-fast", name: "Pollinations GPT-OSS 20B", family: "poll-gptoss", context: 131072, tools: true, vision: false, _poll: true, _pollModel: "openai" },
+  // Cosplay aliases — LLM roleplays the model name, same openai-fast backend
+  { id: "pol/GPT-5", name: "Pollinations GPT-5", family: "poll-gpt", context: 131072, tools: true, vision: false, _poll: true, _pollCosplay: true, _pollModel: "openai" },
+  { id: "pol/Claude", name: "Pollinations Claude", family: "poll-claude", context: 200000, tools: true, vision: false, _poll: true, _pollCosplay: true, _pollModel: "openai" },
+  { id: "pol/Gemini", name: "Pollinations Gemini", family: "poll-gemini", context: 1048576, tools: true, vision: false, _poll: true, _pollCosplay: true, _pollModel: "openai" },
+  { id: "pol/DeepSeek", name: "Pollinations DeepSeek", family: "poll-deepseek", context: 131072, tools: true, vision: false, _poll: true, _pollCosplay: true, _pollModel: "openai" },
+  { id: "pol/Llama-4", name: "Pollinations Llama 4", family: "poll-llama", context: 131072, tools: true, vision: false, _poll: true, _pollCosplay: true, _pollModel: "openai" },
+  { id: "pol/Mistral", name: "Pollinations Mistral", family: "poll-mistral", context: 131072, tools: true, vision: false, _poll: true, _pollCosplay: true, _pollModel: "openai" },
 ];
 
 function fmtParamSize(val) {
@@ -61,6 +70,8 @@ function buildFreeTierModels() {
   const allModels = { ...((_mdCache && _mdCache["opencode-go"]?.models) || {}), ...((_mdCache && _mdCache["opencode"]?.models) || {}) };
   const active = FREE_TIER_MODELS.filter(m => {
     if (m._active === false) return false;
+    if (m._poll && !config.usePollModels) return false;
+    if (m._pollCosplay && config.hidePollCosplay) return false;
     if (allModels[m.id]?.status === "deprecated") return false;
     return true;
   });
@@ -75,7 +86,7 @@ function buildFreeTierModels() {
       modified_at: now,
       size: 0,
       digest: m.id,
-      maxParams: mdModel?.limit?.context || "",
+      maxParams: mdModel?.limit?.context || m.context || "",
       details: {
         parent_model: "",
         format: "gguf",
@@ -117,6 +128,12 @@ async function pingFreeModel(m) {
 export async function validateFreeModels() {
   console.log("[models] pinging free models...");
   const results = await Promise.all(FREE_TIER_MODELS.map(async (m) => {
+    if (m._poll) {
+      // Pollination models don't go through OpenCode free API — skip ping
+      m._active = true;
+      console.log(`[models]   ${m.id} - SKIP (poll)`);
+      return true;
+    }
     const { ok, ms } = await pingFreeModel(m);
     m._active = ok;
     console.log(`[models]   ${m.id} - ${ok ? "OK" : "OFFLINE"} (${ms}ms)`);
@@ -142,17 +159,23 @@ function sepModel(id, label) {
 
 export function isFreeTierModel(id) {
   const clean = (id || "").split(":")[0].trim().toLowerCase();
-  return FREE_TIER_MODELS.some(m => m.id === clean);
+  return FREE_TIER_MODELS.some(m => m.id.toLowerCase() === clean);
+}
+
+export function isPollModel(id) {
+  const clean = (id || "").split(":")[0].trim();
+  return FREE_TIER_MODELS.some(m => m._poll && m.id.toLowerCase() === clean.toLowerCase());
 }
 
 export function isSeparator(id) {
   const clean = (id || "").split(":")[0].trim().toLowerCase();
-  return clean === SEP_FREE || clean === SEP_PAID ||
-    clean === "== free ==" || clean === "== premium ==";
+  return clean === SEP_FREE || clean === SEP_PAID || clean === SEP_FREE_P ||
+    clean === "== free ==" || clean === "== premium ==" || clean === "== poll ==";
 }
 
 const SEP_FREE = "(free)";
 const SEP_PAID = "(go)";
+const SEP_FREE_P = "(free_p)";
 
 const config = {
   get apiKey() { return Bun.env.OPENCODE_API_KEY ?? ""; },
@@ -165,6 +188,7 @@ const config = {
   },
   baseUrl: Bun.env.OPENCODE_BASE_URL ?? "https://opencode.ai/zen/go/v1",
   baseUrlFree: Bun.env.OPENCODE_BASE_FREE_URL ?? "https://opencode.ai/zen/v1",
+  baseUrlPoll: Bun.env.POLLINATIONS_BASE_URL ?? "https://text.pollinations.ai/openai",
   host: Bun.env.SERVER_HOST ?? "127.0.0.1",
   port: parseInt(Bun.env.SERVER_PORT ?? "11434", 10),
   defaultModel: Bun.env.DEFAULT_MODEL ?? "big-pickle",
@@ -178,6 +202,17 @@ const config = {
   },
   get hideFree() {
     return Bun.env.HIDE_FREE === "true" || Bun.env.HIDE_FREE === "1";
+  },
+  get hidePoll() {
+    return Bun.env.HIDE_POLL === "true" || Bun.env.HIDE_POLL === "1";
+  },
+  get usePollModels() {
+    const v = Bun.env.USE_POLL_MODELS;
+    return v === undefined ? true : v === "true" || v === "1";
+  },
+  get hidePollCosplay() {
+    const v = Bun.env.HIDE_POLL_COSPLAY;
+    return v === undefined ? true : v === "true" || v === "1";
   },
   get forceAllCapabilities() {
     return (Bun.env.FORCE_ALL_CAPABILITIES ?? "true") !== "false";
@@ -388,6 +423,14 @@ async function checkKeyChanged() {
   return false;
 }
 
+function freeTierHash() {
+  const ids = FREE_TIER_MODELS.map(m => m.id).join("|");
+  if (_crypto) return _crypto.createHash("sha256").update(ids).digest("hex").slice(0, 12);
+  let h = 0;
+  for (let i = 0; i < ids.length; i++) { h = ((h << 5) - h + ids.charCodeAt(i)) | 0; }
+  return (h >>> 0).toString(36);
+}
+
 function loadModelsFromDisk() {
   try {
     if (!_fs) return false;
@@ -398,9 +441,22 @@ function loadModelsFromDisk() {
     }
     const data = JSON.parse(_fs.readFileSync(getDiskPath(), "utf8"));
     if (data._models?.length) {
+      // Invalidate cache if FREE_TIER_MODELS changed (new models added/removed)
+      if (!data._freeTierHash || data._freeTierHash !== freeTierHash()) {
+        console.log("[models] free tier models changed — forcing refresh");
+        return false;
+      }
       _models = data._models;
       _modelMap = data._modelMap || {};
       _nameToId = data._nameToId || {};
+      // Strip cosplay models from cached data when hidden
+      if (config.hidePollCosplay) {
+        const cosplayIds = new Set(FREE_TIER_MODELS.filter(m => m._pollCosplay).map(m => m.id.toLowerCase()));
+        _models = _models.filter(m => {
+          const rawId = (m.model || "").replace(":latest", "").toLowerCase();
+          return !cosplayIds.has(rawId);
+        });
+      }
       console.log(`[models] loaded ${_models.length} from disk cache`);
       return true;
     }
@@ -411,9 +467,10 @@ function loadModelsFromDisk() {
 async function saveModelsToDisk() {
   try {
     await _loadFs();
+    await _loadCrypto();
     const path = getDiskPath();
     if (!_models?.length) return;
-    _fs.writeFileSync(path, JSON.stringify({ _models, _modelMap, _nameToId, _keyHash: keyHash() }));
+    _fs.writeFileSync(path, JSON.stringify({ _models, _modelMap, _nameToId, _keyHash: keyHash(), _freeTierHash: freeTierHash() }));
     console.log(`[cache] saved to ${path}`);
   } catch (e) {
     console.error(`[cache] save failed: ${e.message}`);
@@ -446,8 +503,17 @@ async function fetchModels() {
   // Always start with free tier models (alphabetical)
   const models = [];
   if (!config.hideFree) {
-    models.push(sepModel(SEP_FREE, "== FREE =="));
-    models.push(...buildFreeTierModels());
+    const allFree = buildFreeTierModels();
+    const regFree = allFree.filter(m => !isPollModel(m.model));
+    const pollFree = allFree.filter(m => isPollModel(m.model));
+    if (regFree.length) {
+      models.push(sepModel(SEP_FREE, "== FREE =="));
+      models.push(...regFree);
+    }
+    if (pollFree.length && !config.hidePoll) {
+      models.push(sepModel(SEP_FREE_P, "== POLL =="));
+      models.push(...pollFree);
+    }
   }
   const freeSet = new Set(FREE_TIER_MODELS.map(m => m.id));
   let paidFrom = "";
@@ -627,9 +693,9 @@ export function resolveModel(name) {
   
   if (_modelMap[clean]) return _modelMap[clean];
   const nmId = _nameToId[clean];
-  if (nmId && _modelMap[nmId]) return _modelMap[nmId];
+  if (nmId && _modelMap[nmId.toLowerCase()]) return _modelMap[nmId.toLowerCase()];
   
-  const freeMatch = FREE_TIER_MODELS.find(m => m.id === clean);
+  const freeMatch = FREE_TIER_MODELS.find(m => m.id.toLowerCase() === clean);
   if (freeMatch) return { id: freeMatch.id, name: freeMatch.name, tools: freeMatch.tools, vision: freeMatch.vision };
   
   return { id: clean, name: clean, tools: true, vision: false, unverified: true };
@@ -642,7 +708,7 @@ export function isKnownModel(id) {
   if (isSeparator(clean)) return true;
   if (_modelMap[clean]) return true;
   if (_nameToId[clean]) return true;
-  if (FREE_TIER_MODELS.find(m => m.id === clean)) return true;
+  if (FREE_TIER_MODELS.find(m => m.id.toLowerCase() === clean)) return true;
   return false;
 }
 
@@ -654,7 +720,7 @@ function isoNow() { return new Date().toISOString(); }
 
 export class APIError extends Error {
   constructor(status, body, message) {
-    super(message || `OpenCode API ${status}`);
+    super(message || `API ${status}`);
     this.status = status;
     this.body = body;
     this.name = "APIError";
@@ -675,15 +741,28 @@ const ERROR_CODES = {
   504: "gateway_timeout",
 };
 
+function resolvePollModelName(id) {
+  const clean = (id || "").split(":")[0].trim();
+  const def = FREE_TIER_MODELS.find(m => m._poll && m.id.toLowerCase() === clean.toLowerCase());
+  return def?._pollModel || clean;
+}
+
 async function zenRequest(endpoint, body, opts = {}) {
-  const base = isFreeTierModel(body.model) ? config.baseUrlFree : config.baseUrl;
+  const isPoll = isPollModel(body.model);
+  const isFree = !isPoll && isFreeTierModel(body.model);
+  const base = isPoll ? config.baseUrlPoll : (isFree ? config.baseUrlFree : config.baseUrl);
   const url = `${base}${endpoint}`;
   const key = withKey();
-  const isFree = isFreeTierModel(body.model);
   const clientTag = opts?.clientTag || "";
   
   if (isSeparator(body.model)) {
     throw new APIError(400, "", "This is a category header, not a model. Please select an actual model from the list.");
+  }
+
+  // Map poll model names to Pollinations-native model IDs
+  const sendBody = { ...body };
+  if (isPoll) {
+    sendBody.model = resolvePollModelName(body.model);
   }
   
   const lastMsg = body.messages?.[body.messages.length - 1];
@@ -691,28 +770,32 @@ async function zenRequest(endpoint, body, opts = {}) {
   const preview = prompt.replace(/\s+/g, " ").trim().slice(0, 60);
   if (config.requestLog) {
     const tag = clientTag ? ` [${clientTag}]` : "";
-    console.log(`[zen]${tag} ${body.model || "?"}${isFree ? " (free)" : ""} — "${preview}${prompt.length > 60 ? "\u2026" : ""}"`);
+    const label = isPoll ? " (poll)" : (isFree ? " (free)" : "");
+    console.log(`[zen]${tag} ${body.model || "?"}${label} — "${preview}${prompt.length > 60 ? "\u2026" : ""}"`);
   }
 
   const headers = {
     "Content-Type": "application/json",
   };
   
+  // Poll models: no auth needed (free public API)
   // Free models: never send auth. Paid: require key.
-  if (key && !isFree) {
+  if (isPoll) {
+    // Pollinations is a public API, no auth needed
+  } else if (key && !isFree) {
     headers["Authorization"] = `Bearer ${key}`;
   } else if (!isFree) {
     throw new APIError(401, "", "No API key configured. Free tier models can be used without a key.");
   }
 
-  const resp = await _fetchWithAgent(url, { method: "POST", headers, body: JSON.stringify(body), signal: opts?.signal });
+  const resp = await _fetchWithAgent(url, { method: "POST", headers, body: JSON.stringify(sendBody), signal: opts?.signal });
 
   if (!resp.ok) {
     const txt = await resp.text().catch(() => "");
     console.error(`[zen] ${resp.status}`);
 
     // Extract detailed error from upstream JSON responses
-    let upstreamMsg = "OpenCode API error";
+    let upstreamMsg = "API error";
     let code = ERROR_CODES[resp.status] || "api_error";
     let mappedStatus = resp.status;
     try {
@@ -739,10 +822,13 @@ async function zenRequest(endpoint, body, opts = {}) {
       return zenRequest(endpoint, body, { ...opts, retries: retries + 1 });
     }
 
-    // Network errors also retry up to max
+    // Network errors also retry up to max, with backoff for free/poll models
     if (resp.status === 502 || resp.status === 503 || resp.status === 504) {
-      if (retries < maxRetries) {
-        if (config.requestLog) console.log(`[zen] retry ${retries + 1}/${maxRetries} on upstream ${resp.status}`);
+      const max = isPoll || isFree ? Math.min(maxRetries, 1) : maxRetries;
+      if (retries < max) {
+        const delay = (isPoll || isFree) ? 2000 * (retries + 1) : 500 * (retries + 1);
+        if (config.requestLog) console.log(`[zen] retry ${retries + 1}/${max} in ${delay}ms on upstream ${resp.status}`);
+        await new Promise(r => setTimeout(r, delay));
         return zenRequest(endpoint, body, { ...opts, retries: retries + 1 });
       }
     }
@@ -804,6 +890,8 @@ function inferFamily(modelId) {
     [/\bnemotron/i, "Nemotron"],
     [/\bminimax/i, "MiniMax"],
     [/\btrinity/i, "Trinity"],
+    [/\bkimi/i, "Kimi"],
+    [/\bpoll\//i, "Pollinations"],
   ];
   for (const [re, family] of patterns) {
     if (re.test(clean)) return family;
@@ -845,10 +933,12 @@ export function resolveModelMetadata(modelId) {
   const override = config.modelMetadataOverrides[clean] || config.modelMetadataOverrides[modelId] || {};
   const allModels = { ...((_mdCache && _mdCache["opencode-go"]?.models) || {}), ...((_mdCache && _mdCache["opencode"]?.models) || {}) };
   const mdModel = allModels[clean] || allModels[modelId];
+  const freeDef = FREE_TIER_MODELS.find(m => m.id.toLowerCase() === clean.toLowerCase());
 
   const contextLength = override.context_length
     || (config.forceContextLength || 0)
     || mdModel?.limit?.context
+    || freeDef?.context
     || config.defaultContextLength;
 
   const capabilities = override.capabilities
@@ -1036,4 +1126,4 @@ export async function* generateCompletion(req) {
   }
 }
 
-export { config, SEP_PAID, SEP_FREE };
+export { config, SEP_PAID, SEP_FREE, SEP_FREE_P };

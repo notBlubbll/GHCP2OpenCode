@@ -6,6 +6,7 @@ on:
     paths-ignore:
       - '.version'
       - '**.md'
+      - '.github/workflows/**'
 
 jobs:
   bump:

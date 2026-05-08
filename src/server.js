@@ -41,10 +41,11 @@ if (typeof ReadableStream === 'undefined') {
 import { Hono } from "hono";
 import { stream } from "hono/streaming";
 import { cors } from "hono/cors";
-import { config, getModels, initModels, resolveModel, resolveModelMetadata, isKnownModel, chatCompletion, APIError, isSeparator, isFreeTierModel, isPollModel, SEP_PAID, SEP_FREE, SEP_FREE_P, refreshModels, validateFreeModels, bgFetchDone, getKeyStatus } from "./opencode-client.js";
+import { config, getModels, initModels, resolveModel, resolveModelMetadata, isKnownModel, chatCompletion, APIError, isSeparator, isFreeTierModel, isPollModel, isM365Model, SEP_PAID, SEP_FREE, SEP_FREE_P, SEP_M365, refreshModels, validateFreeModels, bgFetchDone, getKeyStatus } from "./opencode-client.js";
 import { check as cacheCheck, store as cacheStore, cacheKey } from "./cache.js";
 import { ModelConcurrencyManager, RateLimitError, truncateToolMessagesInPayload, checkRequestBodySize } from "./concurrency.js";
 import { compactIdentity, compactToolInstructions, compactOllamaToolInstructions, compactCodeCompletionPrompt, compressMessages } from "./token-optimizer.js";
+import { m365ChatCompletion, m365ChatCompletionStream, M365CopilotError } from "./m365-client.js";
 
 // ── Version check ──
 const VERSION_URL = `https://raw.githubusercontent.com/notBlubbll/GHCP2OpenCode/main/.version?cb=${Date.now()}`;
@@ -278,7 +279,7 @@ const MODEL_MAP = {};
 
 function mapModel(name) {
   let clean = (name || "").split(":")[0].trim();
-  clean = clean.replace(/^\s*\[(?:FREE_P|FREE|GO)\]\s*/i, "").trim();
+  clean = clean.replace(/^\s*\[(?:FREE_P|FREE|GO|M365|m365)\]\s*/i, "").trim();
   const mapped = MODEL_MAP[clean] || MODEL_MAP[clean.toLowerCase()];
   if (mapped) return mapped;
   return resolveModel(clean).id;
@@ -475,7 +476,8 @@ async function handleTags(c) {
 
     const isFree = isFreeTierModel(m.model);
     const isPoll = isPollModel(m.model);
-    const prefix = isPoll ? "[FREE_P] " : (isFree ? "[FREE] " : "[GO] ");
+    const isM365 = isM365Model(m.model);
+    const prefix = isM365 ? "[m365] " : (isPoll ? "[FREE_P] " : (isFree ? "[FREE] " : "[GO] "));
     const family = m.details?.family || rawId;
     const metadata = resolveModelMetadata(rawId);
     const caps = metadata.capabilities || [];
@@ -490,7 +492,7 @@ async function handleTags(c) {
       capabilities: caps,
       context_length: ctxLen,
       max_output_tokens: 4096,
-      pricing: isPoll ? "free_poll" : (isFree ? "free" : "premium"),
+      pricing: isM365 ? "m365" : (isPoll ? "free_poll" : (isFree ? "free" : "premium")),
       details: {
         parent_model: m.details?.parent_model || "",
         format: m.details?.format || "gguf",
@@ -746,7 +748,8 @@ app.get("/v1/models", async c => {
     const rawId = m.model.replace(":latest", "").split(":")[0].trim();
     const isFree = isFreeTierModel(m.model);
     const isPoll = isPollModel(m.model);
-    const prefix = isPoll ? "[FREE_P] " : (isFree ? "[FREE] " : "[GO] ");
+    const isM365 = isM365Model(m.model);
+    const prefix = isM365 ? "[m365] " : (isPoll ? "[FREE_P] " : (isFree ? "[FREE] " : "[GO] "));
     const id = vsc ? prefix + m.name : m.name;
     const metadata = resolveModelMetadata(rawId);
     const family = metadata.family;
@@ -782,7 +785,7 @@ app.get("/v1/models", async c => {
         type: "chat",
         family,
       },
-      pricing: isPoll ? "free_poll" : (isFree ? "free" : "premium"),
+      pricing: isM365 ? "m365" : (isPoll ? "free_poll" : (isFree ? "free" : "premium")),
       context_length: ctxLen,
       max_output_tokens: 4096,
     });
@@ -878,6 +881,62 @@ app.post("/v1/chat/completions", async c => {
     let systemMsg = "";
     const userMsgs = [];
     const goModel = mapModel(model);
+
+    // ── M365 Copilot path (no tools, no streaming via Go API) ──
+    if (isM365Model(goModel)) {
+      const m365Messages = messages.map(m => ({
+        role: m.role,
+        content: typeof m.content === "string" ? m.content : (Array.isArray(m.content) ? m.content.map(p => p.text || "").join("") : ""),
+      }));
+
+      const lastMsg = m365Messages[m365Messages.length - 1];
+      const preview = typeof lastMsg?.content === "string" ? lastMsg.content.replace(/\s+/g, " ").trim().slice(0, 60) : "";
+      const tag = clientTag ? ` [${clientTag}]` : "";
+      if (config.requestLog) log(`[m365]${tag} ${model} — "${preview}${(lastMsg?.content?.length || 0) > 60 ? "\u2026" : ""}"`);
+
+      if (streamMode) {
+        return stream(c, async (s) => {
+          const w = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
+          const base = { id: chatId, object: "chat.completion.chunk", created, model, system_fingerprint: systemFp };
+          await w({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+          try {
+            let fullText = "";
+            for await (const chunk of m365ChatCompletionStream(goModel, m365Messages)) {
+              fullText += chunk;
+              await w({ ...base, choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }] });
+            }
+            await w({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
+            await s.write("data: [DONE]\n\n");
+          } catch (e) {
+            err(`  m365 stream error: ${e.message}`);
+            await w({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
+            await s.write("data: [DONE]\n\n");
+          }
+        });
+      }
+
+      // Non-streaming
+      try {
+        const content = await m365ChatCompletion(goModel, m365Messages);
+
+        // Simulate SSE streaming for clients that requested it (e.g. VS 2026 sends stream:true)
+        if (clientWantsStream) {
+          return stream(c, async s => {
+            const w2 = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
+            const base = { id: chatId, object: "chat.completion.chunk", created, model, system_fingerprint: systemFp };
+            await w2({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+            await _simStream(w2, base, false, null, content, null);
+            await s.write("data: [DONE]\n\n");
+          });
+        }
+
+        return c.json(oaiResp(content, undefined, "stop", model));
+      } catch (e) {
+        err(`  m365 error: ${e.message}`);
+        const status = e instanceof M365CopilotError ? 502 : 500;
+        return c.json({ error: { message: e.message, type: status === 502 ? "server_error" : "server_error", code: "m365_error" } }, status);
+      }
+    }
 
     for (const m of messages) {
       const role = (m.role || "").toLowerCase().trim();
@@ -1675,11 +1734,15 @@ if (typeof Bun !== 'undefined' && typeof Bun.serve === 'function') {
 }
 
 // Load models & show banner in background
-const models = await initModels();
+let models = await initModels();
 
 process.stdout.write("\x1b]2;GHCP2OpenCode — OpenCode Go Proxy\x07");
 
 await checkVersion();
+
+// Wait for background paid-model fetch to complete, then refresh model list
+await bgFetchDone();
+models = await getModels();
 
 const B = "\x1b[1m";
 const R = "\x1b[0m";
@@ -1697,12 +1760,15 @@ const hr = S + "\u2500".repeat(boxW - 2);
 
 const hasPaid = models.some(m => m.model === `${SEP_PAID}:latest`);
 const hasPoll = models.some(m => m.model === `${SEP_FREE_P}:latest`);
-const modeLabel = hasPaid
+const hasM365 = models.some(m => m.model === `${SEP_M365}:latest`);
+const modeLabel = (hasPaid
   ? (config.hideFree ? " \x1b[32m(go mode)\x1b[90m" : " \x1b[32m(free&go mode)\x1b[90m")
-  : (hasPoll ? " \x1b[33m(free+poll mode)\x1b[90m" : " \x1b[33m(free mode)\x1b[90m");
+  : (hasPoll ? " \x1b[33m(free+poll mode)\x1b[90m" : " \x1b[33m(free mode)\x1b[90m"))
+  + (hasM365 ? " \x1b[36m+ M365\x1b[90m" : "");
 if (hasPaid) log("\x1b[32m[status] Authenticated — free & paid models\x1b[0m");
 else if (hasPoll) log("\x1b[33m[status] Free mode — OpenCode free + Pollinations\x1b[0m");
 else log("\x1b[33m[status] Free mode — no API key\x1b[0m");
+if (hasM365) log("\x1b[36m[status] M365 Copilot connected\x1b[0m");
 
 P("");
 P(W + "\u256d" + hr + W + "\u256e" + R);
@@ -1714,12 +1780,20 @@ const portLabel = port === 11434 ? `port: ${port} (default)` : `port: ${port}`;
 P(line(S + portLabel + "  │  vs2026  │  models.dev" + R));
 P(W + "\u251c" + hr + W + "\u2524" + R);
 
-// Split models into free / poll / paid by separators
+// Split models into sections by separator order (M365 → Free → Poll → Premium)
+const m365Start = models.findIndex(m => m.model === `${SEP_M365}:latest`);
 const freeStart = models.findIndex(m => m.model === `${SEP_FREE}:latest`);
 const pollStart = models.findIndex(m => m.model === `${SEP_FREE_P}:latest`);
 const paidStart = models.findIndex(m => m.model === `${SEP_PAID}:latest`);
-const freeModels = freeStart >= 0 ? models.slice(freeStart + 1, pollStart >= 0 ? pollStart : (paidStart >= 0 ? paidStart : models.length)) : [];
-const pollModels = pollStart >= 0 ? models.slice(pollStart + 1, paidStart >= 0 ? paidStart : models.length) : [];
+
+// Each section: from its separator+1 to the next separator (or end)
+const m365End = [freeStart, pollStart, paidStart, models.length].find(i => i >= 0);
+const freeEnd = [pollStart, paidStart, models.length].find(i => i >= 0);
+const pollEnd = [paidStart, models.length].find(i => i >= 0);
+
+const m365Models = m365Start >= 0 ? models.slice(m365Start + 1, m365End) : [];
+const freeModels = freeStart >= 0 ? models.slice(freeStart + 1, freeEnd) : [];
+const pollModels = pollStart >= 0 ? models.slice(pollStart + 1, pollEnd) : [];
 const paidModels = paidStart >= 0 ? models.slice(paidStart + 1) : [];
 
 function printTable(list) {
@@ -1733,7 +1807,14 @@ function printTable(list) {
   }
 }
 
+if (hasM365) {
+  P(line(S + "M365 Copilot: " + S + `(${m365Models.length})` + R));
+  P(line(S + "Name".padEnd(20) + " \u2502 " + "ID".padEnd(24) + " \u2502 " + "Context" + R));
+  printTable(m365Models);
+}
+
 if (!config.hideFree && freeModels.length) {
+  if (hasM365) P(line(""));
   P(line(S + "Free: " + S + `(${freeModels.length})` + R));
   P(line(S + "Name".padEnd(20) + " \u2502 " + "ID".padEnd(24) + " \u2502 " + "Context" + R));
   printTable(freeModels);
@@ -1752,6 +1833,7 @@ if (hasPaid) {
   P(line(S + "Name".padEnd(20) + " \u2502 " + "ID".padEnd(24) + " \u2502 " + "Context" + R));
   printTable(paidModels);
 }
+
 P(W + "\u2570" + hr + W + "\u256f" + R);
 P("");
 
@@ -1775,7 +1857,6 @@ if (process.stdin.isTTY && typeof process.stdin.on === "function") {
     }
   });
   process.stdin.resume();
-  await bgFetchDone();
   log("\x1b[96mr/restart\x1b[90m | \x1b[96ms/stop\x1b[90m | \x1b[96me/exit\x1b[0m");
 }
 

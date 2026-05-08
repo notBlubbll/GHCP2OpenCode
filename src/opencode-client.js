@@ -7,6 +7,7 @@ if (typeof Bun === 'undefined') {
 
 import { ModelConcurrencyManager } from "./concurrency.js";
 import { compressToolDefinitions } from "./token-optimizer.js";
+import { isM365Available, getM365Models } from "./m365-client.js";
 
 // ── Optimized HTTP client with connection pooling (copilot-proxy pattern) ──
 let _globalAgent = null;
@@ -169,13 +170,14 @@ export function isPollModel(id) {
 
 export function isSeparator(id) {
   const clean = (id || "").split(":")[0].trim().toLowerCase();
-  return clean === SEP_FREE || clean === SEP_PAID || clean === SEP_FREE_P ||
-    clean === "== free ==" || clean === "== premium ==" || clean === "== poll ==";
+  return clean === SEP_FREE || clean === SEP_PAID || clean === SEP_FREE_P || clean === SEP_M365 ||
+    clean === "== free ==" || clean === "== premium ==" || clean === "== poll ==" || clean === "== m365 ==";
 }
 
 const SEP_FREE = "(free)";
 const SEP_PAID = "(go)";
 const SEP_FREE_P = "(free_p)";
+const SEP_M365 = "(m365)";
 
 const config = {
   get apiKey() { return Bun.env.OPENCODE_API_KEY ?? ""; },
@@ -449,6 +451,14 @@ function loadModelsFromDisk() {
         console.log("[models] free tier models changed — forcing refresh");
         return false;
       }
+      // Invalidate cache if M365 token path changed (newly set, removed, or token refreshed)
+      const cachedHasM365 = data._models.some(m => (m.model || "").replace(":latest", "").startsWith(SEP_M365));
+      const envHasM365 = !!(Bun.env.M365CO_PORT || Bun.env.M365C_RELAY_URL);
+      if (envHasM365 !== cachedHasM365) {
+        console.log(`[models] M365 ${envHasM365 ? "newly set" : "removed"} — forcing refresh`);
+        return false;
+      }
+      // M365 is enabled via relay — availability handled by m365-client.js
       _models = data._models;
       _modelMap = data._modelMap || {};
       _nameToId = data._nameToId || {};
@@ -473,7 +483,8 @@ async function saveModelsToDisk() {
     await _loadCrypto();
     const path = getDiskPath();
     if (!_models?.length) return;
-    _fs.writeFileSync(path, JSON.stringify({ _models, _modelMap, _nameToId, _keyHash: keyHash(), _freeTierHash: freeTierHash() }));
+    const diskData = { _models, _modelMap, _nameToId, _keyHash: keyHash(), _freeTierHash: freeTierHash() };
+    _fs.writeFileSync(path, JSON.stringify(diskData));
     console.log(`[cache] saved to ${path}`);
   } catch (e) {
     console.error(`[cache] save failed: ${e.message}`);
@@ -497,6 +508,13 @@ async function fetchModelsDev() {
 }
 
 async function fetchModels() {
+  // Serialize concurrent fetchModels calls (background fetch + refreshModels)
+  const prevGate = _fetchModelsGate;
+  let resolveGate;
+  _fetchModelsGate = new Promise(r => { resolveGate = r; });
+  await prevGate;
+  try {
+
   const start = Date.now();
   const md = await fetchModelsDev();
   const allModels = { ...(md["opencode-go"]?.models || {}), ...(md["opencode"]?.models || {}) };
@@ -505,6 +523,46 @@ async function fetchModels() {
 
   // Always start with free tier models (alphabetical)
   const models = [];
+
+  // M365 Copilot (optional — always at top if available)
+  let m365Count = 0;
+  const m365Avail = await isM365Available();
+  if (m365Avail) {
+    const m365Models = await getM365Models();
+    if (m365Models.length) {
+      models.push(sepModel(SEP_M365, "== M365 =="));
+      for (const m365Model of m365Models) {
+        models.push({
+          name: m365Model.name,
+          model: `${m365Model.id}:latest`,
+          modified_at: now,
+          size: 0,
+          digest: m365Model.id,
+          maxParams: "",
+          details: {
+            parent_model: "",
+            format: "gguf",
+            family: m365Model.family,
+            families: [m365Model.family],
+            parameter_size: "",
+            quantization_level: "F16",
+            tools: false,
+            vision: false,
+            supports_tools: false,
+            supports_function_calling: false,
+            supports_vision: false,
+          },
+          capabilities: { tools: false, vision: false, function_calling: false, tool_calling: false },
+          supports_tools: false,
+          supports_function_calling: false,
+        });
+        _modelMap[m365Model.id.toLowerCase()] = { id: m365Model.id, name: m365Model.name, tools: false, vision: false, _m365: true };
+        _nameToId[m365Model.name.toLowerCase()] = m365Model.id;
+        m365Count++;
+      }
+    }
+  }
+
   if (!config.hideFree) {
     const allFree = buildFreeTierModels();
     const regFree = allFree.filter(m => !isPollModel(m.model));
@@ -591,6 +649,10 @@ async function fetchModels() {
   const sourceLabel = paidFrom ? ` from ${paidFrom}` : "";
   console.log(`[models] ${totalReal} total${paidLabel}${sourceLabel} (${elapsed}ms)`);
   return _models;
+
+  } finally {
+    resolveGate();
+  }
 }
 
 export async function initModels() {
@@ -603,6 +665,8 @@ export async function initModels() {
   } else {
     console.log("[models] no cache — building from built-in data");
     await fetchModels();
+    await saveModelsToDisk();
+    saveKeyHashToDisk(keyHash());
   }
   // Quick connectivity ping with free model
   try {
@@ -634,6 +698,7 @@ export function getModels() {
 }
 
 let _paidGoData = null;
+let _fetchModelsGate = Promise.resolve();
 
 async function fetchGoModelsRaw() {
   const keys = [];
@@ -713,6 +778,13 @@ export function isKnownModel(id) {
   if (_nameToId[clean]) return true;
   if (FREE_TIER_MODELS.find(m => m.id.toLowerCase() === clean)) return true;
   return false;
+}
+
+export function isM365Model(id) {
+  if (!id) return false;
+  const clean = id.split(":")[0].trim().toLowerCase();
+  const info = _modelMap[clean];
+  return info?._m365 === true;
 }
 
 function isoNow() { return new Date().toISOString(); }
@@ -1129,4 +1201,4 @@ export async function* generateCompletion(req) {
   }
 }
 
-export { config, SEP_PAID, SEP_FREE, SEP_FREE_P };
+export { config, SEP_PAID, SEP_FREE, SEP_FREE_P, SEP_M365 };

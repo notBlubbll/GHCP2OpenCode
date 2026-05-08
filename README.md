@@ -175,7 +175,7 @@ Or `curl http://localhost:11434/stop`
 
 ## Version Check
 
-On startup, the proxy fetches the latest ticks from [`notBlubbll/GHCP2OpenCode/version`](https://raw.githubusercontent.com/notBlubbll/GHCP2OpenCode/main/version) (raw) and compares them with the local `version` file. If they differ, the repo has been updated — the **console title** changes to:
+On startup, the proxy fetches the latest ticks from [`notBlubbll/GHCP2OpenCode/.version`](https://raw.githubusercontent.com/notBlubbll/GHCP2OpenCode/main/.version) (raw) and compares them with the local `.version` file. If they differ, the repo has been updated — the **console title** changes to:
 
 ```
 GHCP2OpenCode (outdated, check github for new version)

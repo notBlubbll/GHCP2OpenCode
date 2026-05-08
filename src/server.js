@@ -47,8 +47,8 @@ import { ModelConcurrencyManager, RateLimitError, truncateToolMessagesInPayload,
 import { compactIdentity, compactToolInstructions, compactOllamaToolInstructions, compactCodeCompletionPrompt } from "./token-optimizer.js";
 
 // ── Version check ──
-const VERSION_URL = "https://raw.githubusercontent.com/notBlubbll/GHCP2OpenCode/main/version";
-const VERSION_FILE = "version";
+const VERSION_URL = `https://raw.githubusercontent.com/notBlubbll/GHCP2OpenCode/main/.version?cb=${Date.now()}`;
+const VERSION_FILE = ".version";
 
 function setConsoleTitle(title) {
   try { process.stdout.write(`\x1b]2;${title}\x1b\x07`); } catch {}
@@ -58,14 +58,14 @@ function setConsoleTitle(title) {
 async function checkVersion() {
   try {
     const fs = await import("node:fs");
-    let local = ""; try { local = fs.readFileSync(VERSION_FILE, "utf8").trim(); } catch {}
+    let local = ""; try { local = fs.readFileSync(VERSION_FILE, "utf8").replace(/[^\d]/g, ""); } catch {}
 
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 8000);
     let remote = "";
     try {
       const resp = await fetch(VERSION_URL, { signal: ctrl.signal });
-      if (resp.ok) remote = (await resp.text()).trim();
+      if (resp.ok) remote = (await resp.text()).replace(/[^\d]/g, "");
     } catch {}
     clearTimeout(t);
 

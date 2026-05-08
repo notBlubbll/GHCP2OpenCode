@@ -214,6 +214,9 @@ const config = {
     const v = Bun.env.HIDE_POLL_COSPLAY;
     return v === undefined ? true : v === "true" || v === "1";
   },
+  get compressionLevel() {
+    return Bun.env.COMPRESSION_LEVEL ?? "auto";
+  },
   get forceAllCapabilities() {
     return (Bun.env.FORCE_ALL_CAPABILITIES ?? "true") !== "false";
   },

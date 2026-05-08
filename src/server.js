@@ -44,7 +44,7 @@ import { cors } from "hono/cors";
 import { config, getModels, initModels, resolveModel, resolveModelMetadata, isKnownModel, chatCompletion, APIError, isSeparator, isFreeTierModel, isPollModel, SEP_PAID, SEP_FREE, SEP_FREE_P, refreshModels, validateFreeModels, bgFetchDone, getKeyStatus } from "./opencode-client.js";
 import { check as cacheCheck, store as cacheStore, cacheKey } from "./cache.js";
 import { ModelConcurrencyManager, RateLimitError, truncateToolMessagesInPayload, checkRequestBodySize } from "./concurrency.js";
-import { compactIdentity, compactToolInstructions, compactOllamaToolInstructions, compactCodeCompletionPrompt } from "./token-optimizer.js";
+import { compactIdentity, compactToolInstructions, compactOllamaToolInstructions, compactCodeCompletionPrompt, compressMessages } from "./token-optimizer.js";
 
 // ── Version check ──
 const VERSION_URL = `https://raw.githubusercontent.com/notBlubbll/GHCP2OpenCode/main/.version?cb=${Date.now()}`;
@@ -101,7 +101,7 @@ const err = (msg) => process.stderr.write(`\x1b[90m${ts()}\x1b[0m \x1b[31m${msg}
   try {
     const fs = await import("node:fs");
     if (!fs.existsSync(".env")) {
-      fs.writeFileSync(".env", "# OpenCode API key (optional — free models work without it)\n# Get yours at: https://opencode.ai\nOPENCODE_API_KEY=\n\n# Multi-key rotation (optional)\n# OPENCODE_API_KEYS=[\\\"key1\\\",\\\"key2\\\"]\n\n# Hide free models from the list (default false)\nHIDE_FREE=false\n\n# Enable Pollinations free models (pol/ prefix) — true by default\nUSE_POLL_MODELS=true\n\n# Pollinations API base URL (default: text.pollinations.ai OpenAI-compatible endpoint)\n# POLLINATIONS_BASE_URL=https://text.pollinations.ai/openai\n\n# Hide Pollinations models from the list (default false)\nHIDE_POLL=false\n\n# Hide Pollinations cosplay aliases (GPT-5, Claude, Gemini, DeepSeek, Llama-4, Mistral)\n# — true by default, shows only the real GPT-OSS 20B model. Set to false to show all 7.\n# HIDE_POLL_COSPLAY=true\n\n# Log incoming requests (default true)\nREQUEST_LOG=true\n\n# ── DLP / Content Blocklist (ghcp-proxy enrichment) ──\n# Enable prompt content filtering (default false)\nBLOCKLIST_ENABLED=false\n\n# Blocklist mode: \"block\" (deny with 403) or \"report\" (allow but log)\nBLOCKLIST_MODE=block\n\n# Comma-separated keywords to block (case-insensitive)\n# BLOCKLIST_KEYWORDS=secret,confidential,password\n\n# Comma-separated file name patterns to block\n# BLOCKLIST_FILEPATTERNS=passwords.txt,.env.production\n\n# Comma-separated regex patterns to block\n# BLOCKLIST_REGEX=sk-[A-Za-z0-9]{20,}\n\n# ── Concurrency & Rate Limiting (antigravity-copilot enrichment) ──\n# Maximum concurrent requests for thinking models (keep low to avoid upstream 429s)\n# CONCURRENCY_THINKING=1\n\n# Maximum concurrent requests for standard models\n# CONCURRENCY_STANDARD=3\n\n# Retry attempts for 429 / RESOURCE_EXHAUSTED errors (0 to disable)\n# RETRY_MAX=3\n\n# Base delay before first retry in ms (exponential backoff follows)\n# RETRY_BASE_DELAY_MS=100\n\n# Abort thinking model requests after this many ms (prevents quota exhaustion)\n# THINKING_TIMEOUT_MS=60000\n\n# Abort standard model requests after this many ms\n# REQUEST_TIMEOUT_MS=120000\n\n# Truncate large tool outputs (e.g., git diff) to reduce context size\n# TRUNCATE_TOOL_OUTPUT=true\n\n# Max chars kept per tool output after truncation\n# MAX_TOOL_OUTPUT_CHARS=12000\n\n# Chars kept from start of tool output when truncating\n# TOOL_OUTPUT_HEAD_CHARS=6000\n\n# Chars kept from end of tool output when truncating\n# TOOL_OUTPUT_TAIL_CHARS=2000\n\n# Absolute max request body size in bytes (returns 413 if exceeded)\n# MAX_REQUEST_BODY_BYTES=10485760\n\n# ── User Auth (ghcp-proxy allowed_users pattern) ──\n# Comma-separated list of allowed users (Proxy-Authorization or X-User-ID header)\n# ALLOWED_USERS=dev1,dev2\n\n# ── Model metadata (lmstudio-ollama-proxy enrichment) ──\n# Force all models to report full capabilities (chat/completion/vision/tools/agent)\nFORCE_ALL_CAPABILITIES=true\n\n# Force a specific context length for all models (0 = use auto-detection)\n# FORCE_CONTEXT_LENGTH=131072\n\n# Default context length fallback when not available from models.dev\nDEFAULT_CONTEXT_LENGTH=131072\n\n# Per-model metadata overrides (JSON). Example:\n# MODEL_METADATA_JSON={\"my-model\":{\"context_length\":32768,\"capabilities\":[\"chat\",\"tools\"],\"family\":\"my-family\",\"parameter_size\":\"7B\"}}\n\n# Passthrough base URL — forward unmatched paths to this upstream\n# PASSTHROUGH_BASE_URL=https://opencode.ai/zen/go/v1\n# Passthrough path prefixes (comma-separated, default /v1)\n# PASSTHROUGH_PREFIXES=/v1,/api/v0\n");
+      fs.writeFileSync(".env", "# OpenCode API key (optional — free models work without it)\n# Get yours at: https://opencode.ai\nOPENCODE_API_KEY=\n\n# Multi-key rotation (optional)\n# OPENCODE_API_KEYS=[\\\"key1\\\",\\\"key2\\\"]\n\n# Hide free models from the list (default false)\nHIDE_FREE=false\n\n# Enable Pollinations free models (pol/ prefix) — true by default\nUSE_POLL_MODELS=true\n\n# Pollinations API base URL (default: text.pollinations.ai OpenAI-compatible endpoint)\n# POLLINATIONS_BASE_URL=https://text.pollinations.ai/openai\n\n# Hide Pollinations models from the list (default false)\nHIDE_POLL=false\n\n# Hide Pollinations cosplay aliases (GPT-5, Claude, Gemini, DeepSeek, Llama-4, Mistral)\n# — true by default, shows only the real GPT-OSS 20B model. Set to false to show all 7.\n# HIDE_POLL_COSPLAY=true\n\n# Log incoming requests (default true)\nREQUEST_LOG=true\n\n# ── Prompt Compression (OmniRoute RTK+Caveman stacked) ──\n# auto / off / lite / caveman / aggressive / ultra / rtk / stacked (default: auto)\n# auto picks: off for <=3 msgs, stacked for free/poll, caveman for paid\nCOMPRESSION_LEVEL=auto\n\n# ── DLP / Content Blocklist (ghcp-proxy enrichment) ──\n# Enable prompt content filtering (default false)\nBLOCKLIST_ENABLED=false\n\n# Blocklist mode: \"block\" (deny with 403) or \"report\" (allow but log)\nBLOCKLIST_MODE=block\n\n# Comma-separated keywords to block (case-insensitive)\n# BLOCKLIST_KEYWORDS=secret,confidential,password\n\n# Comma-separated file name patterns to block\n# BLOCKLIST_FILEPATTERNS=passwords.txt,.env.production\n\n# Comma-separated regex patterns to block\n# BLOCKLIST_REGEX=sk-[A-Za-z0-9]{20,}\n\n# ── Concurrency & Rate Limiting (antigravity-copilot enrichment) ──\n# Maximum concurrent requests for thinking models (keep low to avoid upstream 429s)\n# CONCURRENCY_THINKING=1\n\n# Maximum concurrent requests for standard models\n# CONCURRENCY_STANDARD=3\n\n# Retry attempts for 429 / RESOURCE_EXHAUSTED errors (0 to disable)\n# RETRY_MAX=3\n\n# Base delay before first retry in ms (exponential backoff follows)\n# RETRY_BASE_DELAY_MS=100\n\n# Abort thinking model requests after this many ms (prevents quota exhaustion)\n# THINKING_TIMEOUT_MS=60000\n\n# Abort standard model requests after this many ms\n# REQUEST_TIMEOUT_MS=120000\n\n# Truncate large tool outputs (e.g., git diff) to reduce context size\n# TRUNCATE_TOOL_OUTPUT=true\n\n# Max chars kept per tool output after truncation\n# MAX_TOOL_OUTPUT_CHARS=12000\n\n# Chars kept from start of tool output when truncating\n# TOOL_OUTPUT_HEAD_CHARS=6000\n\n# Chars kept from end of tool output when truncating\n# TOOL_OUTPUT_TAIL_CHARS=2000\n\n# Absolute max request body size in bytes (returns 413 if exceeded)\n# MAX_REQUEST_BODY_BYTES=10485760\n\n# ── User Auth (ghcp-proxy allowed_users pattern) ──\n# Comma-separated list of allowed users (Proxy-Authorization or X-User-ID header)\n# ALLOWED_USERS=dev1,dev2\n\n# ── Model metadata (lmstudio-ollama-proxy enrichment) ──\n# Force all models to report full capabilities (chat/completion/vision/tools/agent)\nFORCE_ALL_CAPABILITIES=true\n\n# Force a specific context length for all models (0 = use auto-detection)\n# FORCE_CONTEXT_LENGTH=131072\n\n# Default context length fallback when not available from models.dev\nDEFAULT_CONTEXT_LENGTH=131072\n\n# Per-model metadata overrides (JSON). Example:\n# MODEL_METADATA_JSON={\"my-model\":{\"context_length\":32768,\"capabilities\":[\"chat\",\"tools\"],\"family\":\"my-family\",\"parameter_size\":\"7B\"}}\n\n# Passthrough base URL — forward unmatched paths to this upstream\n# PASSTHROUGH_BASE_URL=https://opencode.ai/zen/go/v1\n# Passthrough path prefixes (comma-separated, default /v1)\n# PASSTHROUGH_PREFIXES=/v1,/api/v0\n");
       log("Created .env — add your OPENCODE_API_KEY there to unlock paid models");
     }
   } catch { /* fs not available, ignore */ }
@@ -956,7 +956,18 @@ app.post("/v1/chat/completions", async c => {
     if (systemMsg) apiMessages.push({ role: "system", content: systemMsg });
     apiMessages.push(...userMsgs);
 
-    const ollamaReq = { model: goModel, messages: apiMessages, stream: streamMode, tools: vsTools || undefined, clientTag };
+    // Apply prompt compression — auto-select best level per model tier
+    let compLevel = config.compressionLevel;
+    if (compLevel === "auto") {
+      const msgCount = userMsgs.length;
+      if (msgCount <= 3) compLevel = "off";                        // tiny convo — not worth compressing
+      else if (isPollModel(goModel)) compLevel = "stacked";        // free poll — max savings
+      else if (isFreeTierModel(goModel)) compLevel = "stacked";    // free tier — max savings
+      else compLevel = "caveman";                                   // paid — preserve quality
+    }
+    const compressedMessages = compressMessages(apiMessages, compLevel, true);
+
+    const ollamaReq = { model: goModel, messages: compressedMessages, stream: streamMode, tools: vsTools || undefined, clientTag };
     if (body.chat_template_kwargs != null) ollamaReq.chat_template_kwargs = body.chat_template_kwargs;
     if (body.thinking_token_budget != null) ollamaReq.thinking_token_budget = body.thinking_token_budget;
 
@@ -1417,7 +1428,16 @@ app.post("/api/chat", async c => {
       systemMsg += (systemMsg ? "\n" : "") + compactIdentity(model);
 
       const apiMessages = systemMsg ? [{ role: "system", content: systemMsg }, ...userMsgs] : userMsgs;
-      const reqBody = { model, messages: apiMessages, stream: false, options: body.options, format: body.format, clientTag };
+      let compLevel = config.compressionLevel;
+      if (compLevel === "auto") {
+        const msgCount = userMsgs.length;
+        if (msgCount <= 3) compLevel = "off";
+        else if (isPollModel(model)) compLevel = "stacked";
+        else if (isFreeTierModel(model)) compLevel = "stacked";
+        else compLevel = "caveman";
+      }
+      const compressedMessages = compressMessages(apiMessages, compLevel, true);
+      const reqBody = { model, messages: compressedMessages, stream: false, options: body.options, format: body.format, clientTag };
       if (body.chat_template_kwargs != null) reqBody.chat_template_kwargs = body.chat_template_kwargs;
       if (body.thinking_token_budget != null) reqBody.thinking_token_budget = body.thinking_token_budget;
 

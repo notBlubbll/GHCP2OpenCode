@@ -680,6 +680,7 @@ async function zenRequest(endpoint, body, opts = {}) {
   const url = `${base}${endpoint}`;
   const key = withKey();
   const isFree = isFreeTierModel(body.model);
+  const clientTag = opts?.clientTag || "";
   
   if (isSeparator(body.model)) {
     throw new APIError(400, "", "This is a category header, not a model. Please select an actual model from the list.");
@@ -689,7 +690,8 @@ async function zenRequest(endpoint, body, opts = {}) {
   const prompt = typeof lastMsg?.content === "string" ? lastMsg.content : "";
   const preview = prompt.replace(/\s+/g, " ").trim().slice(0, 60);
   if (config.requestLog) {
-    console.log(`[zen] ${body.model || "?"}${isFree ? " (free)" : ""} — "${preview}${prompt.length > 60 ? "\u2026" : ""}"`);
+    const tag = clientTag ? ` [${clientTag}]` : "";
+    console.log(`[zen]${tag} ${body.model || "?"}${isFree ? " (free)" : ""} — "${preview}${prompt.length > 60 ? "\u2026" : ""}"`);
   }
 
   const headers = {
@@ -721,9 +723,16 @@ async function zenRequest(endpoint, body, opts = {}) {
       if (parsed.error?.code) code = parsed.error.code;
     } catch {}
 
-    // Retry: rotate key on auth/rate-limit errors, up to configurable max
     const retries = opts.retries || 0;
     const maxRetries = opts.maxRetries ?? config.maxRetries;
+
+    // Never retry "Service is too busy" errors — propagation not retry
+    if (upstreamMsg.includes("Service is too busy")) {
+      console.error(`[zen] upstream busy — not retrying`);
+      throw new APIError(mappedStatus, txt, upstreamMsg);
+    }
+
+    // Retry: rotate key on auth/rate-limit errors, up to configurable max
     if (key && (resp.status === 401 || resp.status === 429) && retries < maxRetries && retries < _keys.length) {
       cooldownKey(key, resp.status === 429 ? 15000 : 60000);
       if (config.requestLog) console.log(`[zen] retry ${retries + 1}/${maxRetries} after ${resp.status}`);
@@ -927,7 +936,7 @@ export async function* chatCompletion(req) {
   }
 
   try {
-    const resp = await zenRequest("/chat/completions", body, { signal: ac?.signal });
+    const resp = await zenRequest("/chat/completions", body, { signal: ac?.signal, clientTag: req.clientTag });
 
     if (req.stream === false) {
       const data = await resp.json();

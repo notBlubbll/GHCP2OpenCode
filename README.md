@@ -38,11 +38,13 @@ Ollama-emulating proxy that connects **GitHub Copilot Chat&Agent** to the [OpenC
 |--------|--------|
 | VS 2026 Insiders | ✓ Supported |
 | VS 2026 (regular) | ✗ Needs Insiders or LocalPilot |
-| VS 2026 (LocalPilot) | ✓ Supported |
-| VS Code | ✓ Supported |
+| VS 2026 (LocalPilot) | ⚠ Unsupported but working |
+| VS Code | ⚠ Supported, not fully tested |
 | SQL Server Management Studio | ✗ No Ollama provider |
 
-> VS 2026 tested with [LocalPilot](https://marketplace.visualstudio.com/items?itemName=FutureStackSolution.LocalPilotFSS) — a local Ollama provider extension.
+> **VS Code**: Works via the GitHub Copilot extension's Ollama provider, but has not been thoroughly tested. Tool calling and streaming may have edge cases.
+>
+> **LocalPilot (VS 2026)**: The proxy detects LocalPilot requests automatically via `## TASK` / `## [LP]` prompt prefixes and handles orphan tool messages. Not officially supported, but functional.
 
 ---
 
@@ -168,6 +170,22 @@ To create a new file, just ask Copilot (e.g. "create me a css file called test.c
 | `e` / `exit` | Shut down |
 
 Or `curl http://localhost:11434/stop`
+
+---
+
+## Version Check
+
+On startup, the proxy fetches the latest version from [`notBlubbll/GHCP2OpenCode/version`](https://raw.githubusercontent.com/notBlubbll/GHCP2OpenCode/main/version) (raw) and compares it with the local version (`420.96.00`).
+
+If the remote version differs from the local version, the **console title** changes to:
+
+```
+GHCP2OpenCode (outdated, check github for new version)
+```
+
+When up to date, the title shows `GHCP2OpenCode — OpenCode Go Proxy`.
+
+The proxy also writes the current time (in millisecond ticks) to a `version` file on disk to track the last run timestamp.
 
 ---
 

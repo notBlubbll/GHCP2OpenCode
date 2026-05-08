@@ -46,6 +46,42 @@ import { check as cacheCheck, store as cacheStore, cacheKey } from "./cache.js";
 import { ModelConcurrencyManager, RateLimitError, truncateToolMessagesInPayload, checkRequestBodySize } from "./concurrency.js";
 import { compactIdentity, compactToolInstructions, compactOllamaToolInstructions, compactCodeCompletionPrompt } from "./token-optimizer.js";
 
+// ── Version check ──
+const VERSION_URL = "https://raw.githubusercontent.com/notBlubbll/GHCP2OpenCode/main/version";
+const VERSION_FILE = "version";
+
+function setConsoleTitle(title) {
+  try { process.stdout.write(`\x1b]2;${title}\x1b\x07`); } catch {}
+  try { process.title = title; } catch {}
+}
+
+async function checkVersion() {
+  try {
+    const fs = await import("node:fs");
+    let local = ""; try { local = fs.readFileSync(VERSION_FILE, "utf8").trim(); } catch {}
+
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 8000);
+    let remote = "";
+    try {
+      const resp = await fetch(VERSION_URL, { signal: ctrl.signal });
+      if (resp.ok) remote = (await resp.text()).trim();
+    } catch {}
+    clearTimeout(t);
+
+    if (remote && local === remote) {
+      log("\x1b[32m[version] up to date\x1b[0m");
+    } else {
+      log(`\x1b[31m[version] outdated (local=${local.slice(0,14)} remote=${(remote||"???").slice(0,14)})\x1b[0m`);
+      setConsoleTitle("GHCP2OpenCode (outdated, check github for new version)");
+    }
+
+    if (remote) try { fs.writeFileSync(VERSION_FILE, remote); } catch {}
+  } catch (e) {
+    log(`\x1b[31m[version] check failed: ${e.message}\x1b[0m`);
+  }
+}
+
 // ── Logging ──
 
 const ts = () => new Date().toLocaleTimeString("en-US", { hour12: false });
@@ -545,8 +581,34 @@ app.post("/v1/chat/completions", async c => {
   const model = body.model || config.defaultModel;
   const messages = body.messages || [];
   const clientWantsStream = body.stream === true;
+  const vsc = isVSCode(c);
+  const vs2026 = isVS2026(c);
+  // Check for LocalPilot first (takes precedence over UA detection)
+  let clientTag = "";
+  if (messages?.length) {
+    for (const m of messages) {
+      let raw = typeof m.content === "string" ? m.content.trim() : "";
+      if (Array.isArray(m.content)) raw = m.content.map(p => (p?.text || p?.content || "").trim()).join("\n");
+      const c = raw.toLowerCase();
+      if (c.startsWith("## [lp]") || c.startsWith("## [pilot]") || c.startsWith("## task") || c.includes("[lp]") || c.includes("</task_type>") || c.includes("</instruction>")) { clientTag = "lp"; break; }
+    }
+  }
+  // Fall back to UA-based detection
+  if (!clientTag) {
+    clientTag = vsc ? (vs2026 ? "vs" : "vscode") : "";
+  }
+  if (!clientTag && messages?.length) {
+    const allContent = messages.map(m => m.content || "").join(" ");
+    const lc = allContent.toLowerCase();
+    if (lc.includes("github copilot") || lc.includes('"github copilot"')) clientTag = "vs";
+    else if (allContent.startsWith("<context>") || lc.includes("<edito")) clientTag = "vscode";
+  }
+  if (!clientTag) {
+    const hasSystem = messages?.some(m => m.role === "system");
+    if (!hasSystem && messages?.length && messages[0].role === "user") clientTag = "vs";
+  }
   // VS 2026: force non-streaming upstream so extractToolCalls converts markdown to create_file tool calls
-  const streamMode = isVS2026(c) ? false : clientWantsStream;
+  const streamMode = vs2026 ? false : clientWantsStream;
   const vsTools = body.tools;
   const startTime = Date.now();
   const chatId = `chatcmpl-${startTime}`;
@@ -640,7 +702,15 @@ app.post("/v1/chat/completions", async c => {
           }
       } else if (role === "user") {
         userMsgs.push(m);
-      } else if (role === "tool") {
+} else if (role === "tool") {
+        // LocalPilot sends tool msgs without proper tool_calls predecessor — validate and drop orphans
+        if (clientTag === "lp") {
+          const hasPrevToolCalls = userMsgs.length > 0 && userMsgs[userMsgs.length - 1].role === "assistant" && userMsgs[userMsgs.length - 1].tool_calls?.length;
+          if (!hasPrevToolCalls) {
+            log("  [lp] dropping orphan tool message (no preceding tool_calls)");
+            continue;
+          }
+        }
         userMsgs.push({
           role: "tool",
           tool_call_id: m.tool_call_id || "unknown",
@@ -667,7 +737,7 @@ app.post("/v1/chat/completions", async c => {
     if (systemMsg) apiMessages.push({ role: "system", content: systemMsg });
     apiMessages.push(...userMsgs);
 
-    const ollamaReq = { model: goModel, messages: apiMessages, stream: streamMode, tools: vsTools || undefined };
+    const ollamaReq = { model: goModel, messages: apiMessages, stream: streamMode, tools: vsTools || undefined, clientTag };
     if (body.chat_template_kwargs != null) ollamaReq.chat_template_kwargs = body.chat_template_kwargs;
     if (body.thinking_token_budget != null) ollamaReq.thinking_token_budget = body.thinking_token_budget;
 
@@ -1071,15 +1141,21 @@ app.post("/api/chat", async c => {
   const rawBody = await getBody(c);
   const body = normalizeOpenAIParams(rawBody);
   const startTime = Date.now();
+  const messages = body.messages || [];
 
-  // ── Blocklist check ──
-  const chatMessages = body.messages || [];
+  // ── Client detection for /api/chat ──
+  let clientTag = "";
+  for (const m of messages) {
+    let raw = typeof m.content === "string" ? m.content.trim() : "";
+    if (Array.isArray(m.content)) raw = m.content.map(p => (p?.text || p?.content || "").trim()).join("\n");
+    const c = raw.toLowerCase();
+    if (c.startsWith("## [lp]") || c.startsWith("## [pilot]") || c.startsWith("## task") || c.includes("[lp]") || c.includes("</task_type>") || c.includes("</instruction>")) { clientTag = "lp"; break; }
+  }
 
   return stream(c, async s => {
     try {
       const cm = ModelConcurrencyManager.getInstance();
       const model = mapModel(body.model);
-      const messages = body.messages || [];
       const vsTools = body.tools;
 
       // Build messages with tool info in system prompt
@@ -1098,7 +1174,13 @@ app.post("/api/chat", async c => {
           if (hasTools) userMsgs.push({ role: "assistant", content: null, tool_calls: m.tool_calls });
           else if (hasContent) userMsgs.push({ role: "assistant", content: m.content });
         }
-        else if (role === "tool") userMsgs.push({ role: "tool", tool_call_id: m.tool_call_id || "unknown", content: typeof m.content === "string" ? m.content : JSON.stringify(m.content || "") });
+        else if (role === "tool") {
+          if (clientTag === "lp") {
+            const hasPrev = userMsgs.length > 0 && userMsgs[userMsgs.length - 1].role === "assistant" && userMsgs[userMsgs.length - 1].tool_calls?.length;
+            if (!hasPrev) { log("  [lp] dropping orphan tool message (/api/chat)"); continue; }
+          }
+          userMsgs.push({ role: "tool", tool_call_id: m.tool_call_id || "unknown", content: typeof m.content === "string" ? m.content : JSON.stringify(m.content || "") });
+        }
         else if (role === "user") userMsgs.push(m);
         // unknown roles are silently dropped
       }
@@ -1110,7 +1192,7 @@ app.post("/api/chat", async c => {
       systemMsg += (systemMsg ? "\n" : "") + compactIdentity(model);
 
       const apiMessages = systemMsg ? [{ role: "system", content: systemMsg }, ...userMsgs] : userMsgs;
-      const reqBody = { model, messages: apiMessages, stream: false, options: body.options, format: body.format };
+      const reqBody = { model, messages: apiMessages, stream: false, options: body.options, format: body.format, clientTag };
       if (body.chat_template_kwargs != null) reqBody.chat_template_kwargs = body.chat_template_kwargs;
       if (body.thinking_token_budget != null) reqBody.thinking_token_budget = body.thinking_token_budget;
 
@@ -1352,6 +1434,8 @@ const models = await initModels();
 
 process.stdout.write("\x1b]2;GHCP2OpenCode — OpenCode Go Proxy\x07");
 
+await checkVersion();
+
 const B = "\x1b[1m";
 const R = "\x1b[0m";
 const C = "\x1b[36m";
@@ -1393,7 +1477,7 @@ function printTable(list) {
       ? (m.model.replace(":latest", "")).slice(0, 23) + "\u2026"
       : (m.model.replace(":latest", "")).padEnd(24);
     const params = m.maxParams ? m.maxParams.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".").padEnd(9) : "-".padEnd(9);
-    P(line(S + name + " \u2502 " + id + " \u2502 " + params + R));
+    P(line("\x1b[30m" + name + S + " \u2502 " + R + "\x1b[30m" + id + S + " \u2502 " + R + "\x1b[30m" + params + R));
   }
 }
 

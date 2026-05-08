@@ -175,17 +175,15 @@ Or `curl http://localhost:11434/stop`
 
 ## Version Check
 
-On startup, the proxy fetches the latest version from [`notBlubbll/GHCP2OpenCode/version`](https://raw.githubusercontent.com/notBlubbll/GHCP2OpenCode/main/version) (raw) and compares it with the local version (`420.96.00`).
-
-If the remote version differs from the local version, the **console title** changes to:
+On startup, the proxy fetches the latest version number from [`notBlubbll/GHCP2OpenCode/version`](https://raw.githubusercontent.com/notBlubbll/GHCP2OpenCode/main/version) (raw) and compares it with the local `version` file using semver comparison. If the local version is **older** than remote, it means the repo has been updated — the **console title** changes to:
 
 ```
 GHCP2OpenCode (outdated, check github for new version)
 ```
 
-When up to date, the title shows `GHCP2OpenCode — OpenCode Go Proxy`.
+The status line shows green when up to date and red when outdated.
 
-The proxy also writes the current time (in millisecond ticks) to a `version` file on disk to track the last run timestamp.
+> A GitHub Actions workflow auto-bumps the patch version on each push to `main`.
 
 ---
 

@@ -55,6 +55,16 @@ function setConsoleTitle(title) {
   try { process.title = title; } catch {}
 }
 
+function cmpVersion(a, b) {
+  const ap = (a || "0.0.0").split(".").map(Number);
+  const bp = (b || "0.0.0").split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((ap[i] || 0) > (bp[i] || 0)) return 1;
+    if ((ap[i] || 0) < (bp[i] || 0)) return -1;
+  }
+  return 0;
+}
+
 async function checkVersion() {
   try {
     const fs = await import("node:fs");
@@ -69,14 +79,14 @@ async function checkVersion() {
     } catch {}
     clearTimeout(t);
 
-    if (remote && local === remote) {
-      log("\x1b[32m[version] up to date\x1b[0m");
-    } else {
-      log(`\x1b[31m[version] outdated (local=${local.slice(0,14)} remote=${(remote||"???").slice(0,14)})\x1b[0m`);
+    if (remote && cmpVersion(local, remote) >= 0) {
+      log(`\x1b[32m[version] up to date (v${local} = v${remote})\x1b[0m`);
+    } else if (remote && cmpVersion(local, remote) < 0) {
+      log(`\x1b[31m[version] outdated (v${local} < v${remote})\x1b[0m`);
       setConsoleTitle("GHCP2OpenCode (outdated, check github for new version)");
+    } else {
+      log(`\x1b[90m[version] no remote version\x1b[0m`);
     }
-
-    if (remote) try { fs.writeFileSync(VERSION_FILE, remote); } catch {}
   } catch (e) {
     log(`\x1b[31m[version] check failed: ${e.message}\x1b[0m`);
   }

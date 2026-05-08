@@ -1,6 +1,6 @@
 # GHCP2OpenCode
 
-Ollama-emulating proxy that connects **Visual Studio 2026 Copilot Chat** to the [OpenCode](https://opencode.ai) Zen + Go APIs + models.
+Ollama-emulating proxy that connects **GitHub Copilot Chat&Agent** to the [OpenCode](https://opencode.ai) Zen + Go APIs + models.
 
 **No key needed** — free models work immediately. Add a Go key in `.env` to unlock paid models. Full tool calling and streaming.
 

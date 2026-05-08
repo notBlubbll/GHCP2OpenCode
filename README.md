@@ -87,6 +87,7 @@ You can now select any model from the dropdown. No model IDs to configure — th
 |--------|---------|
 | `[FREE]` | Free tier — always available, no key needed |
 | `[GO]` | Premium — requires `OPENCODE_API_KEY` in `.env` |
+| `[M365]` | Microsoft 365 Copilot — requires `M365C_TOKEN_PATH` in `.env` |
 
 
 in VSCode:
@@ -113,6 +114,7 @@ Key validation uses `GET https://opencode.ai/zen/go/v1/models` — returns 200 i
 | `SERVER_HOST` | `127.0.0.1` | Listen host |
 | `DEFAULT_MODEL` | `big-pickle` | Fallback model |
 | `DEFAULT_TEMPERATURE` | — | Global temperature (e.g. `0.1`) |
+| `M365CO_PORT` | — | M365 WebSocket relay port (e.g. `8765`) |
 | `CACHE_ENABLED` | `true` | Prompt cache |
 | `CACHE_MAX_SIZE` | `64` | Max cached entries |
 | `CACHE_TTL_SEC` | `300` | Cache TTL |
@@ -123,11 +125,13 @@ Key validation uses `GET https://opencode.ai/zen/go/v1/models` — returns 200 i
 
 ## Models
 
-Models appear in VS Code's Copilot list as `[FREE] Model Name` and `[GO] Model Name` — the prefix indicates free vs paid tier at a glance.
+Models appear in VS Code's Copilot list as `[FREE] Model Name`, `[GO] Model Name`, and `[M365] M365 Copilot` — the prefix indicates free vs paid vs M365 tier at a glance.
 
 **Free** (always available, auto-validated): Big Pickle, Hy3 Preview Free, MiniMax M2.5 Free, Nemotron 3 Super Free
 
 **Paid** (requires Go API key): fetched dynamically from OpenCode — all support tool calling
+
+**M365 Copilot** (optional, requires `M365CO_PORT`): your company's Microsoft 365 Copilot chat — two models (Quick + Think), chat-only, no tools
 
 ---
 
@@ -236,6 +240,91 @@ All route through the same Pollinations `openai` backend — no API key required
 | `HIDE_POLL` | `false` | Hide all Pollinations models |
 | `HIDE_POLL_COSPLAY` | `true` | Hide cosplay aliases (GPT-5, Claude, Gemini, DeepSeek, Llama-4, Mistral) — only show GPT-OSS 20B |
 | `POLLINATIONS_BASE_URL` | `https://text.pollinations.ai/openai` | Pollinations API endpoint |
+
+---
+
+## Microsoft 365 Copilot (optional)
+
+You can route chat requests through your company's **Microsoft 365 Copilot** (the web chat at [m365.cloud.microsoft](https://m365.cloud.microsoft/chat)) as an additional model. Two models appear: `[M365] M365 Copilot Quick` and `[M365] M365 Copilot Think`.
+
+### How it works
+
+The proxy connects to a **WebSocket relay server** that runs a browser-automated M365 Copilot session. The relay intercepts the M365 substrate WebSocket (`substrate.office.com`) and forwards chat requests/responses. This is the same approach used by [m365-copilot-openai-proxy](https://github.com/kuchris/m365-copilot-openai-proxy).
+
+Two relay options are available:
+
+| Relay | Setup | Description |
+|-------|-------|-------------|
+| **Local relay** (`C:\Apps\O365GHCP\Key\`) | Pre-configured | Edge-based relay bundled with the proxy — uses `start.cmd` / `debug.cmd` |
+| **[g365-headless-relay](https://github.com/notBlubbll/g365-headless-relay)** | `npm install` | Playwright Chromium off-screen relay — open-source, cross-platform, persistent profile |
+
+Both relays expose the same WebSocket API on `ws://127.0.0.1:8765` and are interchangeable.
+
+**Constraints:**
+- Token expires in ~1 hour (browser session handles auth — no manual token extraction).
+- System prompts and conversation history are folded into the message as plain text (labeled sections with `---` separator).
+- **No tool calls or agent mode** — M365 Copilot is chat-only.
+
+### Setup (local relay)
+
+1. Open `C:\Apps\O365GHCP\Key\debug.cmd` — launches Edge with visible browser
+2. Sign in to M365 Copilot at [m365.cloud.microsoft/chat](https://m365.cloud.microsoft/chat)
+3. Close the browser, then start the relay off-screen:
+   ```bash
+   C:\Apps\O365GHCP\Key\start.cmd
+   ```
+4. Set the relay port in `.env`:
+   ```env
+   M365CO_PORT=8765
+   ```
+5. Restart the proxy. `[M365]` models appear in the model list.
+
+### Setup (g365-headless-relay)
+
+1. Clone and install:
+   ```bash
+   git clone https://github.com/notBlubbll/g365-headless-relay
+   cd g365-headless-relay
+   npm install
+   ```
+2. First run — sign in (visible browser):
+   ```bash
+   debug.cmd
+   ```
+3. Subsequent runs — off-screen relay:
+   ```bash
+   start.cmd
+   ```
+4. Set the relay port in `.env`:
+   ```env
+   M365CO_PORT=8765
+   ```
+5. Restart the proxy.
+
+### Relaying prompt to M365
+
+System prompts and conversation history are folded into the message as plain text before sending to M365:
+
+```
+System instructions:
+Be concise and helpful.
+
+Prior conversation transcript:
+User: What is TypeScript?
+Assistant: TypeScript is a typed superset of JavaScript.
+
+---
+
+Tell me more about interfaces.
+```
+
+### Token refresh
+
+When the browser session expires, restart the relay:
+- **Local relay**: run `debug.cmd` to re-sign in, then `start.cmd`
+- **g365-headless-relay**: run `debug.cmd` to re-sign in, then `start.cmd`
+
+No manual token copying required — the browser session handles all auth.
 
 ---
 

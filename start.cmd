@@ -23,7 +23,8 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%SERVER_PORT% " ^| findstr 
     taskkill /pid %%a /f >nul 2>&1
 )
 
-REM 3. API Key Notice
+REM 3. Set libuv thread pool size for DNS/file I/O concurrency
+if "%UV_THREADPOOL_SIZE%"=="" set UV_THREADPOOL_SIZE=8
 
 REM 4. Try Bun first
 bun --version >nul 2>&1
@@ -34,7 +35,7 @@ if %ERRORLEVEL% equ 0 (
         call bun install
     )
     echo.
-    bun run src/server.js
+    bun --smol run src/server.js
     if !ERRORLEVEL! equ 42 goto :restart
     goto :EOF
 )
@@ -48,7 +49,8 @@ if %ERRORLEVEL% equ 0 (
         call npm install hono undici --no-bin-links >nul 2>&1
     )
     echo.
-    node src/server.js
+    REM --expose-gc enables manual gc; --max-old-space-size limits heap to avoid runaway memory
+    node --expose-gc --max-old-space-size=4096 src/server.js
     if !ERRORLEVEL! equ 42 goto :restart
     goto :EOF
 )

@@ -41,7 +41,7 @@ if (typeof ReadableStream === 'undefined') {
 import { Hono } from "hono";
 import { stream } from "hono/streaming";
 import { cors } from "hono/cors";
-import { config, getModels, initModels, resolveModel, resolveModelMetadata, isKnownModel, chatCompletion, APIError, isSeparator, isFreeTierModel, isPollModel, isM365Model, SEP_PAID, SEP_FREE, SEP_FREE_P, SEP_M365, refreshModels, validateFreeModels, bgFetchDone, getKeyStatus } from "./opencode-client.js";
+import { config, getModels, initModels, resolveModel, resolveModelMetadata, isKnownModel, chatCompletion, APIError, isSeparator, isFreeTierModel, isPollModel, isM365Model, SEP_PAID, SEP_FREE, SEP_FREE_P, SEP_M365, refreshModels, validateFreeModels, bgFetchDone, getKeyStatus, fetchWithAgent } from "./opencode-client.js";
 import { check as cacheCheck, store as cacheStore, cacheKey } from "./cache.js";
 import { ModelConcurrencyManager, RateLimitError, truncateToolMessagesInPayload, checkRequestBodySize } from "./concurrency.js";
 import { compactIdentity, compactToolInstructions, compactOllamaToolInstructions, compactCodeCompletionPrompt, compressMessages } from "./token-optimizer.js";
@@ -102,7 +102,7 @@ const err = (msg) => process.stderr.write(`\x1b[90m${ts()}\x1b[0m \x1b[31m${msg}
   try {
     const fs = await import("node:fs");
     if (!fs.existsSync(".env")) {
-      fs.writeFileSync(".env", "# OpenCode API key (optional — free models work without it)\n# Get yours at: https://opencode.ai\nOPENCODE_API_KEY=\n\n# Multi-key rotation (optional)\n# OPENCODE_API_KEYS=[\\\"key1\\\",\\\"key2\\\"]\n\n# Hide free models from the list (default false)\nHIDE_FREE=false\n\n# Enable Pollinations free models (pol/ prefix) — true by default\nUSE_POLL_MODELS=true\n\n# Pollinations API base URL (default: text.pollinations.ai OpenAI-compatible endpoint)\n# POLLINATIONS_BASE_URL=https://text.pollinations.ai/openai\n\n# Hide Pollinations models from the list (default false)\nHIDE_POLL=false\n\n# Hide Pollinations cosplay aliases (GPT-5, Claude, Gemini, DeepSeek, Llama-4, Mistral)\n# — true by default, shows only the real GPT-OSS 20B model. Set to false to show all 7.\n# HIDE_POLL_COSPLAY=true\n\n# Log incoming requests (default true)\nREQUEST_LOG=true\n\n# ── Prompt Compression (OmniRoute RTK+Caveman stacked) ──\n# auto / off / lite / caveman / aggressive / ultra / rtk / stacked (default: auto)\n# auto picks: off for <=3 msgs, stacked for free/poll, caveman for paid\nCOMPRESSION_LEVEL=auto\n\n# ── DLP / Content Blocklist (ghcp-proxy enrichment) ──\n# Enable prompt content filtering (default false)\nBLOCKLIST_ENABLED=false\n\n# Blocklist mode: \"block\" (deny with 403) or \"report\" (allow but log)\nBLOCKLIST_MODE=block\n\n# Comma-separated keywords to block (case-insensitive)\n# BLOCKLIST_KEYWORDS=secret,confidential,password\n\n# Comma-separated file name patterns to block\n# BLOCKLIST_FILEPATTERNS=passwords.txt,.env.production\n\n# Comma-separated regex patterns to block\n# BLOCKLIST_REGEX=sk-[A-Za-z0-9]{20,}\n\n# ── Concurrency & Rate Limiting (antigravity-copilot enrichment) ──\n# Maximum concurrent requests for thinking models (keep low to avoid upstream 429s)\n# CONCURRENCY_THINKING=1\n\n# Maximum concurrent requests for standard models\n# CONCURRENCY_STANDARD=3\n\n# Retry attempts for 429 / RESOURCE_EXHAUSTED errors (0 to disable)\n# RETRY_MAX=3\n\n# Base delay before first retry in ms (exponential backoff follows)\n# RETRY_BASE_DELAY_MS=100\n\n# Abort thinking model requests after this many ms (prevents quota exhaustion)\n# THINKING_TIMEOUT_MS=60000\n\n# Abort standard model requests after this many ms\n# REQUEST_TIMEOUT_MS=120000\n\n# Truncate large tool outputs (e.g., git diff) to reduce context size\n# TRUNCATE_TOOL_OUTPUT=true\n\n# Max chars kept per tool output after truncation\n# MAX_TOOL_OUTPUT_CHARS=12000\n\n# Chars kept from start of tool output when truncating\n# TOOL_OUTPUT_HEAD_CHARS=6000\n\n# Chars kept from end of tool output when truncating\n# TOOL_OUTPUT_TAIL_CHARS=2000\n\n# Absolute max request body size in bytes (returns 413 if exceeded)\n# MAX_REQUEST_BODY_BYTES=10485760\n\n# ── User Auth (ghcp-proxy allowed_users pattern) ──\n# Comma-separated list of allowed users (Proxy-Authorization or X-User-ID header)\n# ALLOWED_USERS=dev1,dev2\n\n# ── Model metadata (lmstudio-ollama-proxy enrichment) ──\n# Force all models to report full capabilities (chat/completion/vision/tools/agent)\nFORCE_ALL_CAPABILITIES=true\n\n# Force a specific context length for all models (0 = use auto-detection)\n# FORCE_CONTEXT_LENGTH=131072\n\n# Default context length fallback when not available from models.dev\nDEFAULT_CONTEXT_LENGTH=131072\n\n# Per-model metadata overrides (JSON). Example:\n# MODEL_METADATA_JSON={\"my-model\":{\"context_length\":32768,\"capabilities\":[\"chat\",\"tools\"],\"family\":\"my-family\",\"parameter_size\":\"7B\"}}\n\n# Passthrough base URL — forward unmatched paths to this upstream\n# PASSTHROUGH_BASE_URL=https://opencode.ai/zen/go/v1\n# Passthrough path prefixes (comma-separated, default /v1)\n# PASSTHROUGH_PREFIXES=/v1,/api/v0\n");
+      fs.writeFileSync(".env", "# OpenCode API key (optional — free models work without it)\n# Get yours at: https://opencode.ai\nOPENCODE_API_KEY=\n\n# Multi-key rotation (optional)\n# OPENCODE_API_KEYS=[\"key1\",\"key2\"]\n\n# Hide free models from the list (default false)\nHIDE_FREE=false\n\n# Show Pollinations free models (pol/ prefix) — true by default\nSHOW_POLL_MODELS=true\n\n# Hide Pollinations cosplay aliases (GPT-5, Claude, Gemini, DeepSeek, Llama-4, Mistral)\n# — true by default, shows only the real GPT-OSS 20B model. Set to false to show all 7.\nHIDE_POLL_COSPLAY=true\n\n# Log incoming requests (default true)\nREQUEST_LOG=true\n\n# ── Prompt Compression (OmniRoute RTK+Caveman stacked) ──\n# auto / off / lite / caveman / aggressive / ultra / rtk / stacked (default: auto)\n# auto picks: off for <=3 msgs, stacked for free/poll, caveman for paid\nCOMPRESSION_LEVEL=auto\n\n# ── DLP / Content Blocklist (ghcp-proxy enrichment) ──\n# Enable prompt content filtering (default false)\nBLOCKLIST_ENABLED=false\n\n# Blocklist mode: \"block\" (deny with 403) or \"report\" (allow but log)\nBLOCKLIST_MODE=block\n\n# Comma-separated keywords to block (case-insensitive)\n# BLOCKLIST_KEYWORDS=secret,confidential,password\n\n# Comma-separated file name patterns to block\n# BLOCKLIST_FILEPATTERNS=passwords.txt,.env.production\n\n# Comma-separated regex patterns to block\n# BLOCKLIST_REGEX=sk-[A-Za-z0-9]{20,}\n\n# ── Concurrency & Rate Limiting (antigravity-copilot enrichment) ──\n# Maximum concurrent requests for thinking models (keep low to avoid upstream 429s)\n# CONCURRENCY_THINKING=1\n\n# Maximum concurrent requests for standard models\n# CONCURRENCY_STANDARD=3\n\n# Retry attempts for 429 / RESOURCE_EXHAUSTED errors (0 to disable)\n# RETRY_MAX=3\n\n# Base delay before first retry in ms (exponential backoff follows)\n# RETRY_BASE_DELAY_MS=100\n\n# Abort thinking model requests after this many ms (prevents quota exhaustion)\n# THINKING_TIMEOUT_MS=60000\n\n# Abort standard model requests after this many ms\n# REQUEST_TIMEOUT_MS=120000\n\n# Truncate large tool outputs (e.g., git diff) to reduce context size\n# TRUNCATE_TOOL_OUTPUT=true\n\n# Max chars kept per tool output after truncation\n# MAX_TOOL_OUTPUT_CHARS=12000\n\n# Chars kept from start of tool output when truncating\n# TOOL_OUTPUT_HEAD_CHARS=6000\n\n# Chars kept from end of tool output when truncating\n# TOOL_OUTPUT_TAIL_CHARS=2000\n\n# Absolute max request body size in bytes (returns 413 if exceeded)\n# MAX_REQUEST_BODY_BYTES=10485760\n\n# ── User Auth (ghcp-proxy allowed_users pattern) ──\n# Comma-separated list of allowed users (Proxy-Authorization or X-User-ID header)\n# ALLOWED_USERS=dev1,dev2\n\n# ── Model metadata (lmstudio-ollama-proxy enrichment) ──\n# Force all models to report full capabilities (chat/completion/vision/tools/agent)\nFORCE_ALL_CAPABILITIES=true\n\n# Force a specific context length for all models (0 = use auto-detection)\n# FORCE_CONTEXT_LENGTH=131072\n\n# Default context length fallback when not available from models.dev\nDEFAULT_CONTEXT_LENGTH=131072\n\n# Per-model metadata overrides (JSON). Example:\n# MODEL_METADATA_JSON={\"my-model\":{\"context_length\":32768,\"capabilities\":[\"chat\",\"tools\"],\"family\":\"my-family\",\"parameter_size\":\"7B\"}}\n\n# Passthrough base URL — forward unmatched paths to this upstream\n# PASSTHROUGH_BASE_URL=https://opencode.ai/zen/go/v1\n# Passthrough path prefixes (comma-separated, default /v1)\n# PASSTHROUGH_PREFIXES=/v1,/api/v0\n");
       log("Created .env — add your OPENCODE_API_KEY there to unlock paid models");
     }
   } catch { /* fs not available, ignore */ }
@@ -468,7 +468,7 @@ async function handleTags(c) {
     if (vsc && sep) continue;
     if (!vsc && sep && config.hideFree) continue;
     if (config.hideFree && isFreeTierModel(m.model)) continue;
-    if (config.hidePoll && isPollModel(m.model)) continue;
+    if (!config.showPollModels && isPollModel(m.model)) continue;
     const id = m.model.replace(":latest", "");
     const rawId = id.split(":")[0].trim();
     if (seen.has(rawId)) continue;
@@ -744,7 +744,7 @@ app.get("/v1/models", async c => {
   for (const m of models) {
     if (isSeparator(m.model)) continue;
     if (config.hideFree && isFreeTierModel(m.model)) continue;
-    if (config.hidePoll && isPollModel(m.model)) continue;
+    if (!config.showPollModels && isPollModel(m.model)) continue;
     const rawId = m.model.replace(":latest", "").split(":")[0].trim();
     const isFree = isFreeTierModel(m.model);
     const isPoll = isPollModel(m.model);
@@ -1633,7 +1633,7 @@ async function handlePassthrough(c) {
   }
 
   try {
-    const upstream = await fetch(`${config.passthroughBaseUrl}${url.pathname}${url.search}`, {
+    const upstream = await fetchWithAgent(`${config.passthroughBaseUrl}${url.pathname}${url.search}`, {
       method,
       headers: incomingHeaders,
       ...(body ? { body } : {}),
@@ -1685,11 +1685,11 @@ const host = config.host;
 
 // Start HTTP server immediately
 if (typeof Bun !== 'undefined' && typeof Bun.serve === 'function') {
-  serverRef = Bun.serve({ port, hostname: host, fetch: app.fetch, idleTimeout: 120 });
+  serverRef = Bun.serve({ port, hostname: host, fetch: app.fetch, idleTimeout: 120, reusePort: true, backlog: 1024, maxRequestBodySize: Math.max(262144, parseInt(Bun.env.MAX_REQUEST_BODY_BYTES || "10485760", 10)) });
   log(`Listening on http://${host}:${serverRef.port}`);
 } else if (typeof process !== 'undefined' && process.versions?.node) {
   const http = await import("http");
-  serverRef = http.createServer({}, (req, res) => {
+  serverRef = http.createServer({ noDelay: true, maxHeaderSize: 65536 }, (req, res) => {
     let raw = "";
     req.on("data", chunk => raw += chunk);
     req.on("end", () => {
@@ -1724,9 +1724,13 @@ if (typeof Bun !== 'undefined' && typeof Bun.serve === 'function') {
       });
     });
   });
-  serverRef.timeout = 300000;
+  serverRef.timeout = 120000;
+  serverRef.headersTimeout = 65000;
+  serverRef.requestTimeout = 120000;
+  serverRef.keepAliveTimeout = 65000;
+  serverRef.maxHeadersCount = 200;
   await new Promise((resolve) => {
-    serverRef.listen(port, host, () => {
+    serverRef.listen(port, host, 1024, () => {
       log(`Listening on http://${host}:${port}`);
       resolve();
     });
@@ -1762,10 +1766,10 @@ const hasPaid = models.some(m => m.model === `${SEP_PAID}:latest`);
 const hasPoll = models.some(m => m.model === `${SEP_FREE_P}:latest`);
 const hasM365 = models.some(m => m.model === `${SEP_M365}:latest`);
 const modeLabel = (hasPaid
-  ? (config.hideFree ? " \x1b[32m(go mode)\x1b[90m" : " \x1b[32m(free&go mode)\x1b[90m")
+  ? (config.hideFree ? " \x1b[32m(premium mode)\x1b[90m" : " \x1b[32m(premium+free mode)\x1b[90m")
   : (hasPoll ? " \x1b[33m(free+poll mode)\x1b[90m" : " \x1b[33m(free mode)\x1b[90m"))
   + (hasM365 ? " \x1b[36m+ M365\x1b[90m" : "");
-if (hasPaid) log("\x1b[32m[status] Authenticated — free & paid models\x1b[0m");
+if (hasPaid) log("\x1b[32m[status] Authenticated — Premium+Free\x1b[0m");
 else if (hasPoll) log("\x1b[33m[status] Free mode — OpenCode free + Pollinations\x1b[0m");
 else log("\x1b[33m[status] Free mode — no API key\x1b[0m");
 if (hasM365) log("\x1b[36m[status] M365 Copilot connected\x1b[0m");
@@ -1820,7 +1824,7 @@ if (!config.hideFree && freeModels.length) {
   printTable(freeModels);
 }
 
-if (!config.hidePoll && pollModels.length) {
+if (config.showPollModels && pollModels.length) {
   if (!config.hideFree && freeModels.length) P(line(""));
   P(line(S + "Pollinations: " + S + `(${pollModels.length})` + R));
   P(line(S + "Name".padEnd(20) + " \u2502 " + "ID".padEnd(24) + " \u2502 " + "Context" + R));

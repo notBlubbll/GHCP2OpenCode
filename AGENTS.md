@@ -141,58 +141,32 @@ Detected in priority order:
 
 ## M365 Copilot Integration
 
-### WebSocket relay
-
-The proxy connects to a local WebSocket relay server that manages a browser-automated M365 Copilot session. Two relay options:
-
-1. **Local relay** (`C:\Apps\O365GHCP\Key\`) — Edge-based, bundled
-2. **[g365-headless-relay](https://github.com/notBlubbll/g365-headless-relay)** — Playwright Chromium, open-source, cross-platform
-
-Both expose `ws://127.0.0.1:8765` with the same protocol.
+Uses a WebSocket relay at `ws://127.0.0.1:8765` to connect to M365 Copilot. See [g365-headless-relay](https://github.com/notBlubbll/g365-headless-relay) for the self-hostable relay server.
 
 ### Relay protocol
 
 ```
-→ {"type":"new","model":"gpt-5.5-quick"}       # Start session
-← {"type":"ready","model":"gpt-5.5-quick"}      # Session ready
-
-→ {"type":"chat","text":"System instructions:\n...\n\n---\n\nuser prompt"}
-← {"type":"delta","text":"resp"}                # Streaming chunks
-← {"type":"message","text":"full response"}     # Full message (type 2 from substrate)
-← {"type":"done"}                               # Turn complete
+→ {"type":"new","model":"gpt-5.5-quick"}
+← {"type":"ready","model":"gpt-5.5-quick"}
+→ {"type":"chat","text":"..."}
+← {"type":"delta","text":"resp"}
+← {"type":"message","text":"full response"}
+← {"type":"done"}
 ```
 
-### Prompt folding (`buildM365ChatText`)
+### Prompt folding
 
-System messages and conversation history are folded into a single text block:
-```
-System instructions:
-{system prompt}
-
-Prior conversation transcript:
-User: {msg1}
-Assistant: {msg2}
-
----
-
-{final user message}
-```
-
-This matches the approach in [m365-copilot-openai-proxy](https://github.com/kuchris/m365-copilot-openai-proxy).
+Messages folded into labeled plain text with `---` separator (matching [m365-copilot-openai-proxy](https://github.com/kuchris/m365-copilot-openai-proxy)).
 
 ### Response handling
 
-- **Streaming deltas** (`type: "delta"`): Streamed as SSE to the client
-- **Full message** (`type: "message"`): Authoritative complete response — used if no deltas arrived
-- **`[COPILOT]` prefix**: Stripped from all response text
-- Deltas arriving after the full message are discarded to avoid duplicate output
+- `type: "delta"` → SSE stream; `type: "message"` → authoritative full response (used if no deltas arrived)
+- `[COPILOT]` prefix stripped; deltas after full message discarded
 
 ### Shared connection
 
-- One persistent WebSocket shared across all M365 chat turns
-- Access serialized via `_sendGate` (Promise chain)
-- Model changes trigger `{ type: "new" }` to create a fresh browser session
-- Connection re-established on close/error
+- Persistent WebSocket, serialized via `_sendGate`, re-established on close/error
+- Model changes send `{ type: "new" }` to create a fresh browser session
 
 ---
 
@@ -219,11 +193,13 @@ This matches the approach in [m365-copilot-openai-proxy](https://github.com/kuch
 
 ## Key Behaviors
 
-- **Model registry**: Free models hardcoded, paid models fetched from Go API, metadata from models.dev. Cached to `.ghcp2oc_models.json` disk.
-- **Key rotation**: Round-robin with cooldown. 401 → 60s cooldown, 429 → 15s. Validated via real API calls. Hash persisted to `.ghcp2oc_keyhash.json`.
+- **Model registry**: Free models hardcoded, paid models fetched from Go API, metadata from models.dev. Cached to `.cache/models.json` disk.
+- **Key validation**: On startup, pings `deepseek-v4-flash` with `max_tokens: 1` *before* fetching the paid model list. If inference fails (429), paid models are skipped entirely and `Premium+Free` mode isn't advertised. If `deepseek-v4-flash` returns 404, falls back to the first premium model from the API with a warning.
+- **Rate-limit persistence**: 429 responses are parsed for `error.type` + `error.message` (e.g. `GoUsageLimitError: Weekly usage limit reached. Resets in 1 day.`). The timing is extracted from the message and persisted to `.cache/key-state.json`. On restart, cooldowns are respected — no ping or model fetch is performed while the key is still banned.
+- **Key rotation**: Round-robin with cooldown. 401 → 60s cooldown, 429 → persisted ban duration. Validated via real inference pings. Hash persisted to `.cache/keyhash.json`.
 - **Auto-compression**: `COMPRESSION_LEVEL=auto` selects `off` for ≤3 messages, `stacked` for free/poll, `caveman` for paid.
 - **Auto-restart**: Exit code 42 triggers restart via `start.cmd` loop. Console commands: `r`/`restart`, `s`/`stop`, `e`/`exit`.
 - **Graceful shutdown**: `/stop` endpoint or SIGINT/SIGTERM/SIGHUP with 30s timeout.
 - **VS 2026 file creation**: Markdown code blocks parsed into `create_file` tool calls. Project files (`.csproj`, `.sln`) handled natively.
-- **Pollinations cosplay**: 6 aliases hidden by default (`HIDE_POLL_COSPLAY=true`). Only `pol/openai-fast` (GPT-OSS 20B) shown.
+- **Pollinations**: 6 cosplay aliases hidden by default (`HIDE_POLL_COSPLAY=true`). Only `pol/openai-fast` (GPT-OSS 20B) shown. Controlled by `SHOW_POLL_MODELS` + `HIDE_POLL_COSPLAY`. URL hardcoded to `https://text.pollinations.ai/openai`.
 - **Version check**: Compares local `.version` against remote GitHub raw file. Console title updates when outdated.

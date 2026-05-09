@@ -28,11 +28,10 @@ async function _getAgent() {
   }
 }
 
-function _fetchWithAgent(url, init = {}) {
-  return _getAgent().then(agent => {
-    if (agent) init.dispatcher = agent;
-    return fetch(url, init);
-  });
+export async function fetchWithAgent(url, init = {}) {
+  const agent = await _getAgent();
+  if (agent) init.dispatcher = agent;
+  return fetch(url, init);
 }
 
 const FREE_TIER_MODELS = [
@@ -71,7 +70,7 @@ function buildFreeTierModels() {
   const allModels = { ...((_mdCache && _mdCache["opencode-go"]?.models) || {}), ...((_mdCache && _mdCache["opencode"]?.models) || {}) };
   const active = FREE_TIER_MODELS.filter(m => {
     if (m._active === false) return false;
-    if (m._poll && !config.usePollModels) return false;
+    if (m._poll && !config.showPollModels) return false;
     if (m._pollCosplay && config.hidePollCosplay) return false;
     if (allModels[m.id]?.status === "deprecated") return false;
     return true;
@@ -182,15 +181,15 @@ const SEP_M365 = "(m365)";
 const config = {
   get apiKey() { return Bun.env.OPENCODE_API_KEY ?? ""; },
   get hasKey() {
-    if (Bun.env.OPENCODE_API_KEY) return true;
     if (Bun.env.OPENCODE_API_KEYS) {
-      try { return JSON.parse(Bun.env.OPENCODE_API_KEYS).length > 0; } catch {}
+      try { return JSON.parse(Bun.env.OPENCODE_API_KEYS).some(k => k.length > 5); } catch {}
     }
+    if (Bun.env.OPENCODE_API_KEY && Bun.env.OPENCODE_API_KEY.length > 5) return true;
     return false;
   },
   baseUrl: Bun.env.OPENCODE_BASE_URL ?? "https://opencode.ai/zen/go/v1",
   baseUrlFree: Bun.env.OPENCODE_BASE_FREE_URL ?? "https://opencode.ai/zen/v1",
-  baseUrlPoll: Bun.env.POLLINATIONS_BASE_URL ?? "https://text.pollinations.ai/openai",
+  baseUrlPoll: "https://text.pollinations.ai/openai",
   host: Bun.env.SERVER_HOST ?? "127.0.0.1",
   port: parseInt(Bun.env.SERVER_PORT ?? "11434", 10),
   defaultModel: Bun.env.DEFAULT_MODEL ?? "big-pickle",
@@ -205,11 +204,8 @@ const config = {
   get hideFree() {
     return Bun.env.HIDE_FREE === "true" || Bun.env.HIDE_FREE === "1";
   },
-  get hidePoll() {
-    return Bun.env.HIDE_POLL === "true" || Bun.env.HIDE_POLL === "1";
-  },
-  get usePollModels() {
-    const v = Bun.env.USE_POLL_MODELS;
+  get showPollModels() {
+    const v = Bun.env.SHOW_POLL_MODELS;
     return v === undefined ? true : v === "true" || v === "1";
   },
   get hidePollCosplay() {
@@ -250,36 +246,238 @@ const config = {
 
 export function setApiKey(key) { Bun.env.OPENCODE_API_KEY = key; }
 
-// ── Key rotation ──
+// ── Key rotation with ApiBalancer ──
+
+const COOLDOWN_429_FIRST = 5 * 60 * 60 * 1000;  // 5 hours
+const COOLDOWN_429_SECOND = 7 * 24 * 60 * 60 * 1000;  // 1 week
+const CONSECUTIVE_429_THRESHOLD = 10;
 
 let _keys = [];
-let _keyIdx = 0;
-const _keyCooldown = new Map(); // key -> cooldownUntil timestamp
+let _balancer = null;
+const _key429Count = new Map();  // key → consecutive 429 count
+
+function cacheDir() {
+  const base = Bun.env.OPENCODE_CACHE_DIR || (typeof process !== 'undefined' ? process.cwd() : ".");
+  const dir = `${base}/.cache`;
+  try { require("node:fs").mkdirSync(dir, { recursive: true }); } catch {}
+  return dir;
+}
+
+const _keyStatePath = `${cacheDir()}/key-state.json`;
+
+function loadKeyState() {
+  try {
+    if (!_fs) return {};
+    if (!_fs.existsSync(_keyStatePath)) return {};
+    const data = JSON.parse(_fs.readFileSync(_keyStatePath, "utf8"));
+    console.log(`[keys] loaded state from ${_keyStatePath}`);
+    return data;
+  } catch {
+    return {};
+  }
+}
+
+function saveKeyState() {
+  if (!_fs) return;
+  try {
+    const now = Date.now();
+    const keys = {};
+    for (const key of _keys) {
+      const short = `${key.slice(0, 6)}...${key.slice(-4)}`;
+      keys[short] = {
+        consecutive429: _key429Count.get(key) || 0,
+      };
+      if (_balancer) {
+        if (_balancer.bannedUntil.has(key)) {
+          const until = _balancer.bannedUntil.get(key);
+          if (until > now) {
+            keys[short].bannedUntil = new Date(until).toISOString();
+          }
+        }
+      }
+    }
+    _fs.writeFileSync(_keyStatePath, JSON.stringify({ keys, updatedAt: isoNow() }, null, 2));
+    console.log(`[keys] state saved to ${_keyStatePath}`);
+  } catch (e) {
+    console.error(`[keys] save state failed: ${e.message}`);
+  }
+}
 
 function loadKeys() {
   if (Bun.env.OPENCODE_API_KEYS) {
-    try { _keys = JSON.parse(Bun.env.OPENCODE_API_KEYS); } catch { _keys = []; }
-  }
-  if (_keys.length === 0 && Bun.env.OPENCODE_API_KEY) {
+    try { _keys = JSON.parse(Bun.env.OPENCODE_API_KEYS).filter(k => k.length > 5); } catch { _keys = []; }
+  } else if (Bun.env.OPENCODE_API_KEY && Bun.env.OPENCODE_API_KEY.length > 5) {
     _keys = [Bun.env.OPENCODE_API_KEY];
+  }
+  if (_keys.length > 0 && (!_balancer || _balancer.keys !== _keys)) {
+    const savedState = loadKeyState();
+    _balancer = new ApiBalancer(_keys, savedState);
+  }
+}
+
+class ApiBalancer {
+  constructor(keys, savedState = {}) {
+    this.keys = keys;
+    this.pool = [];
+    this.bannedUntil = new Map();   // key → timestamp when ban expires
+    this._restoreState(savedState);
+  }
+
+  _restoreState(savedState) {
+    const keyMap = {};
+    for (const k of this.keys) {
+      const short = `${k.slice(0, 6)}...${k.slice(-4)}`;
+      keyMap[short] = k;
+    }
+    let restoredBans = 0;
+    let skippedExpired = 0;
+    for (const [short, info] of Object.entries(savedState.keys || {})) {
+      const fullKey = keyMap[short];
+      if (!fullKey) { console.log(`[keys] state has ${short} but no matching key — skipping`); continue; }
+      if (info.bannedUntil) {
+        const until = new Date(info.bannedUntil).getTime();
+        if (until > Date.now()) {
+          this.bannedUntil.set(fullKey, until);
+          restoredBans++;
+        } else {
+          skippedExpired++;
+        }
+      }
+      if (info.consecutive429) {
+        _key429Count.set(fullKey, info.consecutive429);
+      }
+    }
+    if (restoredBans > 0) console.log(`[keys] restored ${restoredBans} ban(s) from cache (${skippedExpired} expired)`);
+  }
+
+  _refillPool() {
+    const now = Date.now();
+    this.pool = [];
+    for (const key of this.keys) {
+      if (this.bannedUntil.has(key) && this.bannedUntil.get(key) > now) continue;
+      this.pool.push(key);
+    }
+    if (this.pool.length === 0) {
+      // All keys banned — use the one with earliest expiry
+      let earliestKey = null;
+      let earliestTime = Infinity;
+      for (const [key, until] of this.bannedUntil.entries()) {
+        if (until < earliestTime) {
+          earliestTime = until;
+          earliestKey = key;
+        }
+      }
+      if (earliestKey) {
+        this.pool = [earliestKey];
+      } else {
+        this.pool = [...this.keys];
+      }
+    }
+    // Shuffle
+    for (let i = this.pool.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [this.pool[i], this.pool[j]] = [this.pool[j], this.pool[i]];
+    }
+  }
+
+  getNextKey() {
+    if (this.pool.length === 0) {
+      this._refillPool();
+    }
+    if (this.pool.length === 0) return "";
+    return this.pool.pop();
+  }
+
+  // mark429 with optional dynamic reset seconds from upstream response
+  // Pass resetSeconds to use upstream quota reset as ban duration instead of hardcoded values
+  mark429(key, resetSeconds = 0) {
+    const count = (_key429Count.get(key) || 0) + 1;
+    _key429Count.set(key, count);
+    const short = `${key.slice(0, 6)}...${key.slice(-4)}`;
+
+    // Ban immediately if we have upstream timing (e.g. "Resets in 1 day"), or after threshold
+    if (resetSeconds > 0 || count >= CONSECUTIVE_429_THRESHOLD) {
+      let banMs;
+      let label;
+
+      if (resetSeconds > 0) {
+        banMs = resetSeconds * 1000;
+        label = banMs >= 86400000 ? `~${Math.round(banMs / 86400000)}d` : `~${Math.round(banMs / 3600000)}h`;
+      } else if (this.bannedUntil.has(key) && this.bannedUntil.get(key) > Date.now()) {
+        banMs = COOLDOWN_429_SECOND;
+        label = '~1 week';
+      } else {
+        banMs = COOLDOWN_429_FIRST;
+        label = '~5h';
+      }
+
+      const until = Date.now() + banMs;
+      this.bannedUntil.set(key, until);
+      console.warn(`[keys] ${short} banned for ${label}${resetSeconds > 0 ? ` (upstream)` : ` after ${count} consecutive 429s`} (until ${new Date(until).toLocaleString()})`);
+    }
+    saveKeyState();
+  }
+
+  markSuccess(key) {
+    _key429Count.set(key, 0);
+    if (this.bannedUntil.has(key)) {
+      this.bannedUntil.delete(key);
+      const short = `${key.slice(0, 6)}...${key.slice(-4)}`;
+      console.log(`[keys] ${short} released from ban (successful request)`);
+    }
+    saveKeyState();
+  }
+
+  getStatus() {
+    const now = Date.now();
+    return this.keys.map(k => {
+      const short = `${k.slice(0, 6)}...${k.slice(-4)}`;
+      const consecutive429 = _key429Count.get(k) || 0;
+      let status = "active";
+      let releaseAt = null;
+      if (this.bannedUntil.has(k)) {
+        const until = this.bannedUntil.get(k);
+        if (until > now) {
+          status = "cooldown";
+          releaseAt = new Date(until).toISOString();
+        }
+      }
+      return { keyPrefix: short, status, consecutive429, releaseAt };
+    });
   }
 }
 
 function withKey() {
   loadKeys();
+  if (!_balancer) return _keys[0] || "";
   const now = Date.now();
-  for (let i = 0; i < _keys.length; i++) {
-    const idx = (_keyIdx + i) % _keys.length;
-    const key = _keys[idx];
+  let attempts = 0;
+  while (attempts < _keys.length) {
+    const key = _balancer.getNextKey();
+    if (!key) break;
     if (!_keyCooldown.has(key) || _keyCooldown.get(key) < now) {
-      _keyIdx = (idx + 1) % _keys.length;
       return key;
     }
+    attempts++;
   }
   // All keys on cooldown — try first anyway
   return _keys[0] || "";
 }
 
+function report429(key, resetSeconds = 0) {
+  if (key && _balancer) {
+    _balancer.mark429(key, resetSeconds);
+  }
+}
+
+function reportKeySuccess(key) {
+  if (key && _balancer) {
+    _balancer.markSuccess(key);
+  }
+}
+
+// Legacy cooldown for 401 errors (not tracked by ApiBalancer)
+const _keyCooldown = new Map();
 function cooldownKey(key, ms = 30000) {
   _keyCooldown.set(key, Date.now() + ms);
 }
@@ -301,19 +499,22 @@ function isKeyStale(key) {
 
 export function getKeyStatus() {
   loadKeys();
-  const now = Date.now();
-  return _keys.map(k => ({
-    keyPrefix: k ? `${k.slice(0, 6)}...${k.slice(-4)}` : "none",
-    onCooldown: _keyCooldown.has(k) && _keyCooldown.get(k) > now,
-    cooldownUntil: _keyCooldown.get(k) || 0,
-    lastValidated: lastKeyValidation(k),
-    stale: isKeyStale(k),
-  }));
+  if (!_balancer) {
+    return _keys.map(k => ({
+      keyPrefix: k ? `${k.slice(0, 6)}...${k.slice(-4)}` : "none",
+      status: "active",
+      consecutive429: _key429Count.get(k) || 0,
+    }));
+  }
+  return _balancer.getStatus();
 }
 
 export function rotateKey() {
-  const bad = _keys[_keyIdx % _keys.length];
-  if (bad) cooldownKey(bad);
+  // ApiBalancer handles rotation via pool — no explicit rotation needed
+  // This is kept for backward compatibility
+  if (_balancer) {
+    _balancer._refillPool();
+  }
 }
 
 // ── Dynamic model list ──
@@ -332,8 +533,7 @@ async function _loadFs() {
 
 function getDiskPath() {
   if (_diskCachePath) return _diskCachePath;
-  const dir = Bun.env.OPENCODE_CACHE_DIR || (typeof process !== 'undefined' ? process.cwd() : ".");
-  _diskCachePath = `${dir}/.ghcp2oc_models.json`;
+  _diskCachePath = `${cacheDir()}/models.json`;
   return _diskCachePath;
 }
 
@@ -383,8 +583,7 @@ function keyHash() {
 }
 
 function getKeyHashPath() {
-  const dir = Bun.env.OPENCODE_CACHE_DIR || (typeof process !== 'undefined' ? process.cwd() : ".");
-  return `${dir}/.ghcp2oc_keyhash.json`;
+  return `${cacheDir()}/keyhash.json`;
 }
 
 function loadKeyHashFromDisk() {
@@ -403,6 +602,7 @@ function loadKeyHashFromDisk() {
 function saveKeyHashToDisk(h) {
   if (!_fs) { console.log("[keys] no fs module loaded"); return; }
   try {
+    cacheDir();
     const path = getKeyHashPath();
     _fs.writeFileSync(path, JSON.stringify({ h }));
     console.log(`[keys] saved hash ${h.slice(0, 5)} to ${path}`);
@@ -481,6 +681,7 @@ async function saveModelsToDisk() {
   try {
     await _loadFs();
     await _loadCrypto();
+    cacheDir();
     const path = getDiskPath();
     if (!_models?.length) return;
     const diskData = { _models, _modelMap, _nameToId, _keyHash: keyHash(), _freeTierHash: freeTierHash() };
@@ -571,7 +772,7 @@ async function fetchModels() {
       models.push(sepModel(SEP_FREE, "== FREE =="));
       models.push(...regFree);
     }
-    if (pollFree.length && !config.hidePoll) {
+    if (pollFree.length && config.showPollModels) {
       models.push(sepModel(SEP_FREE_P, "== POLL =="));
       models.push(...pollFree);
     }
@@ -581,7 +782,7 @@ async function fetchModels() {
   let paidCount = 0;
 
   // If API key is set, also fetch paid models
-  if (_paidGoData?.data?.length) {
+  if (_paidGoData?.data?.length && _paidKeyUsable) {
     try {
       const goData = _paidGoData;
       _paidGoData = null;
@@ -684,6 +885,8 @@ export async function initModels() {
       await fetchModels();
       await saveModelsToDisk();
       saveKeyHashToDisk(keyHash());
+    } else if (!_paidKeyUsable && _models) {
+      await fetchModels();
     }
   }).catch(() => {});
   return _models;
@@ -698,19 +901,154 @@ export function getModels() {
 }
 
 let _paidGoData = null;
+let _paidKeyUsable = true;
 let _fetchModelsGate = Promise.resolve();
 
 async function fetchGoModelsRaw() {
   const keys = [];
-  if (Bun.env.OPENCODE_API_KEY) keys.push(Bun.env.OPENCODE_API_KEY);
   if (Bun.env.OPENCODE_API_KEYS) {
-    try { keys.push(...JSON.parse(Bun.env.OPENCODE_API_KEYS)); } catch {}
+    try { keys.push(...JSON.parse(Bun.env.OPENCODE_API_KEYS).filter(k => k.length > 5)); } catch {}
+  } else if (Bun.env.OPENCODE_API_KEY && Bun.env.OPENCODE_API_KEY.length > 5) {
+    keys.push(Bun.env.OPENCODE_API_KEY);
   }
   console.log(`[keys] found ${keys.length} key(s) in env`);
+  loadKeys();
+
+  // Build banned-until map from key-state.json directly (safety net)
+  const bannedFromDisk = new Map();
+  try {
+    if (_fs && _fs.existsSync(_keyStatePath)) {
+      const state = JSON.parse(_fs.readFileSync(_keyStatePath, "utf8"));
+      const keyMap = {};
+      for (const k of keys) {
+        keyMap[`${k.slice(0, 6)}...${k.slice(-4)}`] = k;
+      }
+      for (const [short, info] of Object.entries(state.keys || {})) {
+        const fullKey = keyMap[short];
+        if (!fullKey) continue;
+        if (info.bannedUntil) {
+          const until = new Date(info.bannedUntil).getTime();
+          if (until > Date.now()) bannedFromDisk.set(fullKey, until);
+        }
+      }
+    }
+  } catch {}
+
+  // Skip if all keys are still in cooldown
+  const now = Date.now();
+  function keyIsBanned(key) {
+    const balancerBan = _balancer?.bannedUntil?.get(key);
+    if (balancerBan && balancerBan > now) return true;
+    const diskBan = bannedFromDisk.get(key);
+    if (diskBan && diskBan > now) return true;
+    return false;
+  }
+  const allCooldown = keys.length > 0 && keys.every(k => keyIsBanned(k));
+  if (allCooldown) {
+    const banUntil = _balancer?.bannedUntil?.get(keys[0]) || bannedFromDisk.get(keys[0]) || 0;
+    const remaining = Math.round((banUntil - now) / 1000);
+    console.log(`[keys] all keys in cooldown (~${remaining}s) — skipping paid models`);
+    _paidKeyUsable = false;
+    _paidGoData = null;
+    return null;
+  }
 
   for (let i = 0; i < keys.length; i++) {
     const k = keys[i];
     try {
+      // Skip individual keys still in cooldown
+      if (keyIsBanned(k)) {
+        const banUntil = _balancer?.bannedUntil?.get(k) || bannedFromDisk.get(k) || 0;
+        const remaining = Math.round((banUntil - now) / 1000);
+        console.log(`[keys] key[${i}] in cooldown (~${remaining}s) — skipping`);
+        continue;
+      }
+
+      // Ping first — verify inference works before fetching model list
+      const PING_MODEL = "deepseek-v4-flash";
+      await new Promise(r => setTimeout(r, 3000));
+      try {
+        const pingResp = await fetch(`${config.baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${k}` },
+          body: JSON.stringify({ model: PING_MODEL, messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
+        });
+        if (pingResp.ok) {
+          console.log(`[models] key[${i}] ping ${PING_MODEL} → ${pingResp.status} ok`);
+        } else if (pingResp.status === 429) {
+          const txt = await pingResp.text().catch(() => "");
+          let errType = "429", errMsg = "";
+          try {
+            const p = JSON.parse(txt);
+            errType = p.error?.type || p.error?.code || errType;
+            errMsg = p.error?.message || "";
+            // Parse duration from message (e.g. "Resets in 1 day", "Resets in 4 hours")
+            const m = errMsg.match(/resets?\s+in\s+(\d+)\s*(day|hour|minute|second)s?/i);
+            if (m) {
+              const n = parseInt(m[1], 10);
+              const unit = m[2].toLowerCase();
+              let resetSec = n * (unit === "day" ? 86400 : unit === "hour" ? 3600 : unit === "minute" ? 60 : 1);
+              report429(k, resetSec);
+            }
+          } catch {}
+          console.warn(`[models] key[${i}] ping ${PING_MODEL} → 429 (${errType}${errMsg ? `: ${errMsg}` : ""})`);
+          if (keys.length <= 1) { _paidKeyUsable = false; _paidGoData = null; }
+          continue;
+        } else {
+          // Model not found — fallback to first premium model
+          console.warn(`[models] ${PING_MODEL} → ${pingResp.status} (not found?) — trying fallback model`);
+          const fallResp = await fetch(`${config.baseUrl}/models`, {
+            headers: { Authorization: `Bearer ${k}` },
+          });
+          if (fallResp.ok) {
+            const fallData = await fallResp.json();
+            const fallModel = fallData?.data?.[0]?.id;
+            if (fallModel) {
+              try {
+                const fallPing = await fetch(`${config.baseUrl}/chat/completions`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json", Authorization: `Bearer ${k}` },
+                  body: JSON.stringify({ model: fallModel, messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
+                });
+                if (fallPing.ok) {
+                  console.warn(`[models] ${PING_MODEL} not found — verify if it's still the cheapest model`);
+                  console.log(`[models] key[${i}] fallback ping ${fallModel} → ${fallPing.status} ok`);
+                } else if (fallPing.status === 429) {
+                  const ftxt = await fallPing.text().catch(() => "");
+                  let ftype = "429", fmsg = "";
+                  try {
+                    const fp = JSON.parse(ftxt);
+                    ftype = fp.error?.type || ftype;
+                    fmsg = fp.error?.message || "";
+                    const m = fmsg.match(/resets?\s+in\s+(\d+)\s*(day|hour|minute|second)s?/i);
+                    if (m) {
+                      const n = parseInt(m[1], 10);
+                      const unit = m[2].toLowerCase();
+                      report429(k, n * (unit === "day" ? 86400 : unit === "hour" ? 3600 : unit === "minute" ? 60 : 1));
+                    }
+                  } catch {}
+                  console.warn(`[models] key[${i}] fallback ping ${fallModel} → 429 (${ftype}${fmsg ? `: ${fmsg}` : ""})`);
+                  if (keys.length <= 1) { _paidKeyUsable = false; _paidGoData = null; }
+                  continue;
+                } else {
+                  console.warn(`[models] key[${i}] fallback ping ${fallModel} → ${fallPing.status}`);
+                  continue;
+                }
+              } catch {
+                console.warn(`[models] key[${i}] fallback ping ${fallModel} → unreachable`);
+                continue;
+              }
+            }
+            _paidGoData = fallData;
+          }
+          continue;
+        }
+      } catch {
+        console.warn(`[models] key[${i}] ping ${PING_MODEL} → unreachable`);
+        continue;
+      }
+
+      // Ping passed — now fetch model list
       const goResp = await fetch(`${config.baseUrl}/models`, {
         headers: { Authorization: `Bearer ${k}` },
       });
@@ -720,7 +1058,9 @@ async function fetchGoModelsRaw() {
       }
       if (goResp.ok) {
         _paidGoData = await goResp.json();
-        console.log(`[models] key[${i}] valid — ${_paidGoData?.data?.length || 0} paid models`);
+        _paidKeyUsable = true;
+        const modelCount = _paidGoData?.data?.length || 0;
+        console.log(`[models] key[${i}] valid — ${modelCount} paid models`);
         return _paidGoData;
       }
     } catch (e) {
@@ -863,7 +1203,7 @@ async function zenRequest(endpoint, body, opts = {}) {
     throw new APIError(401, "", "No API key configured. Free tier models can be used without a key.");
   }
 
-  const resp = await _fetchWithAgent(url, { method: "POST", headers, body: JSON.stringify(sendBody), signal: opts?.signal });
+  const resp = await fetchWithAgent(url, { method: "POST", headers, body: JSON.stringify(sendBody), signal: opts?.signal });
 
   if (!resp.ok) {
     const txt = await resp.text().catch(() => "");
@@ -892,7 +1232,24 @@ async function zenRequest(endpoint, body, opts = {}) {
 
     // Retry: rotate key on auth/rate-limit errors, up to configurable max
     if (key && (resp.status === 401 || resp.status === 429) && retries < maxRetries && retries < _keys.length) {
-      cooldownKey(key, resp.status === 429 ? 15000 : 60000);
+      if (resp.status === 429) {
+        // Try to extract upstream reset seconds from response body
+        // Priority: monthly > weekly > rolling (only if rate-limited)
+        let resetSec = 0;
+        try {
+          const parsed = JSON.parse(txt);
+          if (parsed.monthlyUsage?.status === "rate-limited") {
+            resetSec = parsed.monthlyUsage.resetInSec;
+          } else if (parsed.weeklyUsage?.status === "rate-limited") {
+            resetSec = parsed.weeklyUsage.resetInSec;
+          } else if (parsed.rollingUsage?.status === "rate-limited") {
+            resetSec = parsed.rollingUsage.resetInSec;
+          }
+        } catch {}
+        report429(key, resetSec);
+      } else {
+        cooldownKey(key, 60000);
+      }
       if (config.requestLog) console.log(`[zen] retry ${retries + 1}/${maxRetries} after ${resp.status}`);
       return zenRequest(endpoint, body, { ...opts, retries: retries + 1 });
     }
@@ -912,7 +1269,10 @@ async function zenRequest(endpoint, body, opts = {}) {
   }
 
   // Mark key as validated on success
-  if (key) markKeyValid(key);
+  if (key) {
+    markKeyValid(key);
+    reportKeySuccess(key);
+  }
 
   return resp;
 }

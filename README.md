@@ -102,7 +102,55 @@ OPENCODE_API_KEY=your-go-key
 OPENCODE_API_KEYS=["key1","key2"]  # multi-key rotation
 ```
 
-Key validation uses `GET https://opencode.ai/zen/go/v1/models` — returns 200 if valid, 401 if invalid.
+**Startup key validation**: On launch, the proxy pings `deepseek-v4-flash` with `max_tokens: 1` to verify the key can run inference. If it returns 429, the key is marked as rate-limited (with timing extracted from the error message, e.g. `Resets in 1 day`) and paid models are hidden from the list — avoiding wasted API calls on an unusable key. If `deepseek-v4-flash` returns 404, it falls back to the first premium model in the API response. Cooldown state is persisted to `.ghcp2oc_key-state.json` and respected on restart.
+
+### Key Rotation & Rate Limit Protection
+
+When multiple API keys are configured via `OPENCODE_API_KEYS`, the proxy uses an **ApiBalancer** that:
+
+1. **Shuffles keys** — keys are shuffled and distributed randomly each time the pool is exhausted, preventing predictable rotation patterns
+2. **Tracks consecutive 429s** — each key's rate limit responses are counted independently
+3. **Auto-bans abusive keys**:
+   - **10 consecutive 429s** → key removed from rotation
+   - Ban duration: if upstream usage data available, matches the **actual API quota reset** (`rollingUsage` ~5h, `weeklyUsage` ~until Monday UTC, `monthlyUsage` ~1st of month). Otherwise falls back to **5h** (first strike) / **1 week** (second strike)
+   - A single **successful request** immediately clears all bans and resets the 429 counter
+
+#### Key state file
+
+Ban state is persisted to `.cache/key-state.json`. You can manually edit this file to release bans or adjust counters:
+
+```json
+{
+  "keys": {
+    "sk-abc1...xyz9": {
+      "consecutive429": 3,
+      "bannedUntil": "2026-05-09T18:00:00.000Z"
+    }
+  },
+  "updatedAt": "2026-05-09T13:00:00.000Z"
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `consecutive429` | Current consecutive 429 count (resets on success) |
+| `bannedUntil` | ISO timestamp when the key returns to rotation (5h or 1 week ban) |
+
+To manually unban a key, delete its entry or remove `bannedUntil`, then restart the proxy.
+
+### Key Ban Checker (startup + refresh)
+
+On startup and on each model refresh, the proxy loads `.cache/key-state.json` and restores any active bans into the `ApiBalancer`:
+
+1. **`_restoreState()`** — reads the JSON file, maps `short` key fragments (`sk-abc1...xyz9`) back to full key strings from the env, sets `bannedUntil` entries for non-expired bans. Logs `[keys] restored N ban(s) from cache` on success.
+
+2. **Direct disk safety net** (`fetchGoModelsRaw`) — as a second check, reads `key-state.json` directly and builds a `bannedFromDisk` Map. The `keyIsBanned()` helper checks both the in-memory `_balancer.bannedUntil` AND the direct disk Map. This ensures a banned key is never pinged even if the `_restoreState` mapping fails silently (e.g. key format mismatch between sessions).
+
+3. **Individual key cooldown** — before each ping in `fetchGoModelsRaw`, `keyIsBanned(k)` is called. Banned keys log `[keys] key[N] in cooldown (~Xs) — skipping` and are never contacted.
+
+4. **All-key cooldown** — if every key is banned, the entire paid model fetch is skipped with `[keys] all keys in cooldown — skipping paid models`.
+
+This means a key rate-limited from a previous session will never be pinged on restart — it's skipped entirely, saving a wasted 429 roundtrip.
 
 ---
 
@@ -196,23 +244,38 @@ The status line shows green when up to date (match) and red when outdated (misma
 
 ## Caching & Validation
 
-### On startup
+### Disk cache (`models.json`)
 
-Keys from `.env` are validated against the Go API via a real chat request. Free models are pinged in parallel. Only working models appear. Results cached to disk for instant restart.
+The full model list (free + paid + Pollinations + M365) is cached to `.cache/models.json`. On restart, if the key hash matches and no relevant config changed (free tier models, M365 token path), the cache is loaded instantly — no upstream API calls needed.
 
-A quick `big-pickle` ping runs at startup to verify connectivity: `200 ok`, `401 key denied`, or `unreachable`.
+Invalidation triggers:
+- **Key hash changes** — keys added, removed, or rotated → full refresh
+- **Free tier models** changed in code — SHA256 hash of all free model IDs compared to cached value
+- **M365 token** set or removed — cached M365 presence vs current env mismatch
 
-### On tags query
+### Key hash cache (`keyhash.json`)
 
-When VS fetches `/api/tags`, the proxy re-checks `.env` for key changes (SHA256 hash comparison). If keys changed, re-validates and rebuilds the model list automatically. Otherwise, serves from cache.
+SHA256 hash of all API keys (sorted, deduped) persisted to `.cache/keyhash.json`. Used at startup to detect key changes without re-parsing `.env` — if the hash matches, paid models load from disk cache instantly.
 
-### Prompt cache
+### Key state cache (`key-state.json`)
 
-LRU in-memory with TTL. Responses keyed by hashed prompt. Hits replay instantly with zero tokens. Disable with `CACHE_ENABLED=false`.
+Persists per-key ban/cooldown state between restarts. See [Key Ban Checker](#key-ban-checker-startup--refresh) above for the full load/restore flow. File is written on every ban state change and loaded on startup + each `refreshModels()` call.
 
-### Disk cache invalidation
+### Prompt cache (in-memory LRU)
 
-When `FREE_TIER_MODELS` changes in code (new providers added), the disk cache auto-invalidates via a hash of all free tier model IDs. No manual cache clearing needed.
+LRU with TTL. Responses keyed by hash of model + temperature + tool count + normalized messages. Cache hits replay instantly with zero tokens. Controlled by `CACHE_ENABLED`/`CACHE_MAX_SIZE`/`CACHE_TTL_SEC`.
+
+### Reasonings cache (in-memory)
+
+Per-message reasoning text from `<think>` tags is cached and re-attached when a cached prompt-response pair is replayed. Ensures DeepSeek-style reasoning isn't lost on cache hits.
+
+### Free model validation
+
+On startup and refresh, each free model is pinged with a lightweight request (`max_tokens: 1`). Only responding models appear in the list. Results are cached to disk models.
+
+### Connectivity ping
+
+A quick `big-pickle` ping runs at startup to verify Zen API reachability: `200 ok`, `401 key denied`, or `unreachable`.
 
 ---
 
@@ -236,10 +299,8 @@ All route through the same Pollinations `openai` backend — no API key required
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `USE_POLL_MODELS` | `true` | Enable Pollinations models |
-| `HIDE_POLL` | `false` | Hide all Pollinations models |
+| `SHOW_POLL_MODELS` | `true` | Show Pollinations models |
 | `HIDE_POLL_COSPLAY` | `true` | Hide cosplay aliases (GPT-5, Claude, Gemini, DeepSeek, Llama-4, Mistral) — only show GPT-OSS 20B |
-| `POLLINATIONS_BASE_URL` | `https://text.pollinations.ai/openai` | Pollinations API endpoint |
 
 ---
 

@@ -418,12 +418,15 @@ class ApiBalancer {
     saveKeyState();
   }
 
-  markSuccess(key) {
+  markSuccess(key, reason = null) {
     _key429Count.set(key, 0);
     if (this.cooldownUntil.has(key)) {
       this.cooldownUntil.delete(key);
       const short = `${key.slice(0, 6)}...${key.slice(-4)}`;
       console.log(`[keys] ${short} released from cooldown (successful request)`);
+    } else if (reason) {
+      const short = `${key.slice(0, 6)}...${key.slice(-4)}`;
+      console.log(`[keys] ${short} verified — ${reason}`);
     }
     saveKeyState();
   }
@@ -470,9 +473,9 @@ function report429(key, resetSeconds = 0) {
   }
 }
 
-function reportKeySuccess(key) {
+function reportKeySuccess(key, reason = null) {
   if (key && _balancer) {
-    _balancer.markSuccess(key);
+    _balancer.markSuccess(key, reason);
   }
 }
 
@@ -619,7 +622,7 @@ async function checkKeyChanged() {
     _lastKeyHash = loadKeyHashFromDisk();
   }
   if (_lastKeyHash !== null && _lastKeyHash !== h) {
-    console.log(`[keys] changed: ${(_lastKeyHash || "").slice(0, 5)} → ${h.slice(0, 5)}`);
+    console.log(`[keys] changed: ${(_lastKeyHash || "").slice(0, 5)} → ${h.slice(0, 5)} — will ping to verify each key`);
     _lastKeyHash = h;
     saveKeyHashToDisk(h);
     return true;
@@ -953,6 +956,40 @@ async function fetchGoModelsRaw() {
     return null;
   }
 
+  // Only verify all keys when the key set actually changed
+  let keysChanged = false;
+  try {
+    const curHash = keyHash();
+    const savedHash = loadKeyHashFromDisk();
+    keysChanged = (savedHash !== curHash);
+  } catch {}
+
+  if (!keysChanged) {
+    if (_paidGoData) {
+      console.log(`[keys] key set unchanged — ${_paidGoData?.data?.length || 0} paid models cached, skipping verification`);
+      return _paidGoData;
+    }
+    // No paid data cached yet — quick model fetch with a known-good key (no per-key verification)
+    const bestKey = withKey();
+    if (bestKey && !keyInCooldown(bestKey)) {
+      try {
+        const quickResp = await fetch(`${config.baseUrl}/models`, {
+          headers: { Authorization: `Bearer ${bestKey}` },
+        });
+        if (quickResp.ok) {
+          _paidGoData = await quickResp.json();
+          _paidKeyUsable = true;
+          console.log(`[models] key set unchanged — quick model fetch → ${_paidGoData?.data?.length || 0} paid models`);
+          return _paidGoData;
+        }
+      } catch {}
+    }
+    return null;
+  }
+
+  // Key set changed — verify every key and cache results
+  console.log(`[keys] key set changed — verifying all ${keys.length} key(s)`);
+
   for (let i = 0; i < keys.length; i++) {
     const k = keys[i];
     try {
@@ -960,7 +997,7 @@ async function fetchGoModelsRaw() {
       if (keyInCooldown(k)) {
         const cooldownUntilVal = _balancer?.cooldownUntil?.get(k) || cooldownFromDisk.get(k) || 0;
         const remaining = Math.round((cooldownUntilVal - now) / 1000);
-        console.log(`[keys] key[${i}] in cooldown (~${remaining}s) — skipping`);
+        console.log(`[keys] key[${i+1}] in cooldown (~${remaining}s) — skipping`);
         continue;
       }
 
@@ -974,7 +1011,22 @@ async function fetchGoModelsRaw() {
           body: JSON.stringify({ model: PING_MODEL, messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
         });
         if (pingResp.ok) {
-          console.log(`[models] key[${i}] ping ${PING_MODEL} → ${pingResp.status} ok`);
+          console.log(`[models] key[${i+1}] ping ${PING_MODEL} → ${pingResp.status} ok`);
+          reportKeySuccess(k, "ping ok");
+          // Fetch model list from first working key — verify all keys regardless
+          if (!_paidGoData) {
+            const goResp = await fetch(`${config.baseUrl}/models`, {
+              headers: { Authorization: `Bearer ${k}` },
+            });
+            if (goResp.status === 401) {
+              console.error(`[models] key[${i+1}] ping ok but model fetch → 401 (invalid)`);
+            } else if (goResp.ok) {
+              _paidGoData = await goResp.json();
+              _paidKeyUsable = true;
+              const modelCount = _paidGoData?.data?.length || 0;
+              console.log(`[models] key[${i+1}] valid — ${modelCount} paid models`);
+            }
+          }
         } else if (pingResp.status === 429) {
           const txt = await pingResp.text().catch(() => "");
           let errType = "429", errMsg = "";
@@ -982,17 +1034,33 @@ async function fetchGoModelsRaw() {
             const p = JSON.parse(txt);
             errType = p.error?.type || p.error?.code || errType;
             errMsg = p.error?.message || "";
-            // Parse duration from message (e.g. "Resets in 1 day", "Resets in 4 hours")
-            const m = errMsg.match(/resets?\s+in\s+(\d+)\s*(day|hour|minute|second)s?/i);
-            if (m) {
-              const n = parseInt(m[1], 10);
-              const unit = m[2].toLowerCase();
-              let resetSec = n * (unit === "day" ? 86400 : unit === "hour" ? 3600 : unit === "minute" ? 60 : 1);
+            // Parse duration from message (e.g. "Resets in 1 day", "Resets in 15hr 8min", "Resets in 4 hours 30 minutes")
+            let resetSec = 0;
+            try {
+              const dm = errMsg.match(/resets?\s+in\s+(.+?)(?:\.|$|\s+To)/i);
+              if (dm) {
+                const durStr = dm[1];
+                let m2;
+                const re = /(\d+)\s*(day|hour|hr|minute|min|second|sec)s?/gi;
+                while ((m2 = re.exec(durStr)) !== null) {
+                  const n = parseInt(m2[1], 10);
+                  const u = m2[2].toLowerCase();
+                  if (u === 'day') resetSec += n * 86400;
+                  else if (u === 'hour' || u === 'hr') resetSec += n * 3600;
+                  else if (u === 'minute' || u === 'min') resetSec += n * 60;
+                  else if (u === 'second' || u === 'sec') resetSec += n;
+                }
+              }
+            } catch {}
+            if (resetSec > 0) {
               report429(k, resetSec);
             }
           } catch {}
-          console.warn(`[models] key[${i}] ping ${PING_MODEL} → 429 (${errType}${errMsg ? `: ${errMsg}` : ""})`);
+          console.warn(`[models] key[${i+1}] ping ${PING_MODEL} → 429 (${errType}${errMsg ? `: ${errMsg}` : ""})`);
           if (keys.length <= 1) { _paidKeyUsable = false; _paidGoData = null; }
+          continue;
+        } else if (pingResp.status === 401 || pingResp.status === 403) {
+          console.warn(`[models] key[${i+1}] ping → ${pingResp.status} (invalid key)`);
           continue;
         } else {
           // Model not found — fallback to first premium model
@@ -1012,7 +1080,8 @@ async function fetchGoModelsRaw() {
                 });
                 if (fallPing.ok) {
                   console.warn(`[models] ${PING_MODEL} not found — verify if it's still the cheapest model`);
-                  console.log(`[models] key[${i}] fallback ping ${fallModel} → ${fallPing.status} ok`);
+                  console.log(`[models] key[${i+1}] fallback ping ${fallModel} → ${fallPing.status} ok`);
+                  reportKeySuccess(k, "fallback ping ok");
                 } else if (fallPing.status === 429) {
                   const ftxt = await fallPing.text().catch(() => "");
                   let ftype = "429", fmsg = "";
@@ -1020,54 +1089,59 @@ async function fetchGoModelsRaw() {
                     const fp = JSON.parse(ftxt);
                     ftype = fp.error?.type || ftype;
                     fmsg = fp.error?.message || "";
-                    const m = fmsg.match(/resets?\s+in\s+(\d+)\s*(day|hour|minute|second)s?/i);
-                    if (m) {
-                      const n = parseInt(m[1], 10);
-                      const unit = m[2].toLowerCase();
-                      report429(k, n * (unit === "day" ? 86400 : unit === "hour" ? 3600 : unit === "minute" ? 60 : 1));
+                    let fResetSec = 0;
+                    try {
+                      const dm = fmsg.match(/resets?\s+in\s+(.+?)(?:\.|$|\s+To)/i);
+                      if (dm) {
+                        const durStr = dm[1];
+                        let m2;
+                        const re = /(\d+)\s*(day|hour|hr|minute|min|second|sec)s?/gi;
+                        while ((m2 = re.exec(durStr)) !== null) {
+                          const n = parseInt(m2[1], 10);
+                          const u = m2[2].toLowerCase();
+                          if (u === 'day') fResetSec += n * 86400;
+                          else if (u === 'hour' || u === 'hr') fResetSec += n * 3600;
+                          else if (u === 'minute' || u === 'min') fResetSec += n * 60;
+                          else if (u === 'second' || u === 'sec') fResetSec += n;
+                        }
+                      }
+                    } catch {}
+                    if (fResetSec > 0) {
+                      report429(k, fResetSec);
                     }
                   } catch {}
-                  console.warn(`[models] key[${i}] fallback ping ${fallModel} → 429 (${ftype}${fmsg ? `: ${fmsg}` : ""})`);
+                  console.warn(`[models] key[${i+1}] fallback ping ${fallModel} → 429 (${ftype}${fmsg ? `: ${fmsg}` : ""})`);
                   if (keys.length <= 1) { _paidKeyUsable = false; _paidGoData = null; }
                   continue;
+                } else if (fallPing.status === 401 || fallPing.status === 403) {
+                  console.warn(`[models] key[${i+1}] fallback ping → ${fallPing.status} (invalid key)`);
+                  continue;
                 } else {
-                  console.warn(`[models] key[${i}] fallback ping ${fallModel} → ${fallPing.status}`);
+                  console.warn(`[models] key[${i+1}] fallback ping ${fallModel} → ${fallPing.status}`);
                   continue;
                 }
               } catch {
-                console.warn(`[models] key[${i}] fallback ping ${fallModel} → unreachable`);
+                console.warn(`[models] key[${i+1}] fallback ping ${fallModel} → unreachable`);
                 continue;
               }
             }
-            _paidGoData = fallData;
+            if (!_paidGoData) _paidGoData = fallData;
           }
           continue;
         }
       } catch {
-        console.warn(`[models] key[${i}] ping ${PING_MODEL} → unreachable`);
+        console.warn(`[models] key[${i+1}] ping ${PING_MODEL} → unreachable`);
         continue;
-      }
-
-      // Ping passed — now fetch model list
-      const goResp = await fetch(`${config.baseUrl}/models`, {
-        headers: { Authorization: `Bearer ${k}` },
-      });
-      if (goResp.status === 401) {
-        console.error(`[models] key[${i}] invalid (401)`);
-        continue;
-      }
-      if (goResp.ok) {
-        _paidGoData = await goResp.json();
-        _paidKeyUsable = true;
-        const modelCount = _paidGoData?.data?.length || 0;
-        console.log(`[models] key[${i}] valid — ${modelCount} paid models`);
-        return _paidGoData;
       }
     } catch (e) {
-      console.error(`[models] key[${i}] API error: ${e.message}`);
+      console.error(`[models] key[${i+1}] API error: ${e.message}`);
     }
   }
 
+  if (_paidGoData) {
+    console.log(`[models] verified ${keys.length} key(s) — ${_paidGoData?.data?.length || 0} paid models loaded`);
+    return _paidGoData;
+  }
   if (keys.length) console.error("[models] No valid Go API key — free tier only");
   _paidGoData = null;
   return null;

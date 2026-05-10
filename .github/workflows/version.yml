@@ -8,6 +8,10 @@ on:
       - '**.md'
       - '.github/workflows/**'
 
+concurrency:
+  group: version-bump-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   bump:
     runs-on: ubuntu-latest

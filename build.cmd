@@ -26,7 +26,7 @@ if !ERRORLEVEL! equ 0 (
         bun build --compile --target bun-windows-x64-modern src/server.js --outfile .dist/ghcp2opencode.exe
     )
     if exist .dist\ghcp2opencode.exe (
-        if exist .env copy /y .env .dist\ >nul
+        if exist .env if not exist .dist\.env copy /y .env .dist\ >nul
         if exist .version copy /y .version .dist\ >nul
         echo.
         echo ================================================
@@ -81,14 +81,12 @@ if exist "!NODEPATH!" (
     copy /y "!NODEPATH!" .dist\node.exe >nul
 )
 
-REM -- Copy .env and .version
-if exist .env (
+REM -- Seed .env on first build only, always update .version
+if exist .env if not exist .dist\.env (
     echo [INFO] Copying .env...
     copy /y .env .dist\ >nul
 )
-if exist .version (
-    copy /y .version .dist\ >nul
-)
+if exist .version copy /y .version .dist\ >nul
 
 REM -- Create start.cmd
 echo [INFO] Creating start.cmd...

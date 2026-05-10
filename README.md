@@ -404,7 +404,7 @@ Functions available in `token-optimizer.js`: `compressContent()`, `compressMessa
 | `build-bun.cmd` | **Explicit Bun** — single `.exe` | [Bun](https://bun.sh) |
 | `build-node.cmd` | **Explicit Node.js** — portable folder | [Node.js](https://nodejs.org) |
 
-All scripts clean `.dist/` before building but **preserve dotfiles** (`.env`, `.version`, etc.) so your config survives rebuilds.
+All scripts clean `.dist/` before building but **preserve dotfiles** (`.env`, `.version`, `.cache/`, etc.) so your config survives rebuilds. `.env` is seeded only on the first build (never overwritten), while `.version` is always updated to match the current source.
 
 ### Bun path (`build-bun.cmd` or auto-detected)
 

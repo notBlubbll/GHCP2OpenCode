@@ -42,13 +42,11 @@ if exist "!NODEPATH!" (
     copy /y "!NODEPATH!" .dist\node.exe >nul
 )
 
-if exist .env (
+if exist .env if not exist .dist\.env (
     echo [INFO] Copying .env...
     copy /y .env .dist\ >nul
 )
-if exist .version (
-    copy /y .version .dist\ >nul
-)
+if exist .version copy /y .version .dist\ >nul
 
 echo [INFO] Creating start.cmd...
 (

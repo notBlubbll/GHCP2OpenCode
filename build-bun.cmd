@@ -42,7 +42,7 @@ if !ERRORLEVEL! neq 0 (
 )
 
 if exist .dist\ghcp2opencode.exe (
-    if exist .env copy /y .env .dist\ >nul
+    if exist .env if not exist .dist\.env copy /y .env .dist\ >nul
     if exist .version copy /y .version .dist\ >nul
     echo.
     echo ================================================

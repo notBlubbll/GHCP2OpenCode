@@ -319,7 +319,6 @@ Two relay options are available:
 
 | Relay | Setup | Description |
 |-------|-------|-------------|
-| **Local relay** (`C:\Apps\O365GHCP\Key\`) | Pre-configured | Edge-based relay bundled with the proxy — uses `start.cmd` / `debug.cmd` |
 | **[g365-headless-relay](https://github.com/notBlubbll/g365-headless-relay)** | `npm install` | Playwright Chromium off-screen relay — open-source, cross-platform, persistent profile |
 
 Both relays expose the same WebSocket API on `ws://127.0.0.1:8765` and are interchangeable.
@@ -328,20 +327,6 @@ Both relays expose the same WebSocket API on `ws://127.0.0.1:8765` and are inter
 - Token expires in ~1 hour (browser session handles auth — no manual token extraction).
 - System prompts and conversation history are folded into the message as plain text (labeled sections with `---` separator).
 - **No tool calls or agent mode** — M365 Copilot is chat-only.
-
-### Setup (local relay)
-
-1. Open `C:\Apps\O365GHCP\Key\debug.cmd` — launches Edge with visible browser
-2. Sign in to M365 Copilot at [m365.cloud.microsoft/chat](https://m365.cloud.microsoft/chat)
-3. Close the browser, then start the relay off-screen:
-   ```bash
-   C:\Apps\O365GHCP\Key\start.cmd
-   ```
-4. Set the relay port in `.env`:
-   ```env
-   M365CO_PORT=8765
-   ```
-5. Restart the proxy. `[M365]` models appear in the model list.
 
 ### Setup (g365-headless-relay)
 
@@ -385,7 +370,6 @@ Tell me more about interfaces.
 ### Token refresh
 
 When the browser session expires, restart the relay:
-- **Local relay**: run `debug.cmd` to re-sign in, then `start.cmd`
 - **g365-headless-relay**: run `debug.cmd` to re-sign in, then `start.cmd`
 
 No manual token copying required — the browser session handles all auth.

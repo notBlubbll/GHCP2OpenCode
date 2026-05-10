@@ -632,8 +632,10 @@ function loadKeyHashFromDisk() {
 function saveKeyHashToDisk(h) {
   if (!_fs) { console.log("[keys] no fs module loaded"); return; }
   try {
-    cacheDir();
     const path = getKeyHashPath();
+    const prev = loadKeyHashFromDisk();
+    if (prev === h) return;
+    cacheDir();
     _fs.writeFileSync(path, JSON.stringify({ h }));
     console.log(`[keys] saved hash ${h.slice(0, 5)} to ${path}`);
   } catch (e) {

@@ -315,13 +315,13 @@ You can route chat requests through your company's **Microsoft 365 Copilot** (th
 
 The proxy connects to a **WebSocket relay server** that runs a browser-automated M365 Copilot session. The relay intercepts the M365 substrate WebSocket (`substrate.office.com`) and forwards chat requests/responses. This is the same approach used by [m365-copilot-openai-proxy](https://github.com/kuchris/m365-copilot-openai-proxy).
 
-Two relay options are available:
+An external relay is required. The proxy uses a WebSocket-based protocol; the relay handles browser automation and M365 auth.
 
 | Relay | Setup | Description |
 |-------|-------|-------------|
 | **[g365-headless-relay](https://github.com/notBlubbll/g365-headless-relay)** | `npm install` | Playwright Chromium off-screen relay — open-source, cross-platform, persistent profile |
 
-Both relays expose the same WebSocket API on `ws://127.0.0.1:8765` and are interchangeable.
+The proxy's M365 WebSocket protocol is inspired by the same substrate-interception concept used in [m365-copilot-openai-proxy](https://github.com/kuchris/m365-copilot-openai-proxy), but the wire format is different — they are not interchangeable.
 
 **Constraints:**
 - Token expires in ~1 hour (browser session handles auth — no manual token extraction).

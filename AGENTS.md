@@ -65,7 +65,7 @@ GitHub Copilot extension             src/server.js                       OpenCod
 - `sanitizeContent()` — strip `<|im_start|>`, `<|im_end|>` tokens
 - `mapModel(name)` — resolve model names, strip `[FREE]`/`[GO]`/`[M365]` prefixes
 
-### `src/opencode-client.js` (1204 lines)
+### `src/opencode-client.js` (1423 lines)
 **Model registry + upstream API communication.**
 
 - `config` — env-var-backed configuration getters
@@ -112,6 +112,9 @@ GitHub Copilot extension             src/server.js                       OpenCod
 - `compressToolDefinitions(tools)` — compress tool schemas for upstream
 - `compactIdentity(model)` — model identity prompts
 - `CompressionLevel` enum: `off`, `lite`, `caveman`, `aggressive`, `ultra`, `rtk`, `stacked`
+
+### `src/completion-cache.js`
+**Reasoning cache + prompt-response cache integration.** Caches `<think>` tag text per message and re-attaches on cache hits so DeepSeek-style reasoning isn't lost.
 
 ---
 
@@ -195,11 +198,99 @@ Messages folded into labeled plain text with `---` separator (matching [m365-cop
 
 - **Model registry**: Free models hardcoded, paid models fetched from Go API, metadata from models.dev. Cached to `.cache/models.json` disk.
 - **Key validation**: On startup, pings `deepseek-v4-flash` with `max_tokens: 1` *before* fetching the paid model list. If inference fails (429), paid models are skipped entirely and `Premium+Free` mode isn't advertised. If `deepseek-v4-flash` returns 404, falls back to the first premium model from the API with a warning.
-- **Rate-limit persistence**: 429 responses are parsed for `error.type` + `error.message` (e.g. `GoUsageLimitError: Weekly usage limit reached. Resets in 1 day.`). The timing is extracted from the message and persisted to `.cache/key-state.json`. On restart, cooldowns are respected — no ping or model fetch is performed while the key is still banned.
-- **Key rotation**: Round-robin with cooldown. 401 → 60s cooldown, 429 → persisted ban duration. Validated via real inference pings. Hash persisted to `.cache/keyhash.json`.
+- **Rate-limit persistence**: 429 responses are parsed for `error.type` + `error.message` (e.g. `GoUsageLimitError: Weekly usage limit reached. Resets in 1 day.`). The timing is extracted from the message and persisted to `.cache/key-state.json`. On restart, cooldowns are respected — no ping or model fetch is performed while the key is still in cooldown.
+- **Key rotation**: Round-robin with cooldown. 401 → 60s cooldown, 429 → persisted cooldown duration. Validated via real inference pings. Hash persisted to `.cache/keyhash.json`.
 - **Auto-compression**: `COMPRESSION_LEVEL=auto` selects `off` for ≤3 messages, `stacked` for free/poll, `caveman` for paid.
 - **Auto-restart**: Exit code 42 triggers restart via `start.cmd` loop. Console commands: `r`/`restart`, `s`/`stop`, `e`/`exit`.
 - **Graceful shutdown**: `/stop` endpoint or SIGINT/SIGTERM/SIGHUP with 30s timeout.
 - **VS 2026 file creation**: Markdown code blocks parsed into `create_file` tool calls. Project files (`.csproj`, `.sln`) handled natively.
 - **Pollinations**: 6 cosplay aliases hidden by default (`HIDE_POLL_COSPLAY=true`). Only `pol/openai-fast` (GPT-OSS 20B) shown. Controlled by `SHOW_POLL_MODELS` + `HIDE_POLL_COSPLAY`. URL hardcoded to `https://text.pollinations.ai/openai`.
 - **Version check**: Compares local `.version` against remote GitHub raw file. Console title updates when outdated.
+
+---
+
+## Key Cooldown Checker
+
+On startup and model refresh (`refreshModels` → `fetchGoModelsRaw`), the proxy loads `.cache/key-state.json` and restores active cooldowns. This prevents a rate-limited key from being pinged on restart.
+
+### Restore flow
+
+1. **`loadKeys()`** (`src/opencode-client.js:307`) — parses keys from env, creates/re-creates `ApiBalancer`, loads `key-state.json` via `loadKeyState()`.
+2. **`ApiBalancer._restoreState()`** (`src/opencode-client.js:327`) — maps saved `short` key fragments back to full key strings from current env. Sets `cooldownUntil` on any non-expired cooldown. Logs: `[keys] restored N cooldown(s) from cache`.
+3. **Direct disk safety net** (`fetchGoModelsRaw` `src/opencode-client.js:917`) — as a second check, reads `key-state.json` directly and builds a `cooldownFromDisk` Map from the local `keys` array. The `keyInCooldown()` helper checks both `_balancer.cooldownUntil` (in-memory) AND `cooldownFromDisk` (direct file read).
+
+### Cooldown checks
+
+- **All-key cooldown** (`src/opencode-client.js:946`): if every key is in cooldown, `fetchGoModelsRaw` skips the entire paid model fetch and returns `null` — `_paidGoData` stays null, paid models hidden.
+- **Individual key cooldown** (`src/opencode-client.js:960`): before pinging each key, `keyInCooldown(k)` is checked. Keys in cooldown log `[keys] key[N] in cooldown — skipping` and are never contacted.
+- **`withKey()` cooldown** (`src/opencode-client.js:444`): at request time, `_balancer.getNextKey()` skips keys in cooldown (via `_refillPool()` at line 353), so user requests never use a key in cooldown.
+
+### Cooldown lifecycle
+
+| Event | Action |
+|-------|--------|
+| 429 response | `ApiBalancer.mark429()` → increments `consecutive429`, sets `cooldownUntil` if threshold met or upstream timer provided |
+| Successful request | `ApiBalancer.markSuccess()` → clears `cooldownUntil`, resets `consecutive429` to 0 |
+| State save | `saveKeyState()` → writes all cooldowns + counters to `.cache/key-state.json` |
+| State load | `loadKeyState()` + `_restoreState()` + direct disk safety net |
+
+### Key state file format
+
+```json
+{
+  "keys": {
+    "sk-abc1...xyz9": {
+      "consecutive429": 3,
+      "cooldownUntil": "2026-05-09T18:00:00.000Z"
+    }
+  },
+  "updatedAt": "2026-05-09T13:00:00.000Z"
+}
+```
+
+---
+
+## Caching Architecture
+
+### Disk caches (`.cache/` dir)
+
+| File | Writer | Reader | Purpose |
+|------|--------|--------|---------|
+| `models.json` | `saveModelsToDisk()` | `loadModelsFromDisk()` + `initModels()` | Full model list (free + paid + poll + M365) |
+| `key-state.json` | `saveKeyState()` | `loadKeyState()` + `ApiBalancer._restoreState()` + `fetchGoModelsRaw` safety net | Per-key cooldown timestamps + 429 counters |
+| `keyhash.json` | `saveKeyHashToDisk()` | `loadKeyHashFromDisk()` + `checkKeyChanged()` | SHA256 hash of all API keys for change detection |
+
+### Disk cache invalidation
+
+- **Key hash mismatch** → full model refresh (keys added/removed/rotated)
+- **Free tier hash mismatch** → `FREE_TIER_MODELS` changed in code (new models added upstream)
+- **M365 presence mismatch** → `M365CO_PORT` set or removed vs cached state
+
+### In-memory caches
+
+| Cache | Module | Type | Key |
+|-------|--------|------|-----|
+| Prompt-response | `src/cache.js` | LRU with TTL | Hash of model + temperature + tool count + normalized messages |
+| Reasonings | `src/server.js` `_cacheReasoning()` | Plain Map | Per-message `<think>` tag text |
+| Free models | `src/opencode-client.js` `FREE_TIER_MODELS` | Static array | Hardcoded — validated via ping on startup |
+| Paid models | `src/opencode-client.js` `_paidGoData` | Module var | Fetched from `/zen/go/v1/models` |
+
+### Startup sequence (caching)
+
+```
+initModels()
+  ├─ _loadFs() — import node:fs for disk I/O
+  ├─ _loadCrypto() — import node:crypto for SHA256 hashing
+  ├─ checkKeyChanged() — compare current key hash to keyhash.json
+  │   └─ loadKeyHashFromDisk() — read .cache/keyhash.json
+  ├─ loadModelsFromDisk() — attempt to load .cache/models.json
+  │   ├─ Validates key hash match (no rotation)
+  │   ├─ Validates free tier SHA256 match (no code changes)
+  │   └─ Validates M365 token presence match
+  │   → If valid: instant startup, background refresh via _bgFetch
+  │   → If invalid: sync fetch from upstream, save to disk
+  └─ _bgFetch = fetchGoModelsRaw() — background paid model validation
+      ├─ loadKeys() → creates ApiBalancer → loads key-state.json
+      ├─ Build cooldownFromDisk Map (direct safety net)
+      └─ Per-key ping (skipping keys in cooldown)
+```

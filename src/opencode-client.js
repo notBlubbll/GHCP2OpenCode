@@ -288,10 +288,10 @@ function saveKeyState() {
         consecutive429: _key429Count.get(key) || 0,
       };
       if (_balancer) {
-        if (_balancer.bannedUntil.has(key)) {
-          const until = _balancer.bannedUntil.get(key);
+        if (_balancer.cooldownUntil.has(key)) {
+          const until = _balancer.cooldownUntil.get(key);
           if (until > now) {
-            keys[short].bannedUntil = new Date(until).toISOString();
+            keys[short].cooldownUntil = new Date(until).toISOString();
           }
         }
       }
@@ -319,7 +319,7 @@ class ApiBalancer {
   constructor(keys, savedState = {}) {
     this.keys = keys;
     this.pool = [];
-    this.bannedUntil = new Map();   // key → timestamp when ban expires
+    this.cooldownUntil = new Map();   // key → cooldown-until timestamp
     this._restoreState(savedState);
   }
 
@@ -329,16 +329,16 @@ class ApiBalancer {
       const short = `${k.slice(0, 6)}...${k.slice(-4)}`;
       keyMap[short] = k;
     }
-    let restoredBans = 0;
+    let restoredCooldowns = 0;
     let skippedExpired = 0;
     for (const [short, info] of Object.entries(savedState.keys || {})) {
       const fullKey = keyMap[short];
       if (!fullKey) { console.log(`[keys] state has ${short} but no matching key — skipping`); continue; }
-      if (info.bannedUntil) {
-        const until = new Date(info.bannedUntil).getTime();
+      if (info.cooldownUntil || info.bannedUntil) {
+        const until = new Date(info.cooldownUntil || info.bannedUntil).getTime();
         if (until > Date.now()) {
-          this.bannedUntil.set(fullKey, until);
-          restoredBans++;
+          this.cooldownUntil.set(fullKey, until);
+          restoredCooldowns++;
         } else {
           skippedExpired++;
         }
@@ -347,21 +347,21 @@ class ApiBalancer {
         _key429Count.set(fullKey, info.consecutive429);
       }
     }
-    if (restoredBans > 0) console.log(`[keys] restored ${restoredBans} ban(s) from cache (${skippedExpired} expired)`);
+    if (restoredCooldowns > 0) console.log(`[keys] restored ${restoredCooldowns} cooldown(s) from cache (${skippedExpired} expired)`);
   }
 
   _refillPool() {
     const now = Date.now();
     this.pool = [];
     for (const key of this.keys) {
-      if (this.bannedUntil.has(key) && this.bannedUntil.get(key) > now) continue;
+      if (this.cooldownUntil.has(key) && this.cooldownUntil.get(key) > now) continue;
       this.pool.push(key);
     }
     if (this.pool.length === 0) {
-      // All keys banned — use the one with earliest expiry
+      // All keys in cooldown — use the one with earliest expiry
       let earliestKey = null;
       let earliestTime = Infinity;
-      for (const [key, until] of this.bannedUntil.entries()) {
+      for (const [key, until] of this.cooldownUntil.entries()) {
         if (until < earliestTime) {
           earliestTime = until;
           earliestKey = key;
@@ -389,41 +389,41 @@ class ApiBalancer {
   }
 
   // mark429 with optional dynamic reset seconds from upstream response
-  // Pass resetSeconds to use upstream quota reset as ban duration instead of hardcoded values
+  // Pass resetSeconds to use upstream quota reset as cooldown duration instead of hardcoded values
   mark429(key, resetSeconds = 0) {
     const count = (_key429Count.get(key) || 0) + 1;
     _key429Count.set(key, count);
     const short = `${key.slice(0, 6)}...${key.slice(-4)}`;
 
-    // Ban immediately if we have upstream timing (e.g. "Resets in 1 day"), or after threshold
+    // Start cooldown immediately if we have upstream timing (e.g. "Resets in 1 day"), or after threshold
     if (resetSeconds > 0 || count >= CONSECUTIVE_429_THRESHOLD) {
-      let banMs;
+      let cdMs;
       let label;
 
       if (resetSeconds > 0) {
-        banMs = resetSeconds * 1000;
-        label = banMs >= 86400000 ? `~${Math.round(banMs / 86400000)}d` : `~${Math.round(banMs / 3600000)}h`;
-      } else if (this.bannedUntil.has(key) && this.bannedUntil.get(key) > Date.now()) {
-        banMs = COOLDOWN_429_SECOND;
+        cdMs = resetSeconds * 1000;
+        label = cdMs >= 86400000 ? `~${Math.round(cdMs / 86400000)}d` : `~${Math.round(cdMs / 3600000)}h`;
+      } else if (this.cooldownUntil.has(key) && this.cooldownUntil.get(key) > Date.now()) {
+        cdMs = COOLDOWN_429_SECOND;
         label = '~1 week';
       } else {
-        banMs = COOLDOWN_429_FIRST;
+        cdMs = COOLDOWN_429_FIRST;
         label = '~5h';
       }
 
-      const until = Date.now() + banMs;
-      this.bannedUntil.set(key, until);
-      console.warn(`[keys] ${short} banned for ${label}${resetSeconds > 0 ? ` (upstream)` : ` after ${count} consecutive 429s`} (until ${new Date(until).toLocaleString()})`);
+      const until = Date.now() + cdMs;
+      this.cooldownUntil.set(key, until);
+      console.warn(`[keys] ${short} in cooldown for ${label}${resetSeconds > 0 ? ` (upstream)` : ` after ${count} consecutive 429s`} (until ${new Date(until).toLocaleString()})`);
     }
     saveKeyState();
   }
 
   markSuccess(key) {
     _key429Count.set(key, 0);
-    if (this.bannedUntil.has(key)) {
-      this.bannedUntil.delete(key);
+    if (this.cooldownUntil.has(key)) {
+      this.cooldownUntil.delete(key);
       const short = `${key.slice(0, 6)}...${key.slice(-4)}`;
-      console.log(`[keys] ${short} released from ban (successful request)`);
+      console.log(`[keys] ${short} released from cooldown (successful request)`);
     }
     saveKeyState();
   }
@@ -435,8 +435,8 @@ class ApiBalancer {
       const consecutive429 = _key429Count.get(k) || 0;
       let status = "active";
       let releaseAt = null;
-      if (this.bannedUntil.has(k)) {
-        const until = this.bannedUntil.get(k);
+      if (this.cooldownUntil.has(k)) {
+        const until = this.cooldownUntil.get(k);
         if (until > now) {
           status = "cooldown";
           releaseAt = new Date(until).toISOString();
@@ -914,8 +914,8 @@ async function fetchGoModelsRaw() {
   console.log(`[keys] found ${keys.length} key(s) in env`);
   loadKeys();
 
-  // Build banned-until map from key-state.json directly (safety net)
-  const bannedFromDisk = new Map();
+  // Build cooldown map from key-state.json directly (safety net)
+  const cooldownFromDisk = new Map();
   try {
     if (_fs && _fs.existsSync(_keyStatePath)) {
       const state = JSON.parse(_fs.readFileSync(_keyStatePath, "utf8"));
@@ -926,9 +926,9 @@ async function fetchGoModelsRaw() {
       for (const [short, info] of Object.entries(state.keys || {})) {
         const fullKey = keyMap[short];
         if (!fullKey) continue;
-        if (info.bannedUntil) {
-          const until = new Date(info.bannedUntil).getTime();
-          if (until > Date.now()) bannedFromDisk.set(fullKey, until);
+        if (info.cooldownUntil || info.bannedUntil) {
+          const until = new Date(info.cooldownUntil || info.bannedUntil).getTime();
+          if (until > Date.now()) cooldownFromDisk.set(fullKey, until);
         }
       }
     }
@@ -936,17 +936,17 @@ async function fetchGoModelsRaw() {
 
   // Skip if all keys are still in cooldown
   const now = Date.now();
-  function keyIsBanned(key) {
-    const balancerBan = _balancer?.bannedUntil?.get(key);
-    if (balancerBan && balancerBan > now) return true;
-    const diskBan = bannedFromDisk.get(key);
-    if (diskBan && diskBan > now) return true;
+  function keyInCooldown(key) {
+    const balancerCooldown = _balancer?.cooldownUntil?.get(key);
+    if (balancerCooldown && balancerCooldown > now) return true;
+    const diskCooldown = cooldownFromDisk.get(key);
+    if (diskCooldown && diskCooldown > now) return true;
     return false;
   }
-  const allCooldown = keys.length > 0 && keys.every(k => keyIsBanned(k));
+  const allCooldown = keys.length > 0 && keys.every(k => keyInCooldown(k));
   if (allCooldown) {
-    const banUntil = _balancer?.bannedUntil?.get(keys[0]) || bannedFromDisk.get(keys[0]) || 0;
-    const remaining = Math.round((banUntil - now) / 1000);
+    const cooldownUntilVal = _balancer?.cooldownUntil?.get(keys[0]) || cooldownFromDisk.get(keys[0]) || 0;
+    const remaining = Math.round((cooldownUntilVal - now) / 1000);
     console.log(`[keys] all keys in cooldown (~${remaining}s) — skipping paid models`);
     _paidKeyUsable = false;
     _paidGoData = null;
@@ -957,9 +957,9 @@ async function fetchGoModelsRaw() {
     const k = keys[i];
     try {
       // Skip individual keys still in cooldown
-      if (keyIsBanned(k)) {
-        const banUntil = _balancer?.bannedUntil?.get(k) || bannedFromDisk.get(k) || 0;
-        const remaining = Math.round((banUntil - now) / 1000);
+      if (keyInCooldown(k)) {
+        const cooldownUntilVal = _balancer?.cooldownUntil?.get(k) || cooldownFromDisk.get(k) || 0;
+        const remaining = Math.round((cooldownUntilVal - now) / 1000);
         console.log(`[keys] key[${i}] in cooldown (~${remaining}s) — skipping`);
         continue;
       }

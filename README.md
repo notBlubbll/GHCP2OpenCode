@@ -110,21 +110,21 @@ When multiple API keys are configured via `OPENCODE_API_KEYS`, the proxy uses an
 
 1. **Shuffles keys** — keys are shuffled and distributed randomly each time the pool is exhausted, preventing predictable rotation patterns
 2. **Tracks consecutive 429s** — each key's rate limit responses are counted independently
-3. **Auto-bans abusive keys**:
+3. **Auto-cooldowns keys**:
    - **10 consecutive 429s** → key removed from rotation
-   - Ban duration: if upstream usage data available, matches the **actual API quota reset** (`rollingUsage` ~5h, `weeklyUsage` ~until Monday UTC, `monthlyUsage` ~1st of month). Otherwise falls back to **5h** (first strike) / **1 week** (second strike)
-   - A single **successful request** immediately clears all bans and resets the 429 counter
+   - **Cooldown duration**: if upstream usage data available, matches the **actual API quota reset** (`rollingUsage` ~5h, `weeklyUsage` ~until Monday UTC, `monthlyUsage` ~1st of month). Otherwise falls back to **5h** (first strike) / **1 week** (second strike)
+   - A single **successful request** immediately clears all cooldowns and resets the 429 counter
 
 #### Key state file
 
-Ban state is persisted to `.cache/key-state.json`. You can manually edit this file to release bans or adjust counters:
+Cooldown state is persisted to `.cache/key-state.json`. You can manually edit this file to clear cooldowns or adjust counters:
 
 ```json
 {
   "keys": {
     "sk-abc1...xyz9": {
       "consecutive429": 3,
-      "bannedUntil": "2026-05-09T18:00:00.000Z"
+      "cooldownUntil": "2026-05-09T18:00:00.000Z"
     }
   },
   "updatedAt": "2026-05-09T13:00:00.000Z"
@@ -134,21 +134,21 @@ Ban state is persisted to `.cache/key-state.json`. You can manually edit this fi
 | Field | Description |
 |-------|-------------|
 | `consecutive429` | Current consecutive 429 count (resets on success) |
-| `bannedUntil` | ISO timestamp when the key returns to rotation (5h or 1 week ban) |
+| `cooldownUntil` | ISO timestamp when the key returns to rotation (5h or 1 week cooldown) |
 
-To manually unban a key, delete its entry or remove `bannedUntil`, then restart the proxy.
+To manually clear a key's cooldown, delete its entry or remove `cooldownUntil`, then restart the proxy.
 
-### Key Ban Checker (startup + refresh)
+### Key Cooldown Checker (startup + refresh)
 
-On startup and on each model refresh, the proxy loads `.cache/key-state.json` and restores any active bans into the `ApiBalancer`:
+On startup and on each model refresh, the proxy loads `.cache/key-state.json` and restores any active cooldowns into the `ApiBalancer`:
 
-1. **`_restoreState()`** — reads the JSON file, maps `short` key fragments (`sk-abc1...xyz9`) back to full key strings from the env, sets `bannedUntil` entries for non-expired bans. Logs `[keys] restored N ban(s) from cache` on success.
+1. **`_restoreState()`** — reads the JSON file, maps `short` key fragments (`sk-abc1...xyz9`) back to full key strings from the env, sets `cooldownUntil` entries for non-expired cooldowns. Logs `[keys] restored N cooldown(s) from cache` on success.
 
-2. **Direct disk safety net** (`fetchGoModelsRaw`) — as a second check, reads `key-state.json` directly and builds a `bannedFromDisk` Map. The `keyIsBanned()` helper checks both the in-memory `_balancer.bannedUntil` AND the direct disk Map. This ensures a banned key is never pinged even if the `_restoreState` mapping fails silently (e.g. key format mismatch between sessions).
+2. **Direct disk safety net** (`fetchGoModelsRaw`) — as a second check, reads `key-state.json` directly and builds a `cooldownFromDisk` Map. The `keyInCooldown()` helper checks both the in-memory `_balancer.cooldownUntil` AND the direct disk Map. This ensures a key in cooldown is never pinged even if the `_restoreState` mapping fails silently (e.g. key format mismatch between sessions).
 
-3. **Individual key cooldown** — before each ping in `fetchGoModelsRaw`, `keyIsBanned(k)` is called. Banned keys log `[keys] key[N] in cooldown (~Xs) — skipping` and are never contacted.
+3. **Individual key cooldown** — before each ping in `fetchGoModelsRaw`, `keyInCooldown(k)` is called. Keys in cooldown log `[keys] key[N] in cooldown (~Xs) — skipping` and are never contacted.
 
-4. **All-key cooldown** — if every key is banned, the entire paid model fetch is skipped with `[keys] all keys in cooldown — skipping paid models`.
+4. **All-key cooldown** — if every key is in cooldown, the entire paid model fetch is skipped with `[keys] all keys in cooldown — skipping paid models`.
 
 This means a key rate-limited from a previous session will never be pinged on restart — it's skipped entirely, saving a wasted 429 roundtrip.
 
@@ -259,7 +259,7 @@ SHA256 hash of all API keys (sorted, deduped) persisted to `.cache/keyhash.json`
 
 ### Key state cache (`key-state.json`)
 
-Persists per-key ban/cooldown state between restarts. See [Key Ban Checker](#key-ban-checker-startup--refresh) above for the full load/restore flow. File is written on every ban state change and loaded on startup + each `refreshModels()` call.
+Persists per-key cooldown state between restarts. See [Key Cooldown Checker](#key-cooldown-checker-startup--refresh) above for the full load/restore flow. File is written on every cooldown state change and loaded on startup + each `refreshModels()` call.
 
 ### Prompt cache (in-memory LRU)
 

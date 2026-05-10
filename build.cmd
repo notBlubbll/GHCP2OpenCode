@@ -7,8 +7,13 @@ echo ================================================
 echo.
 
 REM -- Clean previous build
-if exist .dist rmdir /s /q .dist
+REM -- Clean .dist but preserve dotfiles (.env, .version, etc.)
 if not exist .dist mkdir .dist
+for /d %%i in (.dist\*) do rmdir /s /q "%%i" 2>nul
+for %%i in (.dist\*) do (
+    set "_f=%%~nxi"
+    if "!_f:~0,1!" neq "." del /q "%%i" 2>nul
+)
 
 REM ====== Try Bun first ======
 bun --version >nul 2>&1
@@ -21,6 +26,8 @@ if !ERRORLEVEL! equ 0 (
         bun build --compile --target bun-windows-x64-modern src/server.js --outfile .dist/ghcp2opencode.exe
     )
     if exist .dist\ghcp2opencode.exe (
+        if exist .env copy /y .env .dist\ >nul
+        if exist .version copy /y .version .dist\ >nul
         echo.
         echo ================================================
         echo  Build successful
@@ -72,6 +79,15 @@ for /f "tokens=*" %%i in ('where node 2^>nul') do (
 if exist "!NODEPATH!" (
     echo [INFO] Copying node.exe...
     copy /y "!NODEPATH!" .dist\node.exe >nul
+)
+
+REM -- Copy .env and .version
+if exist .env (
+    echo [INFO] Copying .env...
+    copy /y .env .dist\ >nul
+)
+if exist .version (
+    copy /y .version .dist\ >nul
 )
 
 REM -- Create start.cmd

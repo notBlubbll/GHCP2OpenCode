@@ -23,7 +23,12 @@ if not exist node_modules (
     )
 )
 
-if exist .dist rmdir /s /q .dist
+if not exist .dist mkdir .dist
+for /d %%i in (.dist\*) do rmdir /s /q "%%i" 2>nul
+for %%i in (.dist\*) do (
+    set "_f=%%~nxi"
+    if "!_f:~0,1!" neq "." del /q "%%i" 2>nul
+)
 if not exist .dist mkdir .dist
 
 echo [INFO] Building...
@@ -37,6 +42,8 @@ if !ERRORLEVEL! neq 0 (
 )
 
 if exist .dist\ghcp2opencode.exe (
+    if exist .env copy /y .env .dist\ >nul
+    if exist .version copy /y .version .dist\ >nul
     echo.
     echo ================================================
     echo  Build successful

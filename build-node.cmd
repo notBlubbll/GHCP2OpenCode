@@ -16,7 +16,12 @@ for /f "tokens=*" %%i in ('node --version') do set NODEVER=%%i
 echo [INFO] Node !NODEVER! found
 echo.
 
-if exist .dist rmdir /s /q .dist
+if not exist .dist mkdir .dist
+for /d %%i in (.dist\*) do rmdir /s /q "%%i" 2>nul
+for %%i in (.dist\*) do (
+    set "_f=%%~nxi"
+    if "!_f:~0,1!" neq "." del /q "%%i" 2>nul
+)
 if not exist .dist mkdir .dist
 
 echo [INFO] Copying source files...
@@ -35,6 +40,14 @@ for /f "tokens=*" %%i in ('where node 2^>nul') do (
 if exist "!NODEPATH!" (
     echo [INFO] Copying node.exe...
     copy /y "!NODEPATH!" .dist\node.exe >nul
+)
+
+if exist .env (
+    echo [INFO] Copying .env...
+    copy /y .env .dist\ >nul
+)
+if exist .version (
+    copy /y .version .dist\ >nul
 )
 
 echo [INFO] Creating start.cmd...

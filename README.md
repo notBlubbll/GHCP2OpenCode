@@ -404,7 +404,7 @@ Functions available in `token-optimizer.js`: `compressContent()`, `compressMessa
 | `build-bun.cmd` | **Explicit Bun** — single `.exe` | [Bun](https://bun.sh) |
 | `build-node.cmd` | **Explicit Node.js** — portable folder | [Node.js](https://nodejs.org) |
 
-All scripts clean `.dist/` before building.
+All scripts clean `.dist/` before building but **preserve dotfiles** (`.env`, `.version`, etc.) so your config survives rebuilds.
 
 ### Bun path (`build-bun.cmd` or auto-detected)
 
@@ -419,7 +419,7 @@ Compiles to a single `.exe` using `bun build --compile`. The Bun runtime is embe
 
 Creates a portable folder with `node.exe` + source + production dependencies. Run `start.cmd` inside the folder.
 
-- **No install needed** on the target machine — `node.exe` is bundled (~13 MB without node.exe)
+- **No install needed** on the target machine — `node.exe` is bundled
 - Works on **Windows Server 2016+** and any Windows that runs Node.js v18+
 - `start.cmd` includes the same exit-code-42 restart loop as the normal launcher
 

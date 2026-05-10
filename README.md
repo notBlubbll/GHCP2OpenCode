@@ -175,7 +175,7 @@ This means a key rate-limited from a previous session will never be pinged on re
 
 Models appear in VS Code's Copilot list as `[FREE] Model Name`, `[GO] Model Name`, and `[M365] M365 Copilot` — the prefix indicates free vs paid vs M365 tier at a glance.
 
-**Free** (always available, auto-validated): Big Pickle, Hy3 Preview Free, MiniMax M2.5 Free, Nemotron 3 Super Free
+**Free** (always available, auto-validated): Big Pickle, MiniMax M2.5 Free, Nemotron 3 Super Free, Ring 2.6 1T Free
 
 **Paid** (requires Go API key): fetched dynamically from OpenCode — all support tool calling
 
@@ -407,6 +407,48 @@ Enriched from [OmniRoute](https://github.com/diegosouzapw/OmniRoute) (RTK+Cavema
 | `stacked` | 78-95% | RTK first, then Caveman — best for mixed prompts with tool logs + prose |
 
 Functions available in `token-optimizer.js`: `compressContent()`, `compressMessages()`, `compressBest()`, `estimatedSavings()`.
+
+---
+
+## Build Standalone
+
+`build.cmd` auto-detects the best available runtime and builds accordingly:
+
+| Script | Behavior | Requires |
+|--------|----------|----------|
+| `build.cmd` | **Auto-detect** — tries Bun first, falls back to Node.js | Bun or Node.js |
+| `build-bun.cmd` | **Explicit Bun** — single `.exe` | [Bun](https://bun.sh) |
+| `build-node.cmd` | **Explicit Node.js** — portable folder | [Node.js](https://nodejs.org) |
+
+All scripts clean `.dist/` before building.
+
+### Bun path (`build-bun.cmd` or auto-detected)
+
+Compiles to a single `.exe` using `bun build --compile`. The Bun runtime is embedded.
+
+- **No runtime required** — fully self-contained (~112 MB)
+- **No `node_modules`** — all JS modules bundled
+- **Still reads/writes** `.env`, `.cache/`, `.version` relative to the working directory
+- Requires **Windows 10 1809+ / Windows Server 2019+** (same OS floor as Bun)
+
+### Node.js path (`build-node.cmd` or auto-detected fallback)
+
+Creates a portable folder with `node.exe` + source + production dependencies. Run `start.cmd` inside the folder.
+
+- **No install needed** on the target machine — `node.exe` is bundled (~13 MB without node.exe)
+- Works on **Windows Server 2016+** and any Windows that runs Node.js v18+
+- `start.cmd` includes the same exit-code-42 restart loop as the normal launcher
+
+### Running without building
+
+For older Windows where Bun won't run (Server 2016), use Node.js directly:
+
+```bash
+npm run node           # Node.js fallback
+start.cmd              # auto-detects Bun vs Node
+```
+
+
 
 ---
 

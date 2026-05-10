@@ -36,11 +36,9 @@ export async function fetchWithAgent(url, init = {}) {
 
 const FREE_TIER_MODELS = [
   { id: "big-pickle", name: "Big Pickle", family: "big-pickle", tools: true, vision: true },
-  { id: "hy3-preview-free", name: "Hy3 Preview Free", family: "hy3-free", tools: true, vision: true },
-  { id: "ling-2.6-flash-free", name: "Ling 2.6 Flash Free", family: "ling-flash-free", tools: true, vision: false },
   { id: "minimax-m2.5-free", name: "MiniMax M2.5 Free", family: "minimax-free", tools: true, vision: true },
   { id: "nemotron-3-super-free", name: "Nemotron 3 Super Free", family: "nemotron-free", tools: true, vision: true },
-  { id: "trinity-large-preview-free", name: "Trinity Large Preview", family: "trinity", tools: true, vision: true },
+  { id: "ring-2.6-1t-free", name: "Ring 2.6 1T Free", family: "ring-free", tools: true, vision: false },
   // Pollinations (pol/) — free, no key needed — all map to openai backend
   { id: "pol/openai-fast", name: "Pollinations GPT-OSS 20B", family: "poll-gptoss", context: 131072, tools: true, vision: false, _poll: true, _pollModel: "openai" },
   // Cosplay aliases — LLM roleplays the model name, same openai-fast backend
@@ -1437,6 +1435,10 @@ function inferFamily(modelId) {
     [/\btrinity/i, "Trinity"],
     [/\bkimi/i, "Kimi"],
     [/\bpoll\//i, "Pollinations"],
+    [/\bglm/i, "GLM"],
+    [/\bgrok/i, "Grok"],
+    [/\bmimo/i, "MiMo"],
+    [/\bring/i, "Ring"],
   ];
   for (const [re, family] of patterns) {
     if (re.test(clean)) return family;

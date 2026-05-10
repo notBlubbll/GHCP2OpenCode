@@ -136,10 +136,39 @@ Detected in priority order:
 
 | Tier | Source | Count | Auth | Endpoint |
 |------|--------|-------|------|----------|
-| **Free** | OpenCode Zen | 6 models | None | `https://opencode.ai/zen/v1/chat/completions` |
+| **Free** | OpenCode Zen | 4 models | None | `https://opencode.ai/zen/v1/chat/completions` |
 | **Pollinations** | text.pollinations.ai | 7 models (1 real + 6 cosplay) | None | `https://text.pollinations.ai/openai/chat/completions` |
 | **Paid** | OpenCode Go | Dynamic | `Bearer {key}` | `https://opencode.ai/zen/go/v1/chat/completions` |
 | **M365** | M365 Copilot via relay WS | 2 models (Quick/Think) | Browser session | `ws://127.0.0.1:{M365CO_PORT}` |
+
+---
+
+## Free Model Discovery
+
+Free models are sourced from the **OpenCode Zen** free tier (`https://opencode.ai/zen/v1`). They are hardcoded in `FREE_TIER_MODELS` (`src/opencode-client.js:37`) because the Zen API does not expose a model list endpoint.
+
+### How to discover new free models
+
+1. Fetch `https://models.dev/api.json`
+2. Filter by provider **`opencode`**
+3. Filter by `cost.input === 0 && cost.output === 0`
+4. **Ping each candidate** against `https://opencode.ai/zen/v1/chat/completions` (no auth) — many models.dev entries are catalog-only and return `ModelError: not supported`
+5. Only add IDs that return HTTP 200
+
+### Current free models (4)
+
+| Model ID | Name | Tools | Vision | Context |
+|----------|------|-------|--------|---------|
+| `big-pickle` | Big Pickle | ✓ | ✓ | fallback |
+| `minimax-m2.5-free` | MiniMax M2.5 Free | ✓ | ✓ | fallback |
+| `nemotron-3-super-free` | Nemotron 3 Super Free | ✓ | ✓ | fallback |
+| `ring-2.6-1t-free` | Ring 2.6 1T Free | ✓ | ✗ | 262000 |
+
+> **Important:** models.dev lists ~16 `opencode` models with `cost: 0`, but only 4 respond on the Zen API. The rest return `ModelError: not supported`. Always verify with a live ping before adding.
+
+### HIDE_FREE
+
+Set `HIDE_FREE=true` (default `false`) to hide all free tier models and separators from the model list. Useful when you only want premium models visible.
 
 ---
 
@@ -279,6 +308,7 @@ Cooldown reason is `"401"` (auth denied, 7-day cooldown) or `"429"` (rate limite
 | Prompt-response | `src/cache.js` | LRU with TTL | Hash of model + temperature + tool count + normalized messages |
 | Reasonings | `src/server.js` `_cacheReasoning()` | Plain Map | Per-message `<think>` tag text |
 | Free models | `src/opencode-client.js` `FREE_TIER_MODELS` | Static array | Hardcoded — validated via ping on startup |
+| HIDE_FREE | `Bun.env.HIDE_FREE` | Env var | `false` — hide free tier + separators, show only premium models |
 | Paid models | `src/opencode-client.js` `_paidGoData` | Module var | Fetched from `/zen/go/v1/models` |
 
 ### Startup sequence (caching)

@@ -231,7 +231,7 @@ On startup and model refresh (`refreshModels` → `fetchGoModelsRaw`), the proxy
 
 | Event | Action |
 |-------|--------|
-| 401 response | `ApiBalancer.mark401()` → sets 7-day `cooldownUntil`, persists to disk |
+| 401 response | `ApiBalancer.mark401()` → sets 1h `cooldownUntil` (override via `OPENCODE_401_COOLDOWN_MS`), persists to disk |
 | 429 response | `ApiBalancer.mark429()` → increments `consecutive429`, sets `cooldownUntil` if threshold met or upstream timer provided |
 | Successful request | `ApiBalancer.markSuccess()` → clears `cooldownUntil`, resets `consecutive429` to 0 |
 | State save | `saveKeyState()` → writes all cooldowns + counters to `.cache/key-state.json` |

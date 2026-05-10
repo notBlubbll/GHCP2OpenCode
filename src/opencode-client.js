@@ -293,10 +293,8 @@ function saveKeyState() {
         if (_balancer.cooldownUntil.has(key)) {
           const until = _balancer.cooldownUntil.get(key);
           if (until > now) {
-            const remainingMs = until - now;
-            const days = Math.ceil(remainingMs / 86400000);
             keys[short].cooldownUntil = new Date(until).toISOString();
-            keys[short].cooldownReason = days >= 6 ? "401" : "429";
+            keys[short].cooldownReason = _balancer.cooldownReason.get(key) || "429";
           }
         }
       }
@@ -335,6 +333,7 @@ class ApiBalancer {
     this.keys = keys;
     this.pool = [];
     this.cooldownUntil = new Map();   // key → cooldown-until timestamp
+    this.cooldownReason = new Map();  // key → "401" | "429"
     this._restoreState(savedState);
   }
 
@@ -353,6 +352,7 @@ class ApiBalancer {
         const until = new Date(info.cooldownUntil || info.bannedUntil).getTime();
         if (until > Date.now()) {
           this.cooldownUntil.set(fullKey, until);
+          if (info.cooldownReason) this.cooldownReason.set(fullKey, info.cooldownReason);
           restoredCooldowns++;
         } else {
           skippedExpired++;
@@ -403,12 +403,24 @@ class ApiBalancer {
     return this.pool.pop();
   }
 
+  mark401(key, reason = "") {
+    const cdMs = Math.max(3600000, parseInt(Bun.env.OPENCODE_401_COOLDOWN_MS || "3600000", 10)); // 1 hour default
+    const until = Date.now() + cdMs;
+    this.cooldownUntil.set(key, until);
+    this.cooldownReason.set(key, "401");
+    const short = `${key.slice(0, 6)}...${key.slice(-4)}`;
+    const hrs = Math.round(cdMs / 3600000);
+    console.warn(`[keys] ${short} in cooldown for ~${hrs}h (401)${reason ? ` — ${reason}` : ""} (until ${new Date(until).toLocaleString()})`);
+    saveKeyState();
+  }
+
   // mark429 with optional dynamic reset seconds from upstream response
   // Pass resetSeconds to use upstream quota reset as cooldown duration instead of hardcoded values
   mark429(key, resetSeconds = 0) {
     const count = (_key429Count.get(key) || 0) + 1;
     _key429Count.set(key, count);
     const short = `${key.slice(0, 6)}...${key.slice(-4)}`;
+    this.cooldownReason.set(key, "429");
 
     // Start cooldown immediately if we have upstream timing (e.g. "Resets in 1 day"), or after threshold
     if (resetSeconds > 0 || count >= CONSECUTIVE_429_THRESHOLD) {
@@ -428,18 +440,21 @@ class ApiBalancer {
 
       const until = Date.now() + cdMs;
       this.cooldownUntil.set(key, until);
+      this.cooldownReason.set(key, "429");
       console.warn(`[keys] ${short} in cooldown for ${label}${resetSeconds > 0 ? ` (upstream)` : ` after ${count} consecutive 429s`} (until ${new Date(until).toLocaleString()})`);
     }
     saveKeyState();
   }
 
-  // mark401: key returned 401 (auth denied / invalid). Persist long cooldown.
-  mark401(key) {
-    const cdMs = 7 * 24 * 3600 * 1000; // 7 days
+  // mark401: key returned 401 (auth denied / invalid). Persist cooldown with error message.
+  mark401(key, reason = "") {
+    const cdMs = Math.max(3600000, parseInt(Bun.env.OPENCODE_401_COOLDOWN_MS || "3600000", 10)); // 1 hour default
     const until = Date.now() + cdMs;
     this.cooldownUntil.set(key, until);
+    this.cooldownReason.set(key, "401");
     const short = `${key.slice(0, 6)}...${key.slice(-4)}`;
-    console.warn(`[keys] ${short} in cooldown for ~7d (401 auth denied) (until ${new Date(until).toLocaleString()})`);
+    const hrs = Math.round(cdMs / 3600000);
+    console.warn(`[keys] ${short} in cooldown for ~${hrs}h (401)${reason ? ` — ${reason}` : ""} (until ${new Date(until).toLocaleString()})`);
     saveKeyState();
   }
 
@@ -447,6 +462,7 @@ class ApiBalancer {
     _key429Count.set(key, 0);
     if (this.cooldownUntil.has(key)) {
       this.cooldownUntil.delete(key);
+      this.cooldownReason.delete(key);
       const short = `${key.slice(0, 6)}...${key.slice(-4)}`;
       console.log(`[keys] ${short} released from cooldown (successful request)`);
     } else if (reason) {
@@ -467,9 +483,8 @@ class ApiBalancer {
       if (this.cooldownUntil.has(k)) {
         const until = this.cooldownUntil.get(k);
         if (until > now) {
-          const days = Math.ceil((until - now) / 86400000);
-          status = days >= 6 ? "auth_denied" : "cooldown";
-          reason = days >= 6 ? "401" : "429";
+          reason = this.cooldownReason.get(k) || null;
+          status = reason === "401" ? "auth_denied" : "cooldown";
           releaseAt = new Date(until).toISOString();
         }
       }
@@ -1307,6 +1322,11 @@ async function zenRequest(endpoint, body, opts = {}) {
       if (parsed.error?.code) code = parsed.error.code;
     } catch {}
 
+    // Log the actual upstream error message for diagnostics
+    if ((resp.status === 401 || resp.status === 403) && upstreamMsg !== "API error") {
+      console.error(`[zen] 401 message: ${upstreamMsg}`);
+    }
+
     const retries = opts.retries || 0;
     const maxRetries = opts.maxRetries ?? config.maxRetries;
 
@@ -1334,7 +1354,9 @@ async function zenRequest(endpoint, body, opts = {}) {
         } catch {}
         report429(key, resetSec);
       } else {
-        if (_balancer) _balancer.mark401(key);
+        // Log upstream auth error detail before rotating
+        if (config.requestLog) console.log(`[zen] 401 on key — rotating: ${upstreamMsg}`);
+        if (_balancer) _balancer.mark401(key, upstreamMsg);
       }
       if (config.requestLog) console.log(`[zen] retry ${retries + 1}/${maxRetries} after ${resp.status}`);
       return zenRequest(endpoint, body, { ...opts, retries: retries + 1 });

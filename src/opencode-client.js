@@ -277,6 +277,8 @@ function loadKeyState() {
   }
 }
 
+let _lastKeyStateHash = "";
+
 function saveKeyState() {
   if (!_fs) return;
   try {
@@ -291,11 +293,18 @@ function saveKeyState() {
         if (_balancer.cooldownUntil.has(key)) {
           const until = _balancer.cooldownUntil.get(key);
           if (until > now) {
+            const remainingMs = until - now;
+            const days = Math.ceil(remainingMs / 86400000);
             keys[short].cooldownUntil = new Date(until).toISOString();
+            keys[short].cooldownReason = days >= 6 ? "401" : "429";
           }
         }
       }
     }
+    // Skip write if state hasn't changed since last save
+    const newHash = JSON.stringify(keys);
+    if (newHash === _lastKeyStateHash) return;
+    _lastKeyStateHash = newHash;
     _fs.writeFileSync(_keyStatePath, JSON.stringify({ keys, updatedAt: isoNow() }, null, 2));
     console.log(`[keys] state saved to ${_keyStatePath}`);
   } catch (e) {
@@ -304,12 +313,18 @@ function saveKeyState() {
 }
 
 function loadKeys() {
+  let newKeys = [];
   if (Bun.env.OPENCODE_API_KEYS) {
-    try { _keys = JSON.parse(Bun.env.OPENCODE_API_KEYS).filter(k => k.length > 5); } catch { _keys = []; }
+    try { newKeys = JSON.parse(Bun.env.OPENCODE_API_KEYS).filter(k => k.length > 5); } catch {}
   } else if (Bun.env.OPENCODE_API_KEY && Bun.env.OPENCODE_API_KEY.length > 5) {
-    _keys = [Bun.env.OPENCODE_API_KEY];
+    newKeys = [Bun.env.OPENCODE_API_KEY];
   }
-  if (_keys.length > 0 && (!_balancer || _balancer.keys !== _keys)) {
+
+  // Compare by content, not reference — avoids recreating balancer on every call
+  const keysChanged = _keys.length !== newKeys.length || _keys.some((k, i) => k !== newKeys[i]);
+  _keys = newKeys;
+
+  if (_keys.length > 0 && (!_balancer || keysChanged)) {
     const savedState = loadKeyState();
     _balancer = new ApiBalancer(_keys, savedState);
   }
@@ -418,6 +433,16 @@ class ApiBalancer {
     saveKeyState();
   }
 
+  // mark401: key returned 401 (auth denied / invalid). Persist long cooldown.
+  mark401(key) {
+    const cdMs = 7 * 24 * 3600 * 1000; // 7 days
+    const until = Date.now() + cdMs;
+    this.cooldownUntil.set(key, until);
+    const short = `${key.slice(0, 6)}...${key.slice(-4)}`;
+    console.warn(`[keys] ${short} in cooldown for ~7d (401 auth denied) (until ${new Date(until).toLocaleString()})`);
+    saveKeyState();
+  }
+
   markSuccess(key, reason = null) {
     _key429Count.set(key, 0);
     if (this.cooldownUntil.has(key)) {
@@ -438,14 +463,17 @@ class ApiBalancer {
       const consecutive429 = _key429Count.get(k) || 0;
       let status = "active";
       let releaseAt = null;
+      let reason = null;
       if (this.cooldownUntil.has(k)) {
         const until = this.cooldownUntil.get(k);
         if (until > now) {
-          status = "cooldown";
+          const days = Math.ceil((until - now) / 86400000);
+          status = days >= 6 ? "auth_denied" : "cooldown";
+          reason = days >= 6 ? "401" : "429";
           releaseAt = new Date(until).toISOString();
         }
       }
-      return { keyPrefix: short, status, consecutive429, releaseAt };
+      return { keyPrefix: short, status, reason, consecutive429, releaseAt };
     });
   }
 }
@@ -453,18 +481,8 @@ class ApiBalancer {
 function withKey() {
   loadKeys();
   if (!_balancer) return _keys[0] || "";
-  const now = Date.now();
-  let attempts = 0;
-  while (attempts < _keys.length) {
-    const key = _balancer.getNextKey();
-    if (!key) break;
-    if (!_keyCooldown.has(key) || _keyCooldown.get(key) < now) {
-      return key;
-    }
-    attempts++;
-  }
-  // All keys on cooldown — try first anyway
-  return _keys[0] || "";
+  const key = _balancer.getNextKey();
+  return key || _keys[0] || "";
 }
 
 function report429(key, resetSeconds = 0) {
@@ -477,12 +495,6 @@ function reportKeySuccess(key, reason = null) {
   if (key && _balancer) {
     _balancer.markSuccess(key, reason);
   }
-}
-
-// Legacy cooldown for 401 errors (not tracked by ApiBalancer)
-const _keyCooldown = new Map();
-function cooldownKey(key, ms = 30000) {
-  _keyCooldown.set(key, Date.now() + ms);
 }
 
 const _keyValidated = new Map();
@@ -1322,7 +1334,7 @@ async function zenRequest(endpoint, body, opts = {}) {
         } catch {}
         report429(key, resetSec);
       } else {
-        cooldownKey(key, 60000);
+        if (_balancer) _balancer.mark401(key);
       }
       if (config.requestLog) console.log(`[zen] retry ${retries + 1}/${maxRetries} after ${resp.status}`);
       return zenRequest(endpoint, body, { ...opts, retries: retries + 1 });

@@ -351,6 +351,81 @@ function _progressiveAging(messages) {
 }
 
 // ═══════════════════════════════════════════════════
+// Old tool output dropping
+// ═══════════════════════════════════════════════════
+
+function _dropOldToolOutputs(messages, keepCount) {
+  if (!messages?.length || !keepCount || keepCount < 1) return messages;
+
+  // Walk backwards, grouping tool results by their parent assistant message.
+  // Each assistant-with-tool_calls + its tool results is one "turn group".
+  // Groups are kept or dropped atomically to avoid orphaned tool messages.
+  const dropIndices = new Set();
+
+  // First pass: walk backwards and identify the assistant for each tool message
+  const toolParent = new Map(); // tool message index → assistant message index
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].role === "tool" && messages[i].tool_call_id) {
+      for (let j = i - 1; j >= 0; j--) {
+        if (messages[j].role === "assistant" && messages[j].tool_calls?.length) {
+          const ids = new Set(messages[j].tool_calls.map(tc => tc.id));
+          if (ids.has(messages[i].tool_call_id)) {
+            toolParent.set(i, j);
+            break;
+          }
+        }
+        if (messages[j].role !== "assistant" && messages[j].role !== "tool" && messages[j].role !== "user") break;
+      }
+    }
+  }
+
+  // Build turn groups: each group = { assistantIdx, toolIndices: [...] }
+  const groups = [];
+  const groupedTools = new Set();
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "tool" && !groupedTools.has(i)) {
+      const parentIdx = toolParent.get(i);
+      if (parentIdx == null) continue; // orphaned tool — leave it alone
+      const toolIndices = [i];
+      groupedTools.add(i);
+      // Collect all tool results from the same parent assistant
+      for (let k = parentIdx + 1; k < messages.length && k !== i; k++) {
+        if (messages[k].role === "tool" && !groupedTools.has(k) && toolParent.get(k) === parentIdx) {
+          toolIndices.push(k);
+          groupedTools.add(k);
+        }
+      }
+      // Check if the assistant has text content (don't drop if it does)
+      const assistantHasText = messages[parentIdx].content != null && (
+        typeof messages[parentIdx].content === "string"
+          ? messages[parentIdx].content.trim().length > 0
+          : Array.isArray(messages[parentIdx].content)
+            ? messages[parentIdx].content.some(p => (p?.text || p?.content || "")?.trim?.()?.length > 0)
+            : false
+      );
+      groups.push({
+        assistantIdx: assistantHasText ? -1 : parentIdx, // -1 = don't drop assistant
+        toolIndices,
+      });
+    }
+  }
+
+  // Groups are built in reverse order (newest first).
+  // Keep the most recent `keepCount` groups, drop the rest.
+  for (let g = keepCount; g < groups.length; g++) {
+    for (const ti of groups[g].toolIndices) {
+      dropIndices.add(ti);
+    }
+    if (groups[g].assistantIdx >= 0) {
+      dropIndices.add(groups[g].assistantIdx);
+    }
+  }
+
+  if (!dropIndices.size) return messages;
+  return messages.filter((_, i) => !dropIndices.has(i));
+}
+
+// ═══════════════════════════════════════════════════
 // Ultra compression (~75% savings)
 // All Aggressive + heuristic token pruning + stopword removal
 // ═══════════════════════════════════════════════════
@@ -490,6 +565,32 @@ export function compressMessages(messages, level = "stacked", progressiveAging =
   if (!messages?.length || level === "off") return messages;
 
   let msgs = messages;
+
+  // Drop old tool outputs: keep only the most recent N pairs
+  if (level !== "off") {
+    const envKeep = parseInt(typeof Bun !== "undefined" ? Bun.env.TOOL_OUTPUT_KEEP_COUNT : process.env.TOOL_OUTPUT_KEEP_COUNT, 10);
+    let keepCount = envKeep > 0 ? envKeep : 0;
+    if (!keepCount) {
+      switch (level) {
+        case "lite":     keepCount = 8; break;
+        case "caveman":
+        case "standard": keepCount = 6; break;
+        case "rtk":      keepCount = 6; break;
+        case "stacked":  keepCount = 4; break;
+        case "aggressive": keepCount = 3; break;
+        case "ultra":    keepCount = 1; break;
+        default:         keepCount = 0; break;
+      }
+    }
+    if (keepCount > 0) {
+      const before = msgs.length;
+      msgs = _dropOldToolOutputs(msgs, keepCount);
+      if (msgs.length < before) {
+        const dropped = before - msgs.length;
+        process.stdout.write(`\x1b[90m[compress]\x1b[0m dropped ${dropped} old tool pair${dropped !== 1 ? "s" : ""} (kept last ${keepCount})\n`);
+      }
+    }
+  }
 
   // Progressive aging: reduce older messages more
   if (progressiveAging && (level === "aggressive" || level === "ultra")) {

@@ -105,12 +105,13 @@ GitHub Copilot extension             src/server.js                       OpenCod
 - `check(key)` / `store(key, value)` — cache operations
 - `invalidate()` / `stats()` / `configure(opts)` — cache management
 
-### `src/token-optimizer.js` (563 lines)
+### `src/token-optimizer.js` (636 lines)
 **Multi-level prompt compression (7 levels).**
 
 - `compressContent()` / `compressMessages()` / `compressBest()` — compression functions
 - `compressToolDefinitions(tools)` — compress tool schemas for upstream
 - `compactIdentity(model)` — model identity prompts
+- `_dropOldToolOutputs(messages, keepCount)` — drops old (assistant tool_call → tool result) pairs, keeping only the most recent N
 - `CompressionLevel` enum: `off`, `lite`, `caveman`, `aggressive`, `ultra`, `rtk`, `stacked`
 
 ### `src/completion-cache.js`
@@ -199,8 +200,9 @@ Messages folded into labeled plain text with `---` separator (matching [m365-cop
 - **Model registry**: Free models hardcoded, paid models fetched from Go API, metadata from models.dev. Cached to `.cache/models.json` disk.
 - **Key validation**: On startup, pings `deepseek-v4-flash` with `max_tokens: 1` *before* fetching the paid model list. If inference fails (429), paid models are skipped entirely and `Premium+Free` mode isn't advertised. If `deepseek-v4-flash` returns 404, falls back to the first premium model from the API with a warning.
 - **Rate-limit persistence**: 429 responses are parsed for `error.type` + `error.message` (e.g. `GoUsageLimitError: Weekly usage limit reached. Resets in 1 day.`). The timing is extracted from the message and persisted to `.cache/key-state.json`. On restart, cooldowns are respected — no ping or model fetch is performed while the key is still in cooldown.
-- **Key rotation**: Round-robin with cooldown. 401 → 60s cooldown, 429 → persisted cooldown duration. Validated via real inference pings. Hash persisted to `.cache/keyhash.json`.
+- **Key rotation**: Round-robin with cooldown. 401 → 7-day persisted cooldown (via `key-state.json`), 429 → persisted cooldown duration. Validated via real inference pings. Hash persisted to `.cache/keyhash.json`.
 - **Auto-compression**: `COMPRESSION_LEVEL=auto` selects `off` for ≤3 messages, `stacked` for free/poll, `caveman` for paid.
+- **Tool output dropping**: Old (assistant tool_call → tool result) pairs are dropped at all compression levels above `off`. Groups are dropped atomically (all tool results from the same assistant are kept or dropped together) to prevent orphaned `tool` messages. Kept count per level: `lite`=8, `caveman`/`rtk`=6, `stacked`=4, `aggressive`=3, `ultra`=1. Override with `TOOL_OUTPUT_KEEP_COUNT=N`.
 - **Auto-restart**: Exit code 42 triggers restart via `start.cmd` loop. Console commands: `r`/`restart`, `s`/`stop`, `e`/`exit`.
 - **Graceful shutdown**: `/stop` endpoint or SIGINT/SIGTERM/SIGHUP with 30s timeout.
 - **VS 2026 file creation**: Markdown code blocks parsed into `create_file` tool calls. Project files (`.csproj`, `.sln`) handled natively.
@@ -229,6 +231,7 @@ On startup and model refresh (`refreshModels` → `fetchGoModelsRaw`), the proxy
 
 | Event | Action |
 |-------|--------|
+| 401 response | `ApiBalancer.mark401()` → sets 7-day `cooldownUntil`, persists to disk |
 | 429 response | `ApiBalancer.mark429()` → increments `consecutive429`, sets `cooldownUntil` if threshold met or upstream timer provided |
 | Successful request | `ApiBalancer.markSuccess()` → clears `cooldownUntil`, resets `consecutive429` to 0 |
 | State save | `saveKeyState()` → writes all cooldowns + counters to `.cache/key-state.json` |
@@ -241,12 +244,15 @@ On startup and model refresh (`refreshModels` → `fetchGoModelsRaw`), the proxy
   "keys": {
     "sk-abc1...xyz9": {
       "consecutive429": 3,
-      "cooldownUntil": "2026-05-09T18:00:00.000Z"
+      "cooldownUntil": "2026-05-09T18:00:00.000Z",
+      "cooldownReason": "429"
     }
   },
   "updatedAt": "2026-05-09T13:00:00.000Z"
 }
 ```
+
+Cooldown reason is `"401"` (auth denied, 7-day cooldown) or `"429"` (rate limited, duration varies).
 
 ---
 

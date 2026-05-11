@@ -1,27 +1,10 @@
 @echo off
 setlocal enabledelayedexpansion
 
-echo ================================================
-echo  Build Node.js Portable Distribution
-echo ================================================
-echo.
-
-node --version >nul 2>&1
-if !ERRORLEVEL! neq 0 (
-    echo [ERROR] Node.js is required. Install from: https://nodejs.org
-    exit /b 1
-)
-
 for /f "tokens=*" %%i in ('node --version') do set NODEVER=%%i
 echo [INFO] Node !NODEVER! found
 echo.
 
-if not exist .dist mkdir .dist
-for /d %%i in (.dist\*) do rmdir /s /q "%%i" 2>nul
-for %%i in (.dist\*) do (
-    set "_f=%%~nxi"
-    if "!_f:~0,1!" neq "." del /q "%%i" 2>nul
-)
 if not exist .dist mkdir .dist
 
 echo [INFO] Copying source files...
@@ -54,8 +37,13 @@ echo @echo off
 echo title GHCP2OpenCode Proxy ^(Node^)
 echo.
 echo :restart
-echo "%%~dp0node.exe" "%%~dp0src\server.js"
-echo if %%ERRORLEVEL%% equ 42 goto restart
+echo "%%~dp0node.exe" --expose-gc --max-old-space-size=4096 "%%~dp0src\server.js"
+echo if %%ERRORLEVEL%% equ 43 ^(
+echo     echo [UPDATE] Running updater...
+echo     call "%%~dp0update.cmd"
+echo     goto :restart
+echo ^)
+echo if %%ERRORLEVEL%% equ 42 goto :restart
 echo.
 ) > .dist\start.cmd
 
@@ -63,10 +51,12 @@ echo.
 echo ================================================
 echo  Build successful
 echo ================================================
-    echo.
+echo.
 echo   Output: .dist\  (portable folder)
-echo   Run:    .dist\start.cmd
+echo   Type:   Node.js portable distribution
 echo   OS:     Any Windows (Server 2016+)
+echo   Run:    .dist\start.cmd
 echo ================================================
 
 endlocal
+exit /b 0

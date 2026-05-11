@@ -8,8 +8,11 @@ echo  GHCP2OpenCode -- Update + Build
 echo ================================================
 echo.
 
-REM Kill running proxy window by title so .dist\ghcp2opencode.exe isn't locked
+REM Kill running proxy (by window title + by port)
 taskkill /fi "WINDOWTITLE eq GHCP2OpenCode Proxy" /f >nul 2>&1
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":11434 " ^| findstr "LISTENING" 2^>nul') do (
+    taskkill /pid %%a /f >nul 2>&1
+)
 
 REM Step 1: Update from GitHub
 echo -- STEP 1/2: Updating from GitHub --
@@ -21,7 +24,7 @@ if %UPDATE_RESULT% equ 1 (
     echo.
     echo [ABORT] Update failed, skipping build.
     endlocal
-    pause
+    timeout /t 5 >nul
     exit /b 1
 )
 
@@ -36,4 +39,4 @@ echo.
 echo ================================================
 echo  Update + Build complete.
 echo ================================================
-pause
+timeout /t 5 >nul

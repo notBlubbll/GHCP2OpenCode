@@ -48,7 +48,7 @@ import { compactIdentity, compactToolInstructions, compactOllamaToolInstructions
 import { m365ChatCompletion, m365ChatCompletionStream, M365CopilotError } from "./m365-client.js";
 
 // ── Version check ──
-const VERSION_URL = `https://raw.githubusercontent.com/notBlubbll/GHCP2OpenCode/main/.version?cb=${Date.now()}`;
+const VERSION_API_URL = "https://api.github.com/repos/notBlubbll/GHCP2OpenCode/contents/.version";
 const VERSION_FILE = ".version";
 
 function setConsoleTitle(title) {
@@ -84,8 +84,16 @@ async function checkVersion() {
     const t = setTimeout(() => ctrl.abort(), 8000);
     let remote = "";
     try {
-      const resp = await fetch(VERSION_URL, { signal: ctrl.signal });
-      if (resp.ok) remote = (await resp.text()).replace(/[^\d]/g, "");
+      const resp = await fetch(VERSION_API_URL, {
+        signal: ctrl.signal,
+        headers: { Accept: "application/vnd.github.v3+json" }
+      });
+      if (resp.ok) {
+        const json = await resp.json();
+        if (json.content) {
+          remote = Buffer.from(json.content, "base64").toString("utf8").replace(/[^\d]/g, "");
+        }
+      }
     } catch {}
     clearTimeout(t);
 

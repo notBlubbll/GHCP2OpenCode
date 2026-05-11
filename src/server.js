@@ -1862,32 +1862,44 @@ P(W + "\u2570" + hr + W + "\u256f" + R);
 P("");
 
 // Console commands
-if (process.stdin.isTTY && typeof process.stdin.on === "function") {
-  process.stdin.setEncoding("utf8");
-  process.stdin.on("data", (data) => {
-    const cmd = data.trim().toLowerCase();
-    if (cmd === "stop" || cmd === "s" || cmd === "exit" || cmd === "e" || cmd === "quit" || cmd === "q") {
-      log("Shutting down...");
-      if (serverRef?.stop) serverRef.stop(true);
-      else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(() => process.exit(0)); }
-      setTimeout(() => process.exit(0), 2000);
-    } else if (cmd === "restart" || cmd === "r") {
-      log("Restarting...");
-      if (serverRef?.stop) serverRef.stop(true);
-      else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(() => process.exit(42)); }
-      setTimeout(() => process.exit(42), 2000);
-    } else if (cmd === "update" || cmd === "u") {
-      log("Updating and restarting...");
-      if (serverRef?.stop) serverRef.stop(true);
-      else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(() => process.exit(43)); }
-      setTimeout(() => process.exit(43), 2000);
-    } else if (cmd) {
-      err(`Unknown command: ${cmd}`);
+(async () => {
+  let canUpdate = false;
+  try {
+    const { existsSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    canUpdate = existsSync(join(process.cwd(), "update.cmd"));
+  } catch {}
+  if (process.stdin.isTTY && typeof process.stdin.on === "function") {
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (data) => {
+      const cmd = data.trim().toLowerCase();
+      if (cmd === "stop" || cmd === "s" || cmd === "exit" || cmd === "e" || cmd === "quit" || cmd === "q") {
+        log("Shutting down...");
+        if (serverRef?.stop) serverRef.stop(true);
+        else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(() => process.exit(0)); }
+        setTimeout(() => process.exit(0), 2000);
+      } else if (cmd === "restart" || cmd === "r") {
+        log("Restarting...");
+        if (serverRef?.stop) serverRef.stop(true);
+        else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(() => process.exit(42)); }
+        setTimeout(() => process.exit(42), 2000);
+      } else if (canUpdate && (cmd === "update" || cmd === "u")) {
+        log("Updating and restarting...");
+        if (serverRef?.stop) serverRef.stop(true);
+        else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(() => process.exit(43)); }
+        setTimeout(() => process.exit(43), 2000);
+      } else if (cmd) {
+        err(`Unknown command: ${cmd}`);
+      }
+    });
+    process.stdin.resume();
+    if (canUpdate) {
+      log("\x1b[96mr/restart\x1b[90m | \x1b[96ms/stop\x1b[90m | \x1b[96me/exit\x1b[90m | \x1b[96mu/update\x1b[0m");
+    } else {
+      log("\x1b[96mr/restart\x1b[90m | \x1b[96ms/stop\x1b[90m | \x1b[96me/exit\x1b[0m");
     }
-  });
-  process.stdin.resume();
-  log("\x1b[96mr/restart\x1b[90m | \x1b[96ms/stop\x1b[90m | \x1b[96me/exit\x1b[90m | \x1b[96mu/update\x1b[0m");
-}
+  }
+})();
 
 // ── OS signal handling (copilot-proxy pattern) ──
 let _shuttingDown = false;

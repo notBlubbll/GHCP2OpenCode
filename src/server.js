@@ -56,6 +56,25 @@ function setConsoleTitle(title) {
   try { process.title = title; } catch {}
 }
 
+async function showToast(title, body) {
+  if (process.platform !== "win32") return;
+  try {
+    const { exec } = await import("node:child_process");
+    const tidy = (s) => String(s).replace(/'/g, "''");
+    const ps = `[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; $tpl = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); $tpl.GetElementsByTagName('text')[0].AppendChild($tpl.CreateTextNode('${tidy(title)}')) | Out-Null; $tpl.GetElementsByTagName('text')[1].AppendChild($tpl.CreateTextNode('${tidy(body)}')) | Out-Null; [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('GHCP2OpenCode').Show([Windows.UI.Notifications.ToastNotification]::new($tpl))`;
+    const p = exec(`powershell -NoProfile -Command "${ps}"`, { timeout: 4000 });
+    p.on("error", () => _fallbackPopup(title, body));
+    p.on("exit", (code) => { if (code !== 0) _fallbackPopup(title, body); });
+  } catch { _fallbackPopup(title, body); }
+}
+async function _fallbackPopup(title, body) {
+  try {
+    const { exec } = await import("node:child_process");
+    const tidy = (s) => String(s).replace(/'/g, "''");
+    exec(`powershell -NoProfile -Command "$wsh = New-Object -ComObject WScript.Shell; $null = $wsh.Popup('${tidy(title + '\n\n' + body)}', 8, 'GHCP2OpenCode', 64)"`, { timeout: 8000 });
+  } catch {}
+}
+
 async function checkVersion() {
   try {
     const fs = await import("node:fs");
@@ -75,6 +94,7 @@ async function checkVersion() {
     } else if (remote && local !== remote) {
       log(`\x1b[31m[version] outdated (local=${local.slice(0,14)} remote=${remote.slice(0,14)})\x1b[0m`);
       setConsoleTitle("GHCP2OpenCode (outdated, check github for new version)");
+      showToast("GHCP2OpenCode is outdated", "Check GitHub for the latest version"); // fire-and-forget
     } else {
       log(`\x1b[90m[version] no remote version\x1b[0m`);
     }

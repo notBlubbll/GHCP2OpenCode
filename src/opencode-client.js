@@ -257,7 +257,10 @@ const _key429Count = new Map();  // key → consecutive 429 count
 function cacheDir() {
   const base = Bun.env.OPENCODE_CACHE_DIR || (typeof process !== 'undefined' ? process.cwd() : ".");
   const dir = `${base}/.cache`;
-  try { require("node:fs").mkdirSync(dir, { recursive: true }); } catch {}
+  try {
+    if (_fs) _fs.mkdirSync(dir, { recursive: true });
+    else if (typeof require !== 'undefined') require("node:fs").mkdirSync(dir, { recursive: true });
+  } catch {}
   return dir;
 }
 

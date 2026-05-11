@@ -242,6 +242,34 @@ The status line shows green when up to date (match) and red when outdated (misma
 
 ---
 
+## Self-Updater
+
+No git required. `update.cmd` downloads the latest `main.zip` from GitHub and applies only changed files — your config and caches are preserved.
+
+```
+update.cmd
+```
+
+| Step | What happens |
+|------|-------------|
+| Download | Fetches `main.zip` from the repo |
+| Extract | Unzips to a temp folder |
+| Compare | MD5-hashes every file — copies only new or changed files |
+| Preserve | `.env`, `.cache/`, `.dist/`, `node_modules/`, `.git/` are never touched |
+| Cleanup | Temp folder removed automatically |
+
+Each file is labeled `NEW` (first time), `UPD` (changed), or `SKIP` (preserved) so you can see exactly what was updated. Restart the proxy after updating to use the new code.
+
+### Update + Build
+
+`update-and-build.cmd` fetches the latest source then runs `build.cmd` in one step — pull the newest code and produce a fresh `.dist` standalone.
+
+```
+update-and-build.cmd
+```
+
+---
+
 ## Caching & Validation
 
 ### Disk cache (`models.json`)

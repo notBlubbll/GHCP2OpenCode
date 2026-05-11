@@ -1,6 +1,8 @@
 @echo off
 setlocal enabledelayedexpansion
 
+title GHCP2OpenCode Proxy
+
 REM ============================================
 REM  GHCP2OpenCode v2 — Startup Script
 REM ============================================
@@ -36,6 +38,11 @@ if %ERRORLEVEL% equ 0 (
     )
     echo.
     bun --smol run src/server.js
+    if !ERRORLEVEL! equ 43 (
+        echo [UPDATE] Running updater...
+        call "%~dp0update.cmd"
+        goto :restart
+    )
     if !ERRORLEVEL! equ 42 goto :restart
     goto :EOF
 )
@@ -51,6 +58,11 @@ if %ERRORLEVEL% equ 0 (
     echo.
     REM --expose-gc enables manual gc; --max-old-space-size limits heap to avoid runaway memory
     node --expose-gc --max-old-space-size=4096 src/server.js
+    if !ERRORLEVEL! equ 43 (
+        echo [UPDATE] Running updater...
+        call "%~dp0update.cmd"
+        goto :restart
+    )
     if !ERRORLEVEL! equ 42 goto :restart
     goto :EOF
 )

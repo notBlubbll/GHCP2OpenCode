@@ -1856,12 +1856,17 @@ if (process.stdin.isTTY && typeof process.stdin.on === "function") {
       if (serverRef?.stop) serverRef.stop(true);
       else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(() => process.exit(42)); }
       setTimeout(() => process.exit(42), 2000);
+    } else if (cmd === "update" || cmd === "u") {
+      log("Updating and restarting...");
+      if (serverRef?.stop) serverRef.stop(true);
+      else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(() => process.exit(43)); }
+      setTimeout(() => process.exit(43), 2000);
     } else if (cmd) {
       err(`Unknown command: ${cmd}`);
     }
   });
   process.stdin.resume();
-  log("\x1b[96mr/restart\x1b[90m | \x1b[96ms/stop\x1b[90m | \x1b[96me/exit\x1b[0m");
+  log("\x1b[96mr/restart\x1b[90m | \x1b[96ms/stop\x1b[90m | \x1b[96me/exit\x1b[90m | \x1b[96mu/update\x1b[0m");
 }
 
 // ── OS signal handling (copilot-proxy pattern) ──

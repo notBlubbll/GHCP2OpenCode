@@ -4,7 +4,7 @@
 
 Ollama-emulating proxy that connects **GitHub Copilot Chat & Agent** (VS 2026 / VS Code) to the [OpenCode](https://opencode.ai) Zen + Go APIs + free models. Exposes an Ollama-compatible HTTP API on `localhost:11434` so the GitHub Copilot extension's built-in Ollama provider can use OpenCode models.
 
-**Runtime:** Bun (preferred) → Node.js fallback. Framework: Hono.
+**Runtime:** Bun (preferred) → Node.js fallback. Framework: Hono. Launcher: C# `service.exe` (dual-mode: console + Windows service, embedded in `build-node.cmd`).
 
 ---
 
@@ -117,6 +117,61 @@ GitHub Copilot extension             src/server.js                       OpenCod
 
 ### `src/completion-cache.js`
 **Reasoning cache + prompt-response cache integration.** Caches `<think>` tag text per message and re-attaches on cache hits so DeepSeek-style reasoning isn't lost.
+
+---
+
+## Build System
+
+### `build-node.cmd` (~520 lines)
+**Node.js portable build + embedded C# launcher compiler.**
+
+- Copies `src/`, `package.json`, `node` (without `.exe` — see below), `.env`, `.version` into `.dist/`
+- Generates `.dist\start.cmd` — one-shot batch launcher calling `service.exe`
+- Extracts embedded C# source from itself (after `goto :EOF`), compiles in-memory via PowerShell `Add-Type` → `.dist\service.exe` (no temp `.cs`/`.csproj` files)
+- Falls back to `dotnet publish` → `csc.exe` if `Add-Type` unavailable
+
+### `build-bun.cmd` (~450 lines)
+**Bun standalone build + embedded C# service launcher compiler.**
+
+- Compiles `src/server.js` → `.dist\gc2oc` (Bun standalone, ~112 MB, no `.exe` extension — prevents accidental double-click)
+- Generates `.dist\start.cmd` — one-shot batch launcher: `@"%~dp0server.exe"`
+- Extracts embedded C# source (after `===CS_START===` marker), compiles in-memory via PowerShell `Add-Type` → `.dist\server.exe`
+- Falls back to `dotnet publish` (with `System.ServiceProcess.ServiceController` package) → `csc.exe`
+
+### `service.exe` (C# launcher, compiled at build time)
+**Dual-mode: interactive console + Windows service.** Source embedded in the respective `build-*.cmd` file, extracted at build time via PowerShell `Add-Type` with `System.Core.dll` + `System.ServiceProcess.dll`.
+
+**Interactive mode** (double-click / CLI):
+- Sets console title, loads `.env`, kills port, launches the server runtime
+- Restart loop: exit 42 → restart, exit 43 → run `update.cmd` → restart
+- **Stops any existing instance before starting:** tries `ServiceController.Stop()` (derived name + `gc2oc` fallback, 30s timeout), kills other process with same exe name, retries port cleanup 4×1s
+- Node build: checks bundled `node` (no extension) if system `node` not in PATH
+- Bun build: launches `gc2oc` (no extension) from the same directory
+
+**Service mode** (always attempts `ServiceBase.Run()` first, falls back to console on failure):
+- Uses `ServiceBase.Run(new Gc2ocService())` with `AutoLog = true`
+- **Bun build**: service detection via try/catch — `ServiceBase.Run()` throws if process wasn't started by SCM; `Environment.UserInteractive` is **not** used (unreliable across .NET versions)
+- **Node build**: service detection via `Environment.UserInteractive` check (reliable for .NET Framework)
+- `OnStart`: launches server in background thread (same restart/update loop as console, no console output)
+- `OnStop`: sets global `stopping` flag, kills server process, joins thread (15s)
+
+**Dynamic naming** — service name + console title derived from (in order):
+1. `GC2OC_SERVICE_NAME` env var
+2. EXE filename without extension (e.g. `server.exe` → `server`)
+3. Fallback `"gc2oc"`
+
+### `node` / `gc2oc` (no extension)
+**Runtime binary with no `.exe`** in `.dist/`. Prevents accidental double-click launch (Bun standalone is 112 MB), but the C# `service.exe` and `start.cmd` find them via `Path.Combine(baseDir, "gc2oc")` / `Path.Combine(baseDir, "node")`. For the Node build, system `node` (with `.exe`) is still found first if in PATH.
+
+### Build scripts
+| Script | Purpose | Output |
+|--------|---------|--------|
+| `build.cmd` | Auto-detect Bun vs Node, delegate | — |
+| `build-bun.cmd` | Bun standalone + C# launcher | `gc2oc` + `server.exe` + `start.cmd` |
+| `build-node.cmd` | Portable folder + C# launcher | `node` + `src/` + `service.exe` + `start.cmd` |
+| `start.cmd` | One-shot batch launcher (dev) | — |
+| `update.cmd` | Self-updater | — |
+| `update-and-build.cmd` | Update + Build combined | — |
 
 ---
 

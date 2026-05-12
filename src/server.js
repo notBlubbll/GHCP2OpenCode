@@ -2,6 +2,7 @@
 if (typeof Bun === 'undefined') {
   globalThis.Bun = { env: process.env };
 }
+try { process.stderr.write(`[gc2oc] startup pid=${process.pid} argv=${JSON.stringify(process.argv)}\r\n`); } catch {}
 
 // 1b. Crypto polyfill (Node.js < 19)
 if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
@@ -46,6 +47,16 @@ import { check as cacheCheck, store as cacheStore, cacheKey } from "./cache.js";
 import { ModelConcurrencyManager, RateLimitError, truncateToolMessagesInPayload, checkRequestBodySize } from "./concurrency.js";
 import { compactIdentity, compactToolInstructions, compactOllamaToolInstructions, compactCodeCompletionPrompt, compressMessages } from "./token-optimizer.js";
 import { m365ChatCompletion, m365ChatCompletionStream, M365CopilotError } from "./m365-client.js";
+import { handleServiceCommand, runAsService } from "./win-service.js";
+
+// ── Service command routing (early exit for install/uninstall) ──
+{
+  const svcCmd = await handleServiceCommand(process.argv);
+  if (svcCmd.handled) process.exit(svcCmd.exitCode);
+}
+
+// ── Service mode detection ──
+const _isServiceMode = process.argv.includes("--service") || process.env.GC2OC_SERVICE === "1";
 
 // ── Version check ──
 const VERSION_API_URL = "https://api.github.com/repos/notBlubbll/gc2oc/contents/.version";
@@ -1711,8 +1722,10 @@ const host = config.host;
   }
 }
 
-// Start HTTP server immediately
-if (typeof Bun !== 'undefined' && typeof Bun.serve === 'function') {
+// ── Server lifecycle ──
+async function _runServer() {
+  // Start HTTP server
+  if (typeof Bun !== 'undefined' && typeof Bun.serve === 'function') {
   serverRef = Bun.serve({ port, hostname: host, fetch: app.fetch, idleTimeout: 120, reusePort: true, backlog: 1024, maxRequestBodySize: Math.max(262144, parseInt(Bun.env.MAX_REQUEST_BODY_BYTES || "10485760", 10)) });
   log(`Listening on http://${host}:${serverRef.port}`);
 } else if (typeof process !== 'undefined' && process.versions?.node) {
@@ -1910,6 +1923,26 @@ P("");
     }
   }
 })();
+}
+
+if (_isServiceMode) {
+  try { process.stderr.write("[gc2oc] entering service mode\r\n"); } catch {}
+  try {
+    await runAsService({
+      onStart: _runServer,
+      onStop: () => {
+        log("Service stopping...");
+        if (serverRef?.stop) serverRef.stop(true);
+        else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(); }
+      }
+    });
+  } catch (e) {
+    try { process.stderr.write(`[gc2oc] runAsService error: ${e?.message || e}\r\n`); } catch {}
+    process.exit(1);
+  }
+} else {
+  await _runServer();
+}
 
 // ── Self-restart helper for standalone (.exe) runs ──
 // Restart helper. When wrapped (GC2OC_WRAPPED=1), exit and let the wrapper loop restart.

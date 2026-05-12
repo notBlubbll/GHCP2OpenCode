@@ -436,20 +436,28 @@ All scripts clean `.dist/` before building but **preserve dotfiles** (`.env`, `.
 
 ### Bun path (`build-bun.cmd` or auto-detected)
 
-Compiles to a single `.exe` using `bun build --compile`. The Bun runtime is embedded.
+Compiles to `gc2oc` (Bun standalone) + `service.exe` (C# launcher) using `bun build --compile`. The Bun runtime is embedded.
 
-- **No runtime required** — fully self-contained (~112 MB)
+- **No runtime required** — `gc2oc` is fully self-contained (~112 MB)
 - **No `node_modules`** — all JS modules bundled
-- **Still reads/writes** `.env`, `.cache/`, `.version` relative to the working directory
+- `service.exe` handles restart/update loop, `.env` loading, port cleanup, and Windows service mode
+- `start.cmd` is a one-shot launcher: calls `service.exe` and exits
+- `gc2oc` has no `.exe` extension — prevents accidental double-click; `service.exe` is the entry point
 - Requires **Windows 10 1809+ / Windows Server 2019+** (same OS floor as Bun)
+
+**Windows service:**
+```
+sc create gc2oc binPath= "C:\path\.dist\service.exe" start= auto
+sc start gc2oc
+```
 
 ### Node.js path (`build-node.cmd` or auto-detected fallback)
 
-Creates a portable folder with `node.exe` + source + production dependencies. Run `start.cmd` inside the folder.
+Creates a portable folder with `node` (no extension) + source + production dependencies. Run `start.cmd` or `service.exe` inside the folder.
 
-- **No install needed** on the target machine — `node.exe` is bundled
+- **No install needed** on the target machine — the Node.js binary is bundled
 - Works on **Windows Server 2016+** and any Windows that runs Node.js v18+
-- `start.cmd` includes the same exit-code-42 restart loop as the normal launcher
+- `service.exe` is a C# launcher with the same restart/update loop and Windows service support
 
 ### Running without building
 

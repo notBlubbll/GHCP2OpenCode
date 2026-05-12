@@ -102,7 +102,7 @@ OPENCODE_API_KEY=your-go-key
 OPENCODE_API_KEYS=["key1","key2"]  # multi-key rotation
 ```
 
-**Startup key validation**: On launch, the proxy pings `deepseek-v4-flash` with `max_tokens: 1` to verify the key can run inference. If it returns 429, the key is marked as rate-limited (with timing extracted from the error message, e.g. `Resets in 1 day`) and paid models are hidden from the list — avoiding wasted API calls on an unusable key. If `deepseek-v4-flash` returns 404, it falls back to the first premium model in the API response. Cooldown state is persisted to `.ghcp2oc_key-state.json` and respected on restart.
+**Startup key validation**: On launch, the proxy pings `deepseek-v4-flash` with `max_tokens: 1` to verify the key can run inference. If it returns 429, the key is marked as rate-limited (with timing extracted from the error message, e.g. `Resets in 1 day`) and paid models are hidden from the list — avoiding wasted API calls on an unusable key. If `deepseek-v4-flash` returns 404, it falls back to the first premium model in the API response. Cooldown state is persisted to `.cache/key-state.json` and respected on restart.
 
 ### Key Rotation & Rate Limit Protection
 

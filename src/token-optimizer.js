@@ -107,7 +107,7 @@ export function compressToolDefinitions(tools) {
 // ═══════════════════════════════════════════════════
 
 export function compactIdentity(model) {
-  return `You are GitHub Copilot via GHCP2OC Proxy running ${model}. Always say you are "Copilot (GHCP2OC)" running ${model}.`;
+  return `You are GitHub Copilot via gc2oc Proxy running ${model}. Always say you are "Copilot (gc2oc)" running ${model}.`;
 }
 
 export function compactToolInstructions() {

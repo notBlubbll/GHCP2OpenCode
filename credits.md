@@ -1,6 +1,6 @@
 # Credits
 
-GHCP2OpenCode incorporates patterns, architecture, and features from the following open-source projects.
+gc2oc incorporates patterns, architecture, and features from the following open-source projects.
 
 ## Primary Inspirations
 
@@ -27,7 +27,7 @@ GHCP2OpenCode incorporates patterns, architecture, and features from the followi
 
 ## Architecture
 
-GHCP2OpenCode is a standalone proxy server (Bun/Node.js + Hono) that emulates an Ollama instance on `localhost:11434`. VS Code and VS 2026 connect via their GitHub Copilot extension's built-in Ollama provider feature.
+gc2oc is a standalone proxy server (Bun/Node.js + Hono) that emulates an Ollama instance on `localhost:11434`. VS Code and VS 2026 connect via their GitHub Copilot extension's built-in Ollama provider feature.
 
 The [OpenCode Zen VS Code Provider](https://github.com/wienans/vsc-opencode-zen-chat-provider) takes the complementary approach — it is a native VS Code extension that implements the `LanguageModelChatProvider` API directly, eliminating the need for a proxy or the Copilot extension. Both approaches bring OpenCode models to the VS Code ecosystem.
 

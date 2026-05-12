@@ -48,7 +48,7 @@ import { compactIdentity, compactToolInstructions, compactOllamaToolInstructions
 import { m365ChatCompletion, m365ChatCompletionStream, M365CopilotError } from "./m365-client.js";
 
 // ── Version check ──
-const VERSION_API_URL = "https://api.github.com/repos/notBlubbll/GHCP2OpenCode/contents/.version";
+const VERSION_API_URL = "https://api.github.com/repos/notBlubbll/gc2oc/contents/.version";
 const VERSION_FILE = ".version";
 
 function setConsoleTitle(title) {
@@ -61,7 +61,7 @@ async function showToast(title, body) {
   try {
     const { exec } = await import("node:child_process");
     const tidy = (s) => String(s).replace(/'/g, "''");
-    const ps = `[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; $tpl = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); $tpl.GetElementsByTagName('text')[0].AppendChild($tpl.CreateTextNode('${tidy(title)}')) | Out-Null; $tpl.GetElementsByTagName('text')[1].AppendChild($tpl.CreateTextNode('${tidy(body)}')) | Out-Null; [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('GHCP2OpenCode').Show([Windows.UI.Notifications.ToastNotification]::new($tpl))`;
+    const ps = `[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; $tpl = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); $tpl.GetElementsByTagName('text')[0].AppendChild($tpl.CreateTextNode('${tidy(title)}')) | Out-Null; $tpl.GetElementsByTagName('text')[1].AppendChild($tpl.CreateTextNode('${tidy(body)}')) | Out-Null; [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('gc2oc').Show([Windows.UI.Notifications.ToastNotification]::new($tpl))`;
     const p = exec(`powershell -NoProfile -Command "${ps}"`, { timeout: 4000 });
     p.on("error", () => _fallbackPopup(title, body));
     p.on("exit", (code) => { if (code !== 0) _fallbackPopup(title, body); });
@@ -71,7 +71,7 @@ async function _fallbackPopup(title, body) {
   try {
     const { exec } = await import("node:child_process");
     const tidy = (s) => String(s).replace(/'/g, "''");
-    exec(`powershell -NoProfile -Command "$wsh = New-Object -ComObject WScript.Shell; $null = $wsh.Popup('${tidy(title + '\n\n' + body)}', 8, 'GHCP2OpenCode', 64)"`, { timeout: 8000 });
+    exec(`powershell -NoProfile -Command "$wsh = New-Object -ComObject WScript.Shell; $null = $wsh.Popup('${tidy(title + '\n\n' + body)}', 8, 'gc2oc', 64)"`, { timeout: 8000 });
   } catch {}
 }
 
@@ -101,8 +101,8 @@ async function checkVersion() {
       log("\x1b[32m[version] up to date\x1b[0m");
     } else if (remote && local !== remote) {
       log(`\x1b[31m[version] outdated (local=${local.slice(0,14)} remote=${remote.slice(0,14)})\x1b[0m`);
-      setConsoleTitle("GHCP2OpenCode (outdated, check github for new version)");
-      showToast("GHCP2OpenCode is outdated", "Check GitHub for the latest version"); // fire-and-forget
+      setConsoleTitle("gc2oc (outdated, check github for new version)");
+      showToast("gc2oc is outdated", "Check GitHub for the latest version"); // fire-and-forget
     } else {
       log(`\x1b[90m[version] no remote version\x1b[0m`);
     }
@@ -421,7 +421,7 @@ function extractToolCalls(text, workspaceRoot = "", messages = []) {
 
 // ── GET endpoints ──
 
-app.get("/", c => c.json({ service: "GHCP2OpenCode", status: "running" }));
+app.get("/", c => c.json({ service: "gc2oc", status: "running" }));
 
 app.get("/health", async c => {
   try {
@@ -546,7 +546,7 @@ app.get("/version", async c => {
   return c.json({
     proxy_version: "420.96.00",
     ollama_compatibility: "0.6.4",
-    proxy_name: "GHCP2OpenCode",
+    proxy_name: "gc2oc",
     supported_models: real,
   });
 });
@@ -619,7 +619,7 @@ app.post("/api/diagnostics", async c => {
   const metadata = resolveModelMetadata(testModelId);
 
   const results = {
-    proxy: "GHCP2OpenCode",
+    proxy: "gc2oc",
     version: "420.96.00",
     timestamp: new Date().toISOString(),
     authenticated: config.hasKey,
@@ -1768,7 +1768,7 @@ if (typeof Bun !== 'undefined' && typeof Bun.serve === 'function') {
 // Load models & show banner in background
 let models = await initModels();
 
-process.stdout.write("\x1b]2;GHCP2OpenCode — OpenCode Go Proxy\x07");
+process.stdout.write("\x1b]2;gc2oc\x07");
 
 await checkVersion();
 
@@ -1888,14 +1888,16 @@ P("");
         setTimeout(() => process.exit(0), 2000);
       } else if (cmd === "restart" || cmd === "r") {
         log("Restarting...");
-        if (serverRef?.stop) serverRef.stop(true);
-        else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(() => process.exit(42)); }
-        setTimeout(() => process.exit(42), 2000);
+        if (serverRef?.stop) { serverRef.stop(true); restartSelf(); }
+        else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(() => restartSelf()); }
+        else { restartSelf(); }
+        setTimeout(() => process.exit(42), 5000);
       } else if (canUpdate && (cmd === "update" || cmd === "u")) {
         log("Updating and restarting...");
-        if (serverRef?.stop) serverRef.stop(true);
-        else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(() => process.exit(43)); }
-        setTimeout(() => process.exit(43), 2000);
+        if (serverRef?.stop) { serverRef.stop(true); restartSelf(43); }
+        else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(() => restartSelf(43)); }
+        else { restartSelf(43); }
+        setTimeout(() => process.exit(43), 5000);
       } else if (cmd) {
         err(`Unknown command: ${cmd}`);
       }
@@ -1908,6 +1910,41 @@ P("");
     }
   }
 })();
+
+// ── Self-restart helper for standalone (.exe) runs ──
+// Restart helper. When wrapped (GC2OC_WRAPPED=1), exit and let the wrapper loop restart.
+// Standalone: spawn cmd /c start /D wd cmd /c exe — opens a new independent console.
+// NOTE: paths passed without quotes because Bun wraps the entire cmd arg in quotes,
+// and nested quotes would break CMD parsing.
+async function restartSelf(exitCode = 42) {
+  if (process.env.GC2OC_WRAPPED) {
+    process.exit(exitCode);
+    return;
+  }
+  try {
+    const pathMod = await import("node:path");
+    const exe = process.execPath;
+    const wd = pathMod.dirname(exe);
+    const args = process.argv.slice(1).join(" ");
+    const cmd = `start /D ${wd} cmd /c ${exe} ${args}`.trim();
+
+    if (typeof Bun !== 'undefined') {
+      Bun.spawn(["cmd", "/c", cmd], {
+        stdout: "ignore", stderr: "ignore", stdin: "ignore",
+      }).unref();
+    } else {
+      const { spawn } = await import("node:child_process");
+      spawn("cmd", ["/c", cmd], {
+        detached: true, stdio: "ignore", windowsHide: true,
+      }).unref();
+    }
+    await new Promise(r => setTimeout(r, 500));
+  } catch (e) {
+    err("Self-restart spawn failed: " + e.message);
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  process.exit(exitCode);
+}
 
 // ── OS signal handling (copilot-proxy pattern) ──
 let _shuttingDown = false;

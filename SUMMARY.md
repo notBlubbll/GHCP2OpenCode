@@ -1,4 +1,4 @@
-# GHCP2OpenCode — Summary
+# gc2oc — Summary
 
 ## What it is
 

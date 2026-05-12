@@ -1,10 +1,12 @@
 @echo off
 setlocal enabledelayedexpansion
 
-title GHCP2OpenCode Proxy
+set GC2OC_WRAPPED=1
+
+title gc2oc
 
 REM ============================================
-REM  GHCP2OpenCode v2 — Startup Script
+REM  gc2oc — GitHub Copilot to OpenCode
 REM ============================================
 
 :restart

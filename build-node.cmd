@@ -35,8 +35,9 @@ echo [INFO] Creating start.cmd...
 (
 echo @echo off
 echo setlocal enabledelayedexpansion
+echo set GC2OC_WRAPPED=1
 echo.
-echo title GHCP2OpenCode Proxy ^(Node^)
+echo title gc2oc ^(Node^)
 echo.
 echo :restart
 echo cls

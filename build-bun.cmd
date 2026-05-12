@@ -16,13 +16,13 @@ if not exist node_modules (
 
 if not exist .dist mkdir .dist
 
-bun build --compile --target bun-windows-x64 src/server.js --outfile .dist/ghcp2opencode.exe
+bun build --compile --target bun-windows-x64 src/server.js --outfile .dist/gc2oc.exe
 if !ERRORLEVEL! neq 0 (
     echo [WARN] Baseline target failed, retrying with modern...
-    bun build --compile --target bun-windows-x64-modern src/server.js --outfile .dist/ghcp2opencode.exe
+    bun build --compile --target bun-windows-x64-modern src/server.js --outfile .dist/gc2oc.exe
 )
 
-if not exist .dist\ghcp2opencode.exe (
+if not exist .dist\gc2oc.exe (
     echo [ERROR] Build failed.
     endlocal
     exit /b 1
@@ -36,7 +36,7 @@ echo ================================================
 echo  Build successful
 echo ================================================
 echo.
-echo   Output: .dist\ghcp2opencode.exe
+echo   Output: .dist\gc2oc.exe
 echo   Size:   ~112 MB
 echo   Type:   Bun standalone (fully self-contained)
 echo   OS:     Win 10 1809+ / Server 2019+

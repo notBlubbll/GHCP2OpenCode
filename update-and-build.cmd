@@ -1,15 +1,15 @@
 @echo off
 setlocal
 
-title GHCP2OpenCode Update+Build
+title gc2oc Update+Build
 
 echo ================================================
-echo  GHCP2OpenCode -- Update + Build
+echo  gc2oc -- Update + Build
 echo ================================================
 echo.
 
 REM Kill running proxy (by window title + by port)
-taskkill /fi "WINDOWTITLE eq GHCP2OpenCode Proxy" /f >nul 2>&1
+taskkill /fi "WINDOWTITLE eq gc2oc" /f >nul 2>&1
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":11434 " ^| findstr "LISTENING" 2^>nul') do (
     taskkill /pid %%a /f >nul 2>&1
 )

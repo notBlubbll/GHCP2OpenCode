@@ -1,6 +1,6 @@
 # AGENTS.md
 
-## GHCP2OpenCode Proxy
+## gc2oc Proxy
 
 Ollama-emulating proxy that connects **GitHub Copilot Chat & Agent** (VS 2026 / VS Code) to the [OpenCode](https://opencode.ai) Zen + Go APIs + free models. Exposes an Ollama-compatible HTTP API on `localhost:11434` so the GitHub Copilot extension's built-in Ollama provider can use OpenCode models.
 
@@ -11,7 +11,7 @@ Ollama-emulating proxy that connects **GitHub Copilot Chat & Agent** (VS 2026 / 
 ## Architecture
 
 ```
-VS 2026 / VS Code                    GHCP2OpenCode Proxy                 Upstream APIs
+VS 2026 / VS Code                    gc2oc Proxy                 Upstream APIs
 ─────────────────                    ──────────────────                  ─────────────
 GitHub Copilot extension             src/server.js                       OpenCode Zen (free)
   │  Ollama provider                   │  Hono HTTP server                 │  https://opencode.ai/zen/v1

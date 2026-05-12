@@ -1,4 +1,4 @@
-# GHCP2OpenCode Proxy
+# gc2oc — GitHub Copilot to [OpenCode]
 
 Ollama-emulating proxy that connects **GitHub Copilot Chat&Agent** to the [OpenCode](https://opencode.ai) Zen + Go APIs + models.
 
@@ -230,10 +230,10 @@ Or `curl http://localhost:11434/stop`
 
 ## Version Check
 
-On startup, the proxy fetches the latest ticks from [`notBlubbll/GHCP2OpenCode/.version`](https://raw.githubusercontent.com/notBlubbll/GHCP2OpenCode/main/.version) (raw) and compares them with the local `.version` file. If they differ, the repo has been updated — the **console title** changes to:
+On startup, the proxy fetches the latest ticks from [`notBlubbll/gc2oc/.version`](https://raw.githubusercontent.com/notBlubbll/gc2oc/main/.version) (raw) and compares them with the local `.version` file. If they differ, the repo has been updated — the **console title** changes to:
 
 ```
-GHCP2OpenCode (outdated, check github for new version)
+gc2oc (outdated, check github for new version)
 ```
 
 The status line shows green when up to date (match) and red when outdated (mismatch).
@@ -470,6 +470,6 @@ start.cmd              # auto-detects Bun vs Node
 
 ## Credits
 
-See **[credits.md](credits.md)** for the full list of open-source projects that inspired patterns and features in GHCP2OpenCode.
+See **[credits.md](credits.md)** for the full list of open-source projects that inspired patterns and features in gc2oc.
 
 Key inspirations include [copilot-proxy](https://github.com/chew-z/copilot-proxy), [Qwen-Copilot-Proxy](https://github.com/edwardgj/Qwen-Copilot-Proxy), [Proxllama](https://github.com/Michediana/Proxllama), [vLLM-proxy-for-VS-Code](https://github.com/nbuckley/vLLM-proxy-for-VS-Code), [antigravity-copilot](https://github.com/punal100/antigravity-copilot), [OmniRoute](https://github.com/diegosouzapw/OmniRoute), [OpenCode Zen Provider](https://github.com/wienans/vsc-opencode-zen-chat-provider), and many more.

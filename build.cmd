@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 echo ================================================
-echo  GHCP2OpenCode -- Build
+echo  gc2oc -- Build
 echo ================================================
 echo.
 

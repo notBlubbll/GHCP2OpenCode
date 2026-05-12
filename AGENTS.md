@@ -134,8 +134,8 @@ GitHub Copilot extension             src/server.js                       OpenCod
 **Bun standalone build + embedded C# service launcher compiler.**
 
 - Compiles `src/server.js` → `.dist\gc2oc` (Bun standalone, ~112 MB, no `.exe` extension — prevents accidental double-click)
-- Generates `.dist\start.cmd` — one-shot batch launcher: `@"%~dp0server.exe"`
-- Extracts embedded C# source (after `===CS_START===` marker), compiles in-memory via PowerShell `Add-Type` → `.dist\server.exe`
+- Generates `.dist\start.cmd` — one-shot batch launcher: `@"%~dp0service.exe"`
+- Extracts embedded C# source (after `===CS_START===` marker), compiles in-memory via PowerShell `Add-Type` → `.dist\service.exe`
 - Falls back to `dotnet publish` (with `System.ServiceProcess.ServiceController` package) → `csc.exe`
 
 ### `service.exe` (C# launcher, compiled at build time)
@@ -146,18 +146,16 @@ GitHub Copilot extension             src/server.js                       OpenCod
 - Restart loop: exit 42 → restart, exit 43 → run `update.cmd` → restart
 - **Stops any existing instance before starting:** tries `ServiceController.Stop()` (derived name + `gc2oc` fallback, 30s timeout), kills other process with same exe name, retries port cleanup 4×1s
 - Node build: checks bundled `node` (no extension) if system `node` not in PATH
-- Bun build: launches `gc2oc` (no extension) from the same directory
+- Bun build: launches `gc2oc` (no extension, no fallbacks — only looks in the same directory)
 
-**Service mode** (always attempts `ServiceBase.Run()` first, falls back to console on failure):
+**Service mode** (checks `Environment.UserInteractive`):
 - Uses `ServiceBase.Run(new Gc2ocService())` with `AutoLog = true`
-- **Bun build**: service detection via try/catch — `ServiceBase.Run()` throws if process wasn't started by SCM; `Environment.UserInteractive` is **not** used (unreliable across .NET versions)
-- **Node build**: service detection via `Environment.UserInteractive` check (reliable for .NET Framework)
 - `OnStart`: launches server in background thread (same restart/update loop as console, no console output)
 - `OnStop`: sets global `stopping` flag, kills server process, joins thread (15s)
 
 **Dynamic naming** — service name + console title derived from (in order):
 1. `GC2OC_SERVICE_NAME` env var
-2. EXE filename without extension (e.g. `server.exe` → `server`)
+2. EXE filename without extension (e.g. `service.exe` → `service`)
 3. Fallback `"gc2oc"`
 
 ### `node` / `gc2oc` (no extension)
@@ -167,7 +165,7 @@ GitHub Copilot extension             src/server.js                       OpenCod
 | Script | Purpose | Output |
 |--------|---------|--------|
 | `build.cmd` | Auto-detect Bun vs Node, delegate | — |
-| `build-bun.cmd` | Bun standalone + C# launcher | `gc2oc` + `server.exe` + `start.cmd` |
+| `build-bun.cmd` | Bun standalone + C# launcher | `gc2oc` + `service.exe` + `start.cmd` |
 | `build-node.cmd` | Portable folder + C# launcher | `node` + `src/` + `service.exe` + `start.cmd` |
 | `start.cmd` | One-shot batch launcher (dev) | — |
 | `update.cmd` | Self-updater | — |
@@ -288,8 +286,8 @@ Messages folded into labeled plain text with `---` separator (matching [m365-cop
 - **Key rotation**: Round-robin with cooldown. 401 → 7-day persisted cooldown (via `key-state.json`), 429 → persisted cooldown duration. Validated via real inference pings. Hash persisted to `.cache/keyhash.json`.
 - **Auto-compression**: `COMPRESSION_LEVEL=auto` selects `off` for ≤3 messages, `stacked` for free/poll, `caveman` for paid.
 - **Tool output dropping**: Old (assistant tool_call → tool result) pairs are dropped at all compression levels above `off`. Groups are dropped atomically (all tool results from the same assistant are kept or dropped together) to prevent orphaned `tool` messages. Kept count per level: `lite`=8, `caveman`/`rtk`=6, `stacked`=4, `aggressive`=3, `ultra`=1. Override with `TOOL_OUTPUT_KEEP_COUNT=N`.
-- **Auto-restart**: Exit code 42 triggers restart via `start.cmd` loop (`GC2OC_WRAPPED=1`). Console commands: `r`/`restart`, `s`/`stop`, `e`/`exit`.
-  - **Wrapped mode** (`GC2OC_WRAPPED=1` set by `start.cmd`): `restartSelf()` calls `process.exit(42)`, the wrapper loop catches exit code 42 and re-launches.
+- **Auto-restart**: Exit code 42 triggers restart, exit 43 triggers update-then-restart. The restart loop lives in `service.exe` (C# launcher). Console commands: `r`/`restart`, `s`/`stop`, `e`/`exit`.
+  - **Wrapped mode** (`GC2OC_WRAPPED=1` set by `service.exe`): `restartSelf()` calls `process.exit(42)`, the C# launcher catches exit code 42 and re-launches `gc2oc`/`node`.
   - **Standalone mode** (compiled `.exe` run directly, no wrapper): `restartSelf()` spawns `cmd /c start /D <wd> cmd /c <exe>` — opens a new independent console window. The inner `cmd /c` runs the exe. A 500ms delay before exit gives `start` time to create the new process.
   - **Bun binary caveat**: In Bun-compiled `.exe` binaries, `process.argv[0]` returns `"bun"`, NOT the exe path. Always use `process.execPath` for the exe path. Bun also kills all child processes on `process.exit()`, so spawning-based restart is fragile — the `cmd /c start` approach works because `start` creates the new console window before Bun exits.
 - **Graceful shutdown**: `/stop` endpoint or SIGINT/SIGTERM/SIGHUP with 30s timeout.

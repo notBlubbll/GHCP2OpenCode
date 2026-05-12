@@ -132,16 +132,10 @@ class StartWrapper
         Environment.SetEnvironmentVariable("GC2OC_WRAPPED", "1");
         appId = GetAppId();
 
-        // Always attempt service mode first — Environment.UserInteractive is unreliable.
-        // ServiceBase.Run throws if the process was not started by SCM.
-        try
+        if (!Environment.UserInteractive)
         {
             ServiceBase.Run(new Gc2ocService());
             return 0;
-        }
-        catch (Exception ex)
-        {
-            try { Console.Error.WriteLine("[service] Not started by SCM (" + ex.Message + "), falling back to console mode."); } catch { }
         }
 
         SafeSetTitle(appId);

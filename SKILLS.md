@@ -220,10 +220,10 @@ Semantic/vector search that understands meaning — "where is auth implemented?"
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `navigationType` | string | **Yes** | Type of navigation (e.g. `"findReferences"`) |
-| `filepath` | string | **Yes** | File path to search within |
+| `navigationType` | integer | **Yes** | `0` = go to definition, `1` = find references |
+| `filepath` | string | **Yes** | Absolute file path to search within |
 | `symbolName` | string | **Yes** | Symbol name or partial name |
-| `lineText` | string | **Yes** | Line text for context matching |
+| `lineText` | string | **Yes** | Line text content for context matching (can be empty `""`) |
 
 Returns type info, declarations, scope, and all references.
 

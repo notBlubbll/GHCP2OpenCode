@@ -553,9 +553,12 @@ function normalizeToolCall(tc) {
       if (!Array.isArray(safe.urls)) safe.urls = [String(safe.urls ?? "")];
     } else if (/^(find_symbol|search_symbol)$/i.test(name)) {
       // Actual VS schema (live dump): required ["navigationType","filepath","symbolName","lineText"]
+      // navigationType: 0=goToDefinition, 1=findReferences — must be integer, NOT string
       const q = String(args.query ?? args.symbolName ?? args.symbol ?? args.name ?? "");
       safe.symbolName = q;
-      safe.navigationType = String(args.navigationType ?? args.navType ?? args.type ?? "findReferences");
+      safe.navigationType = typeof args.navigationType === "number" ? args.navigationType
+        : (typeof args.navType === "number" ? args.navType
+        : (typeof args.type === "number" ? args.type : 1));
       safe.filepath = String(args.filepath ?? args.filePath ?? args.filename ?? "");
       safe.lineText = String(args.lineText ?? args.line ?? args.text ?? "");
     } else if (/^nuget_get_latest_package_version$/i.test(name)) {
@@ -613,7 +616,7 @@ function normalizeToolCall(tc) {
     } else if (/^(profiler_agent)$/i.test(name)) {
       // required: ["reason"]  properties: reason
       safe.reason = String(args.reason ?? args.prompt ?? args.query ?? args.question ?? "");
-    } else if (/^(start_modernization)$/i.test(name)) {
+    } else if (/^(start_modernization|task_complete)$/i.test(name)) {
       // required: []  properties: []
       // no-op
     } else if (/^(query_azure_resource_graph)$/i.test(name)) {

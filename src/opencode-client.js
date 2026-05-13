@@ -1678,7 +1678,7 @@ export async function* chatCompletion(req) {
   }
 
   const lastMsg = body.messages?.[body.messages.length - 1];
-  const preview = (typeof lastMsg?.content === "string" ? lastMsg.content : "").replace(/\s+/g, " ").trim().slice(0, 60);
+  const preview = (typeof lastMsg?.content === "string" ? lastMsg.content : "").replace(/\s+/g, " ").trim().slice(0, 500);
   const provider = isPollModel(info.id) ? "pol" : (isFreeTierModel(info.id) ? "zen" : "go");
 
   try {

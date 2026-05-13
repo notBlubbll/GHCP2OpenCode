@@ -181,6 +181,79 @@ const apiErr = (e) => {
   return { status, body: { error: { message: e.message, type, code, ...(param ? { param } : {}) } } };
 };
 
+// Tool error resilience: track consecutive 400 tool errors that indicate orphaned tool_calls.
+// After 3 consecutive such failures, the last assistant's tool_calls are stripped and the
+// request is retried without tools (the AI will respond in plain text instead).
+let _tool400Streak = 0;
+function _toolNames(messages) {
+  if (!messages?.length) return "?";
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role === "assistant" && m.tool_calls?.length) {
+      return m.tool_calls.map(tc => tc.function?.name || tc.name || "?").join(", ");
+    }
+  }
+  return "?";
+}
+function _stripAllToolCalls(messages) {
+  if (!messages?.length) return messages || [];
+  return messages.map(m => {
+    if (m.role === "assistant" && m.tool_calls?.length) {
+      return { ...m, content: m.content || "", tool_calls: undefined };
+    }
+    return m;
+  });
+}
+
+// Pre-flight: for any assistant whose tool_call_ids don't ALL have matching tool results,
+// inject fake tool result messages to complete the group. This satisfies both DeepSeek
+// validation (tool_calls must have matching results) and VS's agent loop (VS expects
+// its tool calls to be resolved before continuing).
+function _stripOrphanedToolCalls(messages) {
+  if (!messages?.length) return { messages, stripped: 0 };
+  let fixed = 0;
+  const result = [...messages];
+
+  for (let i = 0; i < result.length; i++) {
+    const m = result[i];
+    if (m.role !== "assistant" || !m.tool_calls?.length) continue;
+
+    const callIds = m.tool_calls.map(tc => tc.id);
+    const matched = new Set();
+    let lastToolIdx = i; // position of the last tool result for this assistant
+    for (let j = i + 1; j < result.length; j++) {
+      const t = result[j];
+      if (t.role === "tool" && t.tool_call_id && callIds.some(cid => cid === t.tool_call_id)) {
+        matched.add(t.tool_call_id);
+        lastToolIdx = j;
+      }
+    }
+
+    if (matched.size < callIds.length) {
+      const missing = callIds.filter(id => !matched.has(id));
+      const names = m.tool_calls.filter(tc => missing.includes(tc.id)).map(tc => tc.function?.name || "?");
+      log(`  [tool] injecting ${missing.length} fake tool results: ${names.join(", ")} (${missing.length}/${callIds.length} missing)`);
+
+      // Inject fake tool results after the last existing result (or after the assistant itself)
+      let insertIdx = lastToolIdx > i ? lastToolIdx + 1 : i + 1;
+      for (const mId of missing) {
+        const tc = m.tool_calls.find(tc => tc.id === mId);
+        const fnName = tc?.function?.name || "unknown";
+        result.splice(insertIdx, 0, {
+          role: "tool",
+          tool_call_id: mId,
+          content: `[gc2oc] fake result for ${fnName} (original tool result missing from VS)`,
+        });
+        insertIdx++;
+      }
+      fixed++;
+    }
+  }
+
+  if (fixed) log(`  [tool] fixed ${fixed} orphaned assistant group${fixed !== 1 ? "s" : ""} total`);
+  return { messages: result, stripped: fixed };
+}
+
 const oaiResp = (content, tool_calls, finish_reason, model, usage) => {
   const choice = { index: 0, message: { role: "assistant" }, finish_reason: finish_reason || "stop" };
   if (content != null) choice.message.content = content;
@@ -296,8 +369,7 @@ async function _simStream(w, base, hasTools, toolCalls, text, reasoningContent) 
   if (hasTools) {
     for (let i = 0; i < toolCalls.length; i++) {
       const tc = toolCalls[i];
-      await w({ ...base, choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: "" } }] }, finish_reason: null }] });
-      await w({ ...base, choices: [{ index: 0, delta: { tool_calls: [{ index: i, function: { arguments: tc.function.arguments } }] }, finish_reason: null }] });
+      await w({ ...base, choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: tc.function.arguments } }] }, finish_reason: null }] });
     }
     await w({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
   } else {
@@ -493,8 +565,12 @@ function normalizeToolCall(tc) {
       safe.explanation = String(args.explanation ?? "");
     } else if (/^create_file$/i.test(name)) {
       // required: ["filePath","content"]  properties: filePath,content
-      safe.filePath = String(args.filePath ?? args.path ?? args.filename ?? "");
+      safe.filePath = String(args.filePath ?? args.path ?? args.filename ?? "").replace(/\\/g, "/");
       safe.content = String(args.content ?? args.contents ?? args.text ?? args.code ?? "");
+      // Preserve any extra fields VS might require beyond the schema
+      for (const k of Object.keys(args)) {
+        if (!(k in safe)) safe[k] = args[k];
+      }
     } else if (/^remove_file|delete_file(s)?$/i.test(name)) {
       // required: ["filePath"]  properties: filePath
       safe.filePath = String(args.filePath ?? args.path ?? args.filename ?? "");
@@ -593,7 +669,7 @@ function normalizeToolCall(tc) {
     } else if (/^(update_plan_progress)$/i.test(name)) {
       // required: ["stepId","status","message","autoAdvance"]  properties: stepId,status,message,autoAdvance
       safe.stepId = String(args.stepId ?? args.step ?? "");
-      safe.status = String(args.status ?? "in_progress");
+      safe.status = String(args.status ?? "in-progress");
       safe.message = String(args.message ?? "");
       safe.autoAdvance = (typeof args.autoAdvance === "boolean") ? args.autoAdvance : true;
     } else if (/^(record_observation)$/i.test(name)) {
@@ -755,8 +831,84 @@ function normalizeToolCall(tc) {
     }
 
     const fixed = JSON.stringify(safe);
+    if (name) log(`\x1b[35m[normalize] ${name} RAW: ${raw} → ${fixed}\x1b[0m`);
     return { ...tc, function: { ...tc.function, arguments: fixed } };
-  } catch {}
+  } catch (e) {
+    log(`\x1b[31m[normalize-ERR] ${name}: ${e.message}\x1b[0m`);
+    const raw2 = tc.function?.arguments;
+    if (!raw2) return tc;
+    // DeepSeek often truncates create_file content mid-string — salvage what we can
+    if (/^create_file$/i.test(name)) {
+      try {
+        const safe = {};
+        const fpMatch = raw2.match(/"filePath"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+        safe.filePath = fpMatch ? fpMatch[1].replace(/\\+/g, "/").replace(/\/{2,}/g, "/") : "";
+        const ctMatch = raw2.match(/"content"\s*:\s*"((?:[^"\\]|\\.)*)/);
+        safe.content = ctMatch ? ctMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "";
+        if (safe.filePath && safe.content.length > 0) {
+          log(`\x1b[33m[create_file] salvaged path=${safe.filePath} contentLen=${safe.content.length}\x1b[0m`);
+          const fixed = JSON.stringify(safe);
+          return { ...tc, function: { ...tc.function, arguments: fixed } };
+        }
+      } catch {}
+    }
+    if (/^replace_string_in_file$/i.test(name)) {
+      try {
+        const safe = {};
+        const fpMatch = raw2.match(/"filePath"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+        safe.filePath = fpMatch ? fpMatch[1].replace(/\\+/g, "/").replace(/\/{2,}/g, "/") : "";
+        const osMatch = raw2.match(/"oldString"\s*:\s*"((?:[^"\\]|\\.)*)/);
+        safe.oldString = osMatch ? osMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "";
+        const nsMatch = raw2.match(/"newString"\s*:\s*"((?:[^"\\]|\\.)*)/);
+        safe.newString = nsMatch ? nsMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "";
+        if (safe.filePath && (safe.oldString || safe.newString)) {
+          log(`\x1b[33m[replace_string_in_file] salvaged path=${safe.filePath} oldLen=${safe.oldString.length} newLen=${safe.newString.length}\x1b[0m`);
+          return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
+        }
+      } catch {}
+    }
+    if (/^multi_replace_string_in_file$/i.test(name)) {
+      try {
+        const fpMatch = raw2.match(/"filePath"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+        const osMatch = raw2.match(/"oldString"\s*:\s*"((?:[^"\\]|\\.)*)/);
+        const nsMatch = raw2.match(/"newString"\s*:\s*"((?:[^"\\]|\\.)*)/);
+        if (fpMatch) {
+          const rep = {
+            filePath: fpMatch[1].replace(/\\+/g, "/").replace(/\/{2,}/g, "/"),
+            oldString: osMatch ? osMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "",
+            newString: nsMatch ? nsMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "",
+          };
+          log(`\x1b[33m[multi_replace_string_in_file] salvaged 1 replacement path=${rep.filePath}\x1b[0m`);
+          return { ...tc, function: { ...tc.function, arguments: JSON.stringify({ replacements: [rep] }) } };
+        }
+      } catch {}
+    }
+    if (/^insert_edit_into_file$/i.test(name)) {
+      try {
+        const safe = {};
+        const fpMatch = raw2.match(/"filePath"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+        safe.filePath = fpMatch ? fpMatch[1].replace(/\\+/g, "/").replace(/\/{2,}/g, "/") : "";
+        const cdMatch = raw2.match(/"code"\s*:\s*"((?:[^"\\]|\\.)*)/);
+        safe.code = cdMatch ? cdMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "";
+        if (safe.filePath && safe.code.length > 0) {
+          log(`\x1b[33m[insert_edit_into_file] salvaged path=${safe.filePath} codeLen=${safe.code.length}\x1b[0m`);
+          return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
+        }
+      } catch {}
+    }
+    if (/^plan$/i.test(name)) {
+      try {
+        const pmMatch = raw2.match(/"planMarkdown"\s*:\s*"((?:[^"\\]|\\.)*)/);
+        if (pmMatch) {
+          const planMarkdown = pmMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+          if (planMarkdown.length > 0) {
+            log(`\x1b[33m[plan] salvaged planLen=${planMarkdown.length}\x1b[0m`);
+            return { ...tc, function: { ...tc.function, arguments: JSON.stringify({ planMarkdown }) } };
+          }
+        }
+      } catch {}
+    }
+  }
   return tc;
 }
 
@@ -808,6 +960,38 @@ function extractToolCalls(text, workspaceRoot = "", messages = []) {
     remaining = remaining.replace(fc[0], "");
   }
 
+  // 2b. ```json tool call blocks: {"name":"create_file","arguments":{...}}
+  const jsonBlockRe = /```json\s*\n(\{[\s\S]*?\})\s*\n```/g;
+  let jb;
+  while ((jb = jsonBlockRe.exec(text)) !== null) {
+    try {
+      const parsed = JSON.parse(jb[1]);
+      if (parsed.name && parsed.arguments) {
+        const tc = normalizeToolCall({
+          id: callId(), type: "function",
+          function: { name: parsed.name, arguments: JSON.stringify(parsed.arguments || {}) },
+        });
+        if (tc) { calls.push(tc); remaining = remaining.replace(jb[0], ""); }
+      }
+    } catch {}
+  }
+
+  // 2c. Inline JSON tool calls: {"name":"create_file","arguments":{...}} (standalone, no code fence)
+  const inlineJsonRe = /\{\s*"name"\s*:\s*"(create_file|replace_string_in_file|multi_replace_string_in_file|remove_file|get_file|read_file|grep_search|file_search|find_symbol|search_symbol|run_command_in_terminal|execute_command|replace_in_file)"\s*,\s*"arguments"\s*:\s*\{[\s\S]*?\}\s*\}/gi;
+  let ij;
+  while ((ij = inlineJsonRe.exec(text)) !== null) {
+    try {
+      const parsed = JSON.parse(ij[0]);
+      if (parsed.name && parsed.arguments) {
+        const tc = normalizeToolCall({
+          id: callId(), type: "function",
+          function: { name: parsed.name, arguments: JSON.stringify(parsed.arguments || {}) },
+        });
+        if (tc) { calls.push(tc); remaining = remaining.replace(ij[0], ""); }
+      }
+    } catch {}
+  }
+
   // 3. Markdown file creation: ## `path` ```lang\ncontent\n```
   const createRe = /(?:^|\n)(?:##\s*)?`([^`\n]+\.\w+)`\s*\n```[\w-]*\n([\s\S]*?)```/gi;
   let m;
@@ -820,10 +1004,11 @@ function extractToolCalls(text, workspaceRoot = "", messages = []) {
     if (vsCtx.workspace_root && !/^[A-Za-z]:[/\\]/.test(fp)) {
       fp = vsCtx.workspace_root.replace(/\/$/, "") + "/" + fp;
     }
-    calls.push({
+    const tc = normalizeToolCall({
       id: callId(), type: "function",
       function: { name: "create_file", arguments: JSON.stringify({ filePath: fp, content: codeContent }) },
     });
+    if (tc) calls.push(tc);
   }
 
   // Auto-inject project file update for created files
@@ -1638,6 +1823,9 @@ app.post("/v1/chat/completions", async c => {
     if (systemMsg) apiMessages.push({ role: "system", content: systemMsg });
     apiMessages.push(...userMsgs);
 
+    // Strip orphaned tool_calls before compression (prevents upstream 400)
+    const { messages: validatedMessages, stripped: _strippedOrphaned } = _stripOrphanedToolCalls(apiMessages);
+
     // Apply prompt compression — auto-select best level per model tier
     let compLevel = config.compressionLevel;
     if (compLevel === "auto") {
@@ -1647,7 +1835,7 @@ app.post("/v1/chat/completions", async c => {
       else if (isFreeTierModel(goModel)) compLevel = "stacked";    // free tier — max savings
       else compLevel = "caveman";                                   // paid — preserve quality
     }
-    const compressedMessages = compressMessages(apiMessages, compLevel, true);
+    const compressedMessages = compressMessages(validatedMessages, compLevel, true);
 
     const ollamaReq = { model: goModel, messages: compressedMessages, stream: streamMode, tools: vsTools || undefined, clientTag };
     if (body.chat_template_kwargs != null) ollamaReq.chat_template_kwargs = body.chat_template_kwargs;
@@ -1658,6 +1846,7 @@ app.post("/v1/chat/completions", async c => {
     const cached = ck ? cacheCheck(ck) : null;
     if (cached) {
       const { text, toolCalls, hasTools, reasoningContent } = cached.value;
+      if (toolCalls?.length) log(`\x1b[35m[cache-hit] returning ${toolCalls.length} cached tool calls: ${toolCalls.map(tc => tc.function?.name).join(", ")}\x1b[0m`);
 
       if (clientWantsStream) {
         return stream(c, async (s) => {
@@ -1727,6 +1916,9 @@ app.post("/v1/chat/completions", async c => {
             }
           }
         } catch (e) {
+          if (e instanceof APIError && e.status === 400 && /tool|tool_call/i.test(e.message)) {
+            err(`  stream tool error: ${_toolNames(ollamaReq.messages)} — ${e.message}`);
+          }
           err(`  stream error: ${e.message}`);
           await s.write("data: [DONE]\n\n");
           return;
@@ -1768,8 +1960,8 @@ app.post("/v1/chat/completions", async c => {
             hasTools = true;
           }
         }
-        const rawFullText = fullText;
-        const thinkResult = processThinkTags(fullText);
+    const rawFullText = fullText;
+    const thinkResult = processThinkTags(fullText);
         if (!reasoningContent && thinkResult.reasoning) reasoningContent = thinkResult.reasoning;
         fullText = thinkResult.content;
 
@@ -1804,6 +1996,7 @@ app.post("/v1/chat/completions", async c => {
         }
         return result;
       }, true);
+      _tool400Streak = 0;
     } catch (e) {
       if (e.name === "RateLimitError") {
         const errResp = apiErr(new APIError(429, e.body, e.message));
@@ -1816,7 +2009,33 @@ app.post("/v1/chat/completions", async c => {
           },
         }, 503);
       }
-      throw e;
+      if (e instanceof APIError && e.status === 400 && /tool|tool_call/i.test(e.message)) {
+        _tool400Streak++;
+        const tools = _toolNames(compressedMessages);
+        err(`  [400] tool error (#${_tool400Streak}/3): ${tools} — ${e.message}`);
+        if (_tool400Streak >= 3) {
+          err(`  [tool] stripping all tool_calls & retrying without tools after ${_tool400Streak} consecutive failures`);
+          _tool400Streak = 0;
+          const stripped = _stripAllToolCalls(compressedMessages);
+          const retryReq = { ...ollamaReq, messages: stripped, stream: false, tools: undefined };
+          try {
+            chunks = await cm.runRequest(goModel, async () => {
+              const result = [];
+              for await (const chunk of chatCompletion(retryReq)) {
+                result.push(chunk);
+              }
+              return result;
+            }, true);
+          } catch (retryErr) {
+            err(`  [tool] retry without tools also failed: ${retryErr.message}`);
+            throw retryErr;
+          }
+        } else {
+          throw e;
+        }
+      } else {
+        throw e;
+      }
     }
 
     let fullText = "";
@@ -1868,6 +2087,8 @@ app.post("/v1/chat/completions", async c => {
     if (ck) cacheStore(ck, { text: cleanText, toolCalls: allToolCalls, hasTools, reasoningContent });
 
     const resp = oaiResp(hasTools ? null : cleanText, hasTools ? allToolCalls : undefined, hasTools ? "tool_calls" : "stop", model, usage);
+    if (hasTools) log(`\x1b[35m[TOOLS-TO-VS] ${allToolCalls.map(tc => `${tc.function.name}(${tc.function.arguments})`).join(" | ")}\x1b[0m`);
+    else log(`\x1b[35m[TEXT-TO-VS] ${cleanText.replace(/\n/g,"\\n")}\x1b[0m`);
     if (reasoningContent) {
       const choice = resp.choices[0];
       addReasoningAliases(choice.message, reasoningContent);
@@ -1886,6 +2107,11 @@ app.post("/v1/chat/completions", async c => {
 
     return c.json(resp);
   } catch (e) {
+    if (e instanceof APIError && e.status === 400 && /tool|tool_call/i.test(e.message)) {
+      let tools = "?";
+      try { tools = _toolNames(compressedMessages); } catch {}
+      err(`  [400] tool error: ${tools} — ${e.message}`);
+    }
     err(`  Error: ${e.message}`);
     const errResp = apiErr(e);
     return c.json(errResp.body, errResp.status);
@@ -2121,6 +2347,7 @@ app.post("/api/chat", async c => {
       }
 
       const apiMessages = systemMsg ? [{ role: "system", content: systemMsg }, ...userMsgs] : userMsgs;
+      const { messages: validatedMessages, stripped: _strippedOrphaned2 } = _stripOrphanedToolCalls(apiMessages);
       let compLevel = config.compressionLevel;
       if (compLevel === "auto") {
         const msgCount = userMsgs.length;
@@ -2129,8 +2356,8 @@ app.post("/api/chat", async c => {
         else if (isFreeTierModel(model)) compLevel = "stacked";
         else compLevel = "caveman";
       }
-      const compressedMessages = compressMessages(apiMessages, compLevel, true);
-      const reqBody = { model, messages: compressedMessages, stream: false, options: body.options, format: body.format, clientTag };
+      const compressedMessages = compressMessages(validatedMessages, compLevel, true);
+      const reqBody = { model, messages: compressedMessages, stream: false, options: body.options, format: body.format, clientTag, tools: vsTools || undefined };
       if (body.chat_template_kwargs != null) reqBody.chat_template_kwargs = body.chat_template_kwargs;
       if (body.thinking_token_budget != null) reqBody.thinking_token_budget = body.thinking_token_budget;
 

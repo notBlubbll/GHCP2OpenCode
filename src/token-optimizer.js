@@ -405,10 +405,8 @@ function _dropOldToolOutputs(messages, keepCount) {
             ? messages[parentIdx].content.some(p => (p?.text || p?.content || "")?.trim?.()?.length > 0)
             : false
       );
-      groups.push({
-        assistantIdx: assistantHasText ? -1 : parentIdx, // -1 = don't drop assistant
-        toolIndices,
-      });
+      if (assistantHasText) continue; // skip group — can't drop tool results without orphaning tool_calls on text-bearing assistant
+      groups.push({ assistantIdx: parentIdx, toolIndices });
     }
   }
 

@@ -35,7 +35,16 @@ async function _getAgent() {
 
 export async function fetchWithAgent(url, init = {}) {
   const agent = await _getAgent();
-  if (agent) init.dispatcher = agent;
+  if (agent) {
+    try {
+      return await fetch(url, { ...init, dispatcher: agent });
+    } catch (e) {
+      if (e.message === "fetch failed") {
+        return fetch(url, init);
+      }
+      throw e;
+    }
+  }
   return fetch(url, init);
 }
 
@@ -1656,7 +1665,9 @@ export async function* chatCompletion(req) {
     logDone?.(Date.now() - t0);
   } catch (e) {
     if (e instanceof APIError) throw e; // propagate HTTP errors to server.js
-    error(`[stream] ${e.message}`);
+    const base = isPollModel(info.id) ? config.baseUrlPoll : (isFreeTierModel(info.id) ? config.baseUrlFree : config.baseUrl);
+    const fullUrl = `${base}/chat/completions`;
+    error(`[stream] ${e.message} (${fullUrl})`);
     yield {
       model: req.model, created_at: created,
       message: { role: "assistant", content: `Error: ${e.message}` },

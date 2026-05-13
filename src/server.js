@@ -127,7 +127,14 @@ async function checkVersion() {
 // ── Logging ──
 const logReq = (c) => {
   if (!config.requestLog) return;
-  log(`${c.req.method} ${new URL(c.req.url).pathname}`);
+  const path = new URL(c.req.url).pathname;
+  const ua = (c.req.header("User-Agent") || "none").slice(0, 120);
+  const baggage = (c.req.header("baggage") || "none").slice(0, 160);
+  const accept = (c.req.header("Accept") || "none").slice(0, 80);
+  const xEditor = (c.req.header("x-editor-version") || c.req.header("X-Editor-Version") || "").slice(0, 60);
+  const xVSSession = (c.req.header("x-vss-session-id") || "").slice(0, 40);
+  const extras = [ua, baggage ? `baggage=${baggage}` : "", accept ? `accept=${accept}` : "", xEditor ? `editor=${xEditor}` : "", xVSSession ? `vss=${xVSSession}` : ""].filter(Boolean).join(" ");
+  log(`${c.req.method} ${path} ${extras ? `| ${extras}` : ""}`);
 };
 const err = (msg) => logErr(msg);
 

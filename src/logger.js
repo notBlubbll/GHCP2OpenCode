@@ -12,12 +12,19 @@ function error(msg) {
   process.stderr.write(`\x1b[90m${ts()}\x1b[0m \x1b[31m${msg}\x1b[0m\n`);
 }
 
-function reqLog({ tag, provider, model, preview, extra }) {
+function reqLog({ tag, provider, model, preview, elapsed }) {
   const tsPart = `\x1b[90m${ts()}\x1b[0m`;
   const tagPart = tag ? `[${tag}]>` : "";
   const provModel = `[${provider}/${model || "?"}]`;
-  const trail = extra || (preview ? ` — ${JSON.stringify(preview)}` : "");
-  process.stdout.write(`${tsPart} ${tagPart}${provModel}${trail}\n`);
+  const trail = preview ? `—${JSON.stringify(preview)}` : "";
+  process.stdout.write(`${tsPart} ${tagPart}${provModel}${trail}— … `);
+  if (elapsed != null) {
+    process.stdout.write(`\x1b[32m->\x1b[0m [${elapsed}ms]\n`);
+    return;
+  }
+  return (elapsed) => {
+    process.stdout.write(`\x1b[32m->\x1b[0m [${elapsed}ms]\n`);
+  };
 }
 
 export { ts, log, warn, error, reqLog };

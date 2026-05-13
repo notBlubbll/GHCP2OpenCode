@@ -131,6 +131,7 @@ function connectRelay(timeoutMs = 10000) {
 
     ws.on("open", () => {
       clearTimeout(timer);
+      if (ws._socket) ws._socket.setNoDelay(true);
       resolve(ws);
     });
 

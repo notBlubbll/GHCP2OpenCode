@@ -22,6 +22,10 @@ async function _getAgent() {
       keepAliveTimeout: 90_000,     // 90s IdleConnTimeout
       keepAliveMaxTimeout: 600_000, // 10min max
       pipelining: 1,
+      headersTimeout: 60_000,       // 60s header read timeout
+      bodyTimeout: 120_000,         // 120s body read timeout
+      connect: { keepAlive: true, keepAliveInitialDelay: 30_000 },
+      tcpNoDelay: true,             // disable Nagle's algorithm
     });
     return _globalAgent;
   } catch {
@@ -1285,21 +1289,11 @@ async function zenRequest(endpoint, body, opts = {}) {
     sendBody.model = resolvePollModelName(body.model);
   }
   
-  const lastMsg = body.messages?.[body.messages.length - 1];
-  const preview = (typeof lastMsg?.content === "string" ? lastMsg.content : "").replace(/\s+/g, " ").trim().slice(0, 60);
   const provider = isPoll ? "pol" : (isFree ? "zen" : "go");
-  if (config.requestLog) {
-    reqLog({ tag: clientTag, provider, model: body.model, preview: `${preview}${lastMsg?.content?.length > 60 ? "\u2026" : ""}` });
-    if (!preview) {
-      const fullPrompt = (body.messages || []).map(m =>
-        `[${m.role}] ${typeof m.content === "string" ? m.content : JSON.stringify(m.content)}`
-      ).join("\n");
-      log(`[${provider}] DEBUG empty prompt, full payload:\n${fullPrompt}`);
-    }
-  }
 
   const headers = {
     "Content-Type": "application/json",
+    "Accept-Encoding": "gzip, deflate, br",
   };
   
   // Poll models: no auth needed (free public API)
@@ -1580,7 +1574,13 @@ export async function* chatCompletion(req) {
     }
   }
 
+  const lastMsg = body.messages?.[body.messages.length - 1];
+  const preview = (typeof lastMsg?.content === "string" ? lastMsg.content : "").replace(/\s+/g, " ").trim().slice(0, 60);
+  const provider = isPollModel(info.id) ? "pol" : (isFreeTierModel(info.id) ? "zen" : "go");
+
   try {
+    const t0 = Date.now();
+    const logDone = config.requestLog ? reqLog({ tag: req.clientTag, provider, model: req.model, preview: `${preview}${lastMsg?.content?.length > 60 ? "\u2026" : ""}` }) : null;
     const resp = await zenRequest("/chat/completions", body, { signal: ac?.signal, clientTag: req.clientTag });
 
     if (req.stream === false) {
@@ -1597,6 +1597,7 @@ export async function* chatCompletion(req) {
         done: true, done_reason: choice.finish_reason ?? "stop",
         usage: data.usage,
       };
+      logDone?.(Date.now() - t0);
       return;
     }
 
@@ -1618,6 +1619,7 @@ export async function* chatCompletion(req) {
         const dataStr = trimmed.slice(6);
         if (dataStr === "[DONE]") {
           yield { model: req.model, created_at: created, message: { role: "assistant", content: "" }, done: true, done_reason: "stop" };
+          logDone?.(Date.now() - t0);
           return;
         }
         try {
@@ -1651,6 +1653,7 @@ export async function* chatCompletion(req) {
         } catch {}
       }
     }
+    logDone?.(Date.now() - t0);
   } catch (e) {
     if (e instanceof APIError) throw e; // propagate HTTP errors to server.js
     error(`[stream] ${e.message}`);

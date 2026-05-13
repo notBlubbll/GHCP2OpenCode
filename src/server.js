@@ -42,6 +42,7 @@ if (typeof ReadableStream === 'undefined') {
 import { Hono } from "hono";
 import { stream } from "hono/streaming";
 import { cors } from "hono/cors";
+import { compress } from "hono/compress";
 import { config, getModels, initModels, resolveModel, resolveModelMetadata, isKnownModel, chatCompletion, APIError, isSeparator, isFreeTierModel, isPollModel, isM365Model, SEP_PAID, SEP_FREE, SEP_FREE_P, SEP_M365, refreshModels, validateFreeModels, bgFetchDone, getKeyStatus, fetchWithAgent } from "./opencode-client.js";
 import { check as cacheCheck, store as cacheStore, cacheKey } from "./cache.js";
 import { ModelConcurrencyManager, RateLimitError, truncateToolMessagesInPayload, checkRequestBodySize } from "./concurrency.js";
@@ -147,6 +148,9 @@ const app = new Hono();
 
 // CORS — VS Code Copilot sends requests from file:// / vscode-file:// origins
 app.use(cors({ origin: "*", allowMethods: ["GET", "POST", "DELETE", "OPTIONS"], allowHeaders: ["Content-Type", "Authorization"] }));
+
+// Response compression (gzip / deflate / brotli) — reduces wire bytes 70-90%
+app.use(compress());
 
 // Body parser — works on Bun + raw Node.js HTTP (body pre-read)
 async function getBody(c) {
@@ -929,7 +933,8 @@ app.post("/v1/chat/completions", async c => {
 
       const lastMsg = m365Messages[m365Messages.length - 1];
       const preview = typeof lastMsg?.content === "string" ? lastMsg.content.replace(/\s+/g, " ").trim().slice(0, 60) : "";
-      if (config.requestLog) reqLog({ tag: clientTag, provider: "m365", model, preview: `${preview}${(lastMsg?.content?.length || 0) > 60 ? "\u2026" : ""}` });
+      const logDone = config.requestLog ? reqLog({ tag: clientTag, provider: "m365", model, preview: `${preview}${(lastMsg?.content?.length || 0) > 60 ? "\u2026" : ""}` }) : null;
+      const m365t0 = Date.now();
 
       if (streamMode) {
         return stream(c, async (s) => {
@@ -944,6 +949,7 @@ app.post("/v1/chat/completions", async c => {
             }
             await w({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
             await s.write("data: [DONE]\n\n");
+            logDone?.(Date.now() - m365t0);
           } catch (e) {
             err(`  m365 stream error: ${e.message}`);
             await w({ ...base, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
@@ -964,9 +970,11 @@ app.post("/v1/chat/completions", async c => {
             await w2({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
             await _simStream(w2, base, false, null, content, null);
             await s.write("data: [DONE]\n\n");
+            logDone?.(Date.now() - m365t0);
           });
         }
 
+        logDone?.(Date.now() - m365t0);
         return c.json(oaiResp(content, undefined, "stop", model));
       } catch (e) {
         err(`  m365 error: ${e.message}`);

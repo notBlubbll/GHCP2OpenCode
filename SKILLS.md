@@ -1,9 +1,9 @@
-# Visual Studio Copilot Chat Agent — Tool Reference
+# GitHub Copilot Chat Agent — Tool Reference (Visual Studio / VS Code / SQL Studio)
 
-This document catalogs every tool available to the GitHub Copilot Agent in Visual Studio 2026 / 2022 17.14+.  
-Tools are used in **Agent Mode**; enable/disable individual tools via the **Tools** icon in the chat window.
+This document catalogs every tool available to the GitHub Copilot Agent across VS 2026/2022, VS Code, and SQL Studio.
+All schemas are captured from live `body.tools` dumps and ARE authoritative.
 
-> **Note:** GitHub Copilot for VS is closed-source. Confirmed schemas come from tool-call inspection and the AGENTS.md proxy normalization code. Inferred schemas are marked with a `~` in the Required column.
+> **VS schemas** differ wildly from AI conventions. Param names below are the exact VS-expected values.
 
 ---
 
@@ -17,6 +17,8 @@ Tools are used in **Agent Mode**; enable/disable individual tools via the **Tool
 - [Planning Tools (Preview)](#planning-tools-preview)
 - [Specialized Agents & Subagents](#specialized-agents--subagents)
 - [Diagnostics, Logs & Web](#diagnostics-logs--web)
+- [VS Code Copilot Chat — Tool Schemas](#vs-code-copilot-chat--tool-schemas)
+- [SQL Studio (SSMS) Copilot — Tool Schemas](#sql-studio-ssms-copilot--tool-schemas)
 - [References](#references)
 
 ---
@@ -127,31 +129,55 @@ Prompt: "Generate a Bicep template for an App Service with Key Vault secrets"
 |-----------|------|:--------:|-------------|
 | `projectName` | string | ~ | Target project (omit for whole solution) |
 
-### `nuget_get_latest_package_version`
+### Confirmed schemas (VS Insiders 18.7 — from live tool dumps)
 
-**Channel:** `nuget`
+| Tool | Required | Properties |
+|------|:--------:|------------|
+| `get_file` | `filename`,`startLine`,`endLine` | `filename`,`startLine`,`endLine`,`includeLineNumbers` |
+| `grep_search` | `query`,`isRegexp`,`includePattern`,`maxResults` | `query`,`isRegexp`,`includePattern`,`maxResults` |
+| `replace_string_in_file` | `filePath`,`oldString`,`newString` | `filePath`,`oldString`,`newString` |
+| `multi_replace_string_in_file` | `replacements`,`explanation` | `replacements`,`explanation` |
+| `create_file` | `filePath`,`content` | `filePath`,`content` |
+| `remove_file` | `filePath` | `filePath` |
+| `code_search` | `searchQueries` | `searchQueries` |
+| `file_search` | `queries`,`maxResults` | `queries`,`maxResults` |
+| `get_files_in_project` | `projectPath` | `projectPath` |
+| `get_projects_in_solution` | *none* | *none* |
+| `get_errors` | `filePaths` | `filePaths` |
+| `find_symbol` | `navigationType`,`filepath`,`symbolName`,`lineText` | `navigationType`,`filepath`,`symbolName`,`lineText` |
+| `run_build` | *none* | *none* |
+| `run_tests` | `filterTypes`,`filterValues` | `filterTypes`,`filterValues` |
+| `get_tests` | `filterTypes`,`filterValues` | `filterTypes`,`filterValues` |
+| `run_command_in_terminal` | `command`,`summary`,`background` | `command`,`summary`,`background` |
+| `get_background_terminal_output` | `terminal_id`,`headLines`,`tailLines`,`stop`,`waitMs` | `terminal_id`,`headLines`,`tailLines`,`stop`,`waitMs` |
+| `get_output_window_logs` | `paneId` | `paneId` |
+| `get_web_pages` | `urls` | `urls` |
+| `run_subagent` | `prompt`,`description`,`agentName` | `prompt`,`description`,`agentName` |
+| `search_agent` | `query`,`description`,`details` | `query`,`description`,`details` |
+| `profiler_agent` | `reason` | `reason` |
+| `start_modernization` | *none* | *none* |
+| `query_azure_resource_graph` | `prompt` | `prompt` |
+| `plan` | `planMarkdown` | `planMarkdown` |
+| `adapt_plan` | `observation` | `observation` |
+| `update_plan_progress` | `stepId`,`status`,`message`,`autoAdvance` | `stepId`,`status`,`message`,`autoAdvance` |
+| `record_observation` | `observation` | `observation` |
+| `finish_plan` | *none* | *none* |
+| `signal_plan_ready` | `planTitle` | `planTitle` |
+| `clarify_requirements` | `questions` | `questions` |
+| `detect_memories` | `memory`,`confidence` | `memory`,`confidence` |
+| `nuget_get_latest_package_version` | `solutionDirectory`,`packageName`,`includePrerelease` | `solutionDirectory`,`packageName`,`includePrerelease` |
+| `nuget_get_package_context` | `solutionDirectory`,`packageName`,`packageVersion` | `solutionDirectory`,`packageName`,`packageVersion` |
+| `nuget_upgrade_packages_to_latest` | `solutionDirectory`,`projectPaths`,`includeVulnerable`,`includePrerelease` | `solutionDirectory`,`projectPaths`,`includeVulnerable`,`includePrerelease` |
+| `nuget_fix_vulnerable_packages` | `solutionDirectory`,`projectPaths`,`includePrerelease` | `solutionDirectory`,`projectPaths`,`includePrerelease` |
+| `task_complete` | (pass-through) | (pass-through) |
 
-| Parameter | Type | Required | Description |
-|-----------|------|:--------:|-------------|
-| `packageName` | string | Yes | NuGet package ID (e.g. `"Newtonsoft.Json"`) |
-| `projectName` | string | ~ | Project name for target-framework resolution |
+### Azure MCP Server tools (confirmed)
 
-### `nuget_get_package_context`
-
-**Channel:** `nuget`
-
-| Parameter | Type | Required | Description |
-|-----------|------|:--------:|-------------|
-| `packageName` | string | Yes | NuGet package ID |
-| `projectName` | string | ~ | Project context for version/dependency resolution |
-
-### `nuget_upgrade_packages_to_latest`
-
-**Channel:** `nuget`
-
-| Parameter | Type | Required | Description |
-|-----------|------|:--------:|-------------|
-| `projectName` | string | ~ | Target project (omit for whole solution) |
+Most: `required: ["intent"]`, `properties: ["intent","command","parameters","learn"]`  
+`subscription_list`,`group_list`: `required: []`, properties: `tenant`,`auth-method`,`retry-*`, etc.  
+`extension_azqr`: `required: []`, properties: `tenant`,`subscription`,`resource-group`, etc.  
+`extension_cli_install`: `required: ["cli-type"]`, properties: `tenant`,`cli-type`, etc.  
+`extension_cli_generate`: `required: ["intent","cli-type"]`
 
 ---
 
@@ -515,6 +541,174 @@ Fetches and parses web content for documentation lookup or API reference.
 **Channel:** `builtin`
 
 No parameters. Signals to the user that all requested work is done.
+
+---
+
+## VS Code Copilot Chat — Tool Schemas
+
+VS Code uses an entirely different tool set from Visual Studio. Schemas captured from live VS Code Copilot sessions.
+
+### File / Workspace
+
+| Tool | Required | Properties |
+|------|:--------:|------------|
+| `read_file` | `filePath`,`startLine`,`endLine` | `filePath`,`startLine`,`endLine` |
+| `list_dir` | `path` | `path` |
+| `create_directory` | `dirPath` | `dirPath` |
+| `create_new_workspace` | `query` | `query` |
+
+### Search
+
+| Tool | Required | Properties |
+|------|:--------:|------------|
+| `semantic_search` | `query` | `query` |
+| `github_text_search` | `scope`,`query` | `scope`,`query`,`maxResults` |
+| `github_repo` | `repo`,`query` | `repo`,`query` |
+
+### Edit / Notebook
+
+| Tool | Required | Properties |
+|------|:--------:|------------|
+| `insert_edit_into_file` | `explanation`,`filePath`,`code` | `explanation`,`filePath`,`code` |
+| `create_new_jupyter_notebook` | `query` | `query` |
+| `edit_notebook_file` | `filePath`,`editType`,`cellId` | `filePath`,`cellId`,`newCode`,`language`,`editType` |
+| `run_notebook_cell` | `filePath`,`cellId` | `filePath`,`reason`,`cellId`,`continueOnError` |
+| `copilot_getNotebookSummary` | `filePath` | `filePath` |
+
+### Terminal
+
+| Tool | Required | Properties |
+|------|:--------:|------------|
+| `run_in_terminal` | `command`,`explanation`,`goal`,`mode` | `command`,`explanation`,`goal`,`mode`,`isBackground`,`timeout` |
+| `send_to_terminal` | `id`,`command` | `id`,`command`,`waitForOutput` |
+| `get_terminal_output` | `id` | `id` |
+| `kill_terminal` | `id` | `id` |
+| `terminal_last_command` | *none* | *none* |
+| `terminal_selection` | *none* | *none* |
+
+### Symbol / Code
+
+| Tool | Required | Properties |
+|------|:--------:|------------|
+| `vscode_listCodeUsages` | `symbol`,`lineContent` | `symbol`,`uri`,`filePath`,`lineContent` |
+| `vscode_renameSymbol` | `symbol`,`newName`,`lineContent` | `symbol`,`newName`,`uri`,`filePath`,`lineContent` |
+| `get_vscode_api` | `query` | `query` |
+
+### Browser / Playwright
+
+| Tool | Required | Properties |
+|------|:--------:|------------|
+| `open_browser_page` | *none* | `url`,`forceNew` |
+| `navigate_page` | `pageId` | `pageId`,`type`,`url` |
+| `read_page` | `pageId` | `pageId` |
+| `click_element` | `pageId`,`element` | `pageId`,`ref`,`selector`,`element`,`dblClick`,`button` |
+| `type_in_page` | `pageId` | `pageId`,`text`,`key`,`ref`,`selector`,`element` |
+| `hover_element` | `pageId`,`element` | `pageId`,`ref`,`selector`,`element` |
+| `drag_element` | `pageId`,`fromElement`,`toElement` | `pageId`,`fromRef`,`fromSelector`,`fromElement`,`toRef`,`toSelector`,`toElement` |
+| `handle_dialog` | `pageId` | `pageId`,`acceptModal`,`promptText`,`selectFiles` |
+| `screenshot_page` | `pageId` | `pageId`,`ref`,`selector`,`element`,`scrollIntoViewIfNeeded` |
+| `run_playwright_code` | `pageId` | `pageId`,`code`,`deferredResultId`,`timeoutMs` |
+
+### Agents / Tasks
+
+| Tool | Required | Properties |
+|------|:--------:|------------|
+| `runSubagent` | `prompt`,`description` | `prompt`,`description`,`agentName`,`model` |
+| `manage_todo_list` | `todoList` | `todoList` |
+| `create_and_run_task` | `task`,`workspaceFolder` | `workspaceFolder`,`task` |
+
+### Memory / State
+
+| Tool | Required | Properties |
+|------|:--------:|------------|
+| `memory` | `command` | `command`,`path`,`file_text`,`old_str`,`new_str`,`insert_line`,`insert_text`,`view_range`,`old_path`,`new_path` |
+| `resolve_memory_file_uri` | `path` | `path` |
+| `session_store_sql` | `description` | `action`,`query`,`force`,`description` |
+
+### Extensions / Misc
+
+| Tool | Required | Properties |
+|------|:--------:|------------|
+| `install_extension` | `id`,`name` | `id`,`name` |
+| `vscode_searchExtensions_internal` | *none* | `category`,`keywords`,`ids` |
+| `run_vscode_command` | `commandId`,`name` | `commandId`,`name`,`args`,`skipCheck` |
+| `vscode_askQuestions` | `questions` | `questions` |
+| `fetch_webpage` | `urls`,`query` | `urls`,`query` |
+| `view_image` | `filePath` | `filePath` |
+| `renderMermaidDiagram` | *none* | `markup`,`title` |
+
+---
+
+## SQL Studio (SSMS) Copilot — Tool Schemas
+
+SQL Server Management Studio uses its own domain-specific tools. All have `required: [], properties: []` — no structured parameter schemas. The AI interacts via natural language.
+
+### Database Introspection
+
+| Tool | Description |
+|------|-------------|
+| `ReadDatabaseConstitution` | Read database configuration / constitution |
+| `GetCopilotConfiguration` | Get current Copilot settings for the session |
+| `SetCopilotConfiguration` | Set Copilot configuration options |
+| `FindRelevantDatabaseObjects` | Find database objects matching a description |
+| `GetDatabaseObjectInformation` | Get detailed metadata about a database object |
+| `GetObjectText` | Get the T-SQL definition text of an object |
+| `GetForeignKeysForSingleTable` | Get FK relationships for a specific table |
+| `GetColumnInfoForListOfTables` | Get column metadata for a list of tables |
+| `GetTableColumnNames` | Get column names for a table |
+
+### Search / Discovery
+
+| Tool | Description |
+|------|-------------|
+| `SearchSchemasForOnePartName` | Search schemas for an object name |
+| `FindColumn` | Find a column by name across the database |
+| `FindColumnReferences` | Find references to a column |
+| `FindColumnsThat` | Find columns matching criteria |
+| `FindForeignKeysThat` | Find foreign keys matching criteria |
+| `FindDatabaseObjectsThat` | Find database objects matching criteria |
+| `FindDatabaseObjectsWith` | Find database objects with specific properties |
+| `GetTablesWith` | Get tables with specific characteristics |
+| `GetTablesThat` | Get tables matching criteria |
+
+### Query Execution / Results
+
+| Tool | Description |
+|------|-------------|
+| `ReadFromDatabase` | Execute a read query against the database |
+| `ValidateGeneratedTSQL` | Validate generated T-SQL for syntax errors |
+| `ExecutePredefinedQuery` | Run a pre-defined query |
+| `LoadPredefinedQuery` | Load a pre-defined query template |
+| `LoadPredefinedReport` | Load a pre-defined report template |
+| `LoadPredefinedKnowledge` | Load pre-defined knowledge base |
+| `GetTextResults` | Get text-format query results (`startPosition`,`maxLength`) |
+| `GetGridResults` | Get grid-format query results (`gridIndex`,`startColumn`,`columnCount`,`startRow`,`maxRows`,`maxCellTextLength`) |
+| `GetMessagesContent` | Get messages/errors from last execution (`startPosition`,`maxLength`) |
+| `GetQueryPlanXml` | Get XML execution plan (`startPosition`,`maxLength`) |
+| `GetClientStatistics` | Get client-side execution statistics |
+
+### Server / Utility
+
+| Tool | Description |
+|------|-------------|
+| `GetCurrentDate` | Get current server date/time |
+| `GetAllSqlServerProperties` | Get all SQL Server instance properties |
+| `GetServerDefaultBackupDirectory` | Get default backup directory path |
+| `GetServerDefaultDatabaseDataFilesDirectory` | Get default data file directory |
+| `GetServerDefaultDatabaseLogFilesDirectory` | Get default log file directory |
+| `ConvertSegmentedLSNToDecimal` | Convert segmented LSN to decimal |
+| `RestoreVerifyBackupFile` | Verify a backup file for restore |
+| `EscapeDatabaseObjectNameForStringLiteral` | Escape object name for string literals |
+| `EscapeDatabaseObjectNameForIdentifier` | Escape object name for identifiers |
+| `ListExtendedEventsGlobalStateFieldsForPredicates` | List XEvent global state fields |
+| `ListExtendedEventsFieldsForAnEvent` | List XEvent fields for an event |
+
+### Hints / Helpers
+
+| Tool | Description |
+|------|-------------|
+| `HINT_HowToFindDisableConstraints` | Hint: how to find/disable constraints |
+| `HINT_HowToFindLargeIndexKeys` | Hint: how to find large index keys |
 
 ---
 

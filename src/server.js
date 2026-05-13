@@ -416,6 +416,22 @@ function _injectProjectUpdate(calls, messages, workspaceRoot) {
   // Reserved for future project file injection
 }
 
+const _schemaSeen = new Set();
+function _dumpToolSchemas(tools) {
+  if (!tools?.length) return;
+  for (const t of tools) {
+    const n = t.function?.name;
+    if (!n || _schemaSeen.has(n)) continue;
+    _schemaSeen.add(n);
+    const summary = JSON.stringify({
+      name: n,
+      required: t.function?.parameters?.required,
+      properties: t.function?.parameters?.properties ? Object.keys(t.function.parameters.properties) : undefined,
+    });
+    log(`\x1b[33m[schema] ${summary}\x1b[0m`);
+  }
+}
+
 function normalizeToolCall(tc) {
   const name = tc.function?.name || "";
   try {
@@ -423,23 +439,302 @@ function normalizeToolCall(tc) {
     const args = JSON.parse(raw);
     const safe = {};
 
-    if (/^(get_file|read_file)$/i.test(name)) {
+    // ── Confirmed VS schemas (VS Insiders 18.7) ──
+    if (/^get_file$/i.test(name)) {
+      // VS: required ["filename","startLine","endLine"]  properties: filename,startLine,endLine,includeLineNumbers
       const fp = (args.filePath ?? args.filename ?? args.path ?? args.uri ?? args.resource ?? "").toString().replace(/\\/g, "/");
       if (fp) safe.filename = fp;
       safe.startLine = (typeof args.startLine === "number" && args.startLine >= 1) ? args.startLine : 1;
-      // endLine required by VS schema; if AI doesn't provide one, read to end of file
+      safe.endLine = (typeof args.endLine === "number" && args.endLine >= safe.startLine) ? args.endLine : 999999;
+      if (typeof args.includeLineNumbers === "boolean") safe.includeLineNumbers = args.includeLineNumbers;
+    } else if (/^read_file$/i.test(name)) {
+      // VSCode: required ["filePath","startLine","endLine"]  properties: filePath,startLine,endLine
+      safe.filePath = String(args.filePath ?? args.filename ?? args.path ?? args.uri ?? "");
+      safe.startLine = (typeof args.startLine === "number" && args.startLine >= 1) ? args.startLine : 1;
       safe.endLine = (typeof args.endLine === "number" && args.endLine >= safe.startLine) ? args.endLine : 999999;
     } else if (/^(grep_search|search_content|search_file)$/i.test(name)) {
-      if (args.query != null) safe.query = String(args.query);
-      else if (args.pattern != null) safe.query = String(args.pattern);
-      else if (args.search != null) safe.query = String(args.search);
-      else if (args.searchTerm != null) safe.query = String(args.searchTerm);
+      // required: ["query","isRegexp","includePattern","maxResults"]  properties: query,isRegexp,includePattern,maxResults
+      safe.query = String(args.query ?? args.pattern ?? args.search ?? args.searchTerm ?? "");
       safe.isRegexp = (typeof args.isRegexp === "boolean") ? args.isRegexp : (typeof args.regex === "boolean" ? args.regex : false);
-      if (args.includePattern != null) safe.includePattern = String(args.includePattern);
-      else if (args.include != null) safe.includePattern = String(args.include);
-      else if (args.fileTypes != null) safe.includePattern = String(args.fileTypes);
-      else if (args.glob != null) safe.includePattern = String(args.glob);
+      safe.includePattern = args.includePattern ?? args.include ?? args.fileTypes ?? args.glob ?? null;
+      if (safe.includePattern !== null) safe.includePattern = String(safe.includePattern);
       safe.maxResults = (typeof args.maxResults === "number" && args.maxResults >= 1) ? args.maxResults : 20;
+    } else if (/^replace_string_in_file$/i.test(name)) {
+      // required: ["filePath","oldString","newString"]  properties: filePath,oldString,newString
+      safe.filePath = String(args.filePath ?? args.path ?? args.filename ?? "");
+      safe.oldString = String(args.oldString ?? args.old_str ?? args.search ?? args.old_text ?? "");
+      safe.newString = String(args.newString ?? args.new_str ?? args.replace ?? args.new_text ?? "");
+    } else if (/^multi_replace_string_in_file$/i.test(name)) {
+      // required: ["replacements","explanation"]  properties: replacements,explanation
+      const list = args.replacements ?? args.edits ?? args.changes ?? args.patches ?? args.operations ?? args.diffs;
+      if (Array.isArray(list)) {
+        safe.replacements = list.map(r => {
+          const e = {};
+          e.filePath = String(r.filePath ?? r.filepath ?? r.path ?? r.filename ?? "");
+          e.oldString = String(r.oldString ?? r.old_str ?? r.search ?? r.old_text ?? r.find ?? r.from ?? "");
+          e.newString = String(r.newString ?? r.new_str ?? r.replace ?? r.new_text ?? r.to ?? "");
+          return e;
+        });
+      } else {
+        const so = String(args.oldString ?? args.old_str ?? args.search ?? args.old_text ?? "");
+        const sn = String(args.newString ?? args.new_str ?? args.replace ?? args.new_text ?? "");
+        if (so || sn) safe.replacements = [{ filePath: "", oldString: so, newString: sn }];
+      }
+      safe.explanation = String(args.explanation ?? "");
+    } else if (/^create_file$/i.test(name)) {
+      // required: ["filePath","content"]  properties: filePath,content
+      safe.filePath = String(args.filePath ?? args.path ?? args.filename ?? "");
+      safe.content = String(args.content ?? args.contents ?? args.text ?? args.code ?? "");
+    } else if (/^remove_file|delete_file(s)?$/i.test(name)) {
+      // required: ["filePath"]  properties: filePath
+      safe.filePath = String(args.filePath ?? args.path ?? args.filename ?? "");
+    } else if (/^run_command_in_terminal|execute_command$/i.test(name)) {
+      // required: ["command","summary","background"]  properties: command,summary,background
+      safe.command = String(args.command ?? args.cmd ?? "");
+      safe.summary = String(args.summary ?? args.description ?? "");
+      safe.background = (typeof args.background === "boolean") ? args.background : (typeof args.runInBackground === "boolean" ? args.runInBackground : false);
+      if (args.cwd != null) safe.cwd = String(args.cwd);
+      if (typeof args.timeout === "number") safe.timeout = args.timeout;
+    } else if (/^get_background_terminal_output$/i.test(name)) {
+      // required: ["terminal_id","headLines","tailLines","stop","waitMs"]  properties: terminal_id,headLines,tailLines,stop,waitMs
+      safe.terminal_id = String(args.terminal_id ?? args.terminalId ?? args.terminal ?? "");
+      safe.headLines = (typeof args.headLines === "number") ? args.headLines : 0;
+      safe.tailLines = (typeof args.tailLines === "number") ? args.tailLines : 0;
+      safe.stop = (typeof args.stop === "boolean") ? args.stop : false;
+      safe.waitMs = (typeof args.waitMs === "number") ? args.waitMs : (typeof args.timeout === "number" ? args.timeout : 0);
+    } else if (/^(code_search|search_code|semantic_search)$/i.test(name)) {
+      // required: ["searchQueries"]  properties: searchQueries
+      safe.searchQueries = args.searchQueries ?? args.queries ?? args.query ?? args.search ?? [];
+      if (!Array.isArray(safe.searchQueries)) safe.searchQueries = [String(safe.searchQueries ?? "")];
+    } else if (/^(file_search|search_files|find_files|glob_search|list_files)$/i.test(name)) {
+      // required: ["queries","maxResults"]  properties: queries,maxResults
+      safe.queries = args.queries ?? args.query ?? args.pattern ?? [];
+      if (!Array.isArray(safe.queries)) safe.queries = [String(safe.queries ?? "")];
+      safe.maxResults = (typeof args.maxResults === "number" && args.maxResults >= 1) ? args.maxResults : 20;
+    } else if (/^(get_files_in_project|list_project_files|get_project_files|list_files_in_project)$/i.test(name)) {
+      // required: ["projectPath"]  properties: projectPath
+      safe.projectPath = String(args.projectPath ?? args.projectName ?? args.project ?? args.name ?? args.project_name ?? "");
+    } else if (/^(get_projects_in_solution)$/i.test(name)) {
+      // required: []  properties: []
+      // no-op — just return the safe empty object
+    } else if (/^(run_build|build)$/i.test(name)) {
+      // required: []  properties: []
+      // no-op
+    } else if (/^(run_tests|execute_tests)$/i.test(name)) {
+      // required: ["filterTypes","filterValues"]  properties: filterTypes,filterValues
+      safe.filterTypes = args.filterTypes ?? args.filter_types ?? [];
+      if (!Array.isArray(safe.filterTypes)) safe.filterTypes = [String(safe.filterTypes ?? "")];
+      safe.filterValues = args.filterValues ?? args.filter_values ?? args.testName ?? args.test ?? [];
+      if (!Array.isArray(safe.filterValues)) safe.filterValues = [String(safe.filterValues ?? "")];
+      if (args.framework != null) safe.framework = String(args.framework);
+    } else if (/^(get_tests|list_tests|discover_tests)$/i.test(name)) {
+      // required: ["filterTypes","filterValues"]  properties: filterTypes,filterValues
+      safe.filterTypes = args.filterTypes ?? args.filter_types ?? [];
+      if (!Array.isArray(safe.filterTypes)) safe.filterTypes = [String(safe.filterTypes ?? "")];
+      safe.filterValues = args.filterValues ?? args.filter_values ?? args.filePath ?? args.projectName ?? [];
+      if (!Array.isArray(safe.filterValues)) safe.filterValues = [String(safe.filterValues ?? "")];
+    } else if (/^(get_errors|list_errors|get_diagnostics)$/i.test(name)) {
+      // required: ["filePaths"]  properties: filePaths
+      safe.filePaths = args.filePaths ?? args.filePath ?? [];
+      if (!Array.isArray(safe.filePaths)) safe.filePaths = [String(safe.filePaths ?? "")];
+    } else if (/^get_output_window_logs$/i.test(name)) {
+      // required: ["paneId"]  properties: paneId
+      safe.paneId = String(args.paneId ?? args.outputPane ?? args.pane ?? "");
+    } else if (/^get_web_pages$/i.test(name)) {
+      // required: ["urls"]  properties: urls
+      safe.urls = args.urls ?? args.url ?? [];
+      if (!Array.isArray(safe.urls)) safe.urls = [String(safe.urls ?? "")];
+    } else if (/^(find_symbol|search_symbol)$/i.test(name)) {
+      // required: ["navigationType","filepath","symbolName","lineText"]  properties: navigationType,filepath,symbolName,lineText
+      safe.navigationType = String(args.navigationType ?? args.navType ?? "findReferences");
+      safe.filepath = String(args.filepath ?? args.filePath ?? args.filename ?? "");
+      safe.symbolName = String(args.symbolName ?? args.symbol ?? args.query ?? args.name ?? "");
+      safe.lineText = String(args.lineText ?? args.line ?? args.text ?? "");
+    } else if (/^nuget_get_latest_package_version$/i.test(name)) {
+      // required: ["solutionDirectory","packageName","includePrerelease"]  properties: solutionDirectory,packageName,includePrerelease
+      safe.solutionDirectory = String(args.solutionDirectory ?? args.solution ?? "");
+      safe.packageName = String(args.packageName ?? args.package ?? args.name ?? args.id ?? "");
+      safe.includePrerelease = (typeof args.includePrerelease === "boolean") ? args.includePrerelease : false;
+    } else if (/^nuget_get_package_context$/i.test(name)) {
+      // required: ["solutionDirectory","packageName","packageVersion"]  properties: solutionDirectory,packageName,packageVersion
+      safe.solutionDirectory = String(args.solutionDirectory ?? args.solution ?? "");
+      safe.packageName = String(args.packageName ?? args.package ?? args.name ?? args.id ?? "");
+      safe.packageVersion = String(args.packageVersion ?? args.version ?? "");
+    } else if (/^nuget_upgrade_packages_to_latest$/i.test(name)) {
+      // required: ["solutionDirectory","projectPaths","includeVulnerable","includePrerelease"]
+      safe.solutionDirectory = String(args.solutionDirectory ?? args.solution ?? "");
+      safe.projectPaths = args.projectPaths ?? args.projectPath ?? args.projectName ?? [];
+      if (!Array.isArray(safe.projectPaths)) safe.projectPaths = [String(safe.projectPaths ?? "")];
+      safe.includeVulnerable = (typeof args.includeVulnerable === "boolean") ? args.includeVulnerable : false;
+      safe.includePrerelease = (typeof args.includePrerelease === "boolean") ? args.includePrerelease : false;
+    } else if (/^nuget_fix_vulnerable_packages$/i.test(name)) {
+      // required: ["solutionDirectory","projectPaths","includePrerelease"]
+      safe.solutionDirectory = String(args.solutionDirectory ?? args.solution ?? "");
+      safe.projectPaths = args.projectPaths ?? args.projectPath ?? args.projectName ?? [];
+      if (!Array.isArray(safe.projectPaths)) safe.projectPaths = [String(safe.projectPaths ?? "")];
+      safe.includePrerelease = (typeof args.includePrerelease === "boolean") ? args.includePrerelease : false;
+    } else if (/^(plan)$/i.test(name)) {
+      // required: ["planMarkdown"]  properties: planMarkdown
+      safe.planMarkdown = String(args.planMarkdown ?? args.task ?? args.plan ?? "");
+    } else if (/^(adapt_plan)$/i.test(name)) {
+      // required: ["observation"]  properties: observation
+      safe.observation = String(args.observation ?? args.changes ?? args.note ?? "");
+    } else if (/^(update_plan_progress)$/i.test(name)) {
+      // required: ["stepId","status","message","autoAdvance"]  properties: stepId,status,message,autoAdvance
+      safe.stepId = String(args.stepId ?? args.step ?? "");
+      safe.status = String(args.status ?? "in_progress");
+      safe.message = String(args.message ?? "");
+      safe.autoAdvance = (typeof args.autoAdvance === "boolean") ? args.autoAdvance : true;
+    } else if (/^(record_observation)$/i.test(name)) {
+      // required: ["observation"]  properties: observation
+      safe.observation = String(args.observation ?? args.note ?? args.finding ?? "");
+    } else if (/^(finish_plan)$/i.test(name)) {
+      // required: []  properties: []
+      // no-op
+    } else if (/^(signal_plan_ready)$/i.test(name)) {
+      // required: ["planTitle"]  properties: planTitle
+      safe.planTitle = String(args.planTitle ?? args.title ?? args.name ?? "");
+    } else if (/^(clarify_requirements)$/i.test(name)) {
+      // required: ["questions"]  properties: questions
+      safe.questions = args.questions ?? args.question ?? [];
+      if (!Array.isArray(safe.questions)) safe.questions = [String(safe.questions ?? "")];
+    } else if (/^(detect_memories)$/i.test(name)) {
+      // required: ["memory","confidence"]  properties: memory,confidence
+      safe.memory = String(args.memory ?? args.query ?? args.text ?? "");
+      safe.confidence = (typeof args.confidence === "number") ? args.confidence : 0.5;
+    } else if (/^(profiler_agent)$/i.test(name)) {
+      // required: ["reason"]  properties: reason
+      safe.reason = String(args.reason ?? args.prompt ?? args.query ?? args.question ?? "");
+    } else if (/^(start_modernization)$/i.test(name)) {
+      // required: []  properties: []
+      // no-op
+    } else if (/^(query_azure_resource_graph)$/i.test(name)) {
+      // required: ["prompt"]  properties: prompt
+      safe.prompt = String(args.prompt ?? args.query ?? "");
+    } else if (/^(run_subagent)$/i.test(name)) {
+      // required: ["prompt","description","agentName"]  properties: prompt,description,agentName
+      safe.prompt = String(args.prompt ?? args.task ?? "");
+      safe.description = String(args.description ?? args.desc ?? "");
+      safe.agentName = String(args.agentName ?? args.agent ?? args.name ?? "");
+    } else if (/^(search_agent)$/i.test(name)) {
+      // required: ["query","description","details"]  properties: query,description,details
+      safe.query = String(args.query ?? args.search ?? "");
+      safe.description = String(args.description ?? args.desc ?? "");
+      safe.details = String(args.details ?? args.info ?? "");
+    } else if (/^Azure_MCP_Server_/i.test(name)) {
+      if (args.intent != null) safe.intent = String(args.intent);
+      if (args.command != null) safe.command = String(args.command);
+      if (args.parameters != null) safe.parameters = args.parameters;
+      if (args.learn != null) safe.learn = String(args.learn);
+      if (args.tenant != null) safe.tenant = String(args.tenant);
+      if (args.subscription != null) safe.subscription = String(args.subscription);
+      if (args["resource-group"] != null) safe["resource-group"] = String(args["resource-group"]);
+      if (args["cli-type"] != null) safe["cli-type"] = String(args["cli-type"]);
+      if (args["auth-method"] != null) safe["auth-method"] = String(args["auth-method"]);
+      if (args["retry-delay"] != null) safe["retry-delay"] = String(args["retry-delay"]);
+      if (args["retry-max-delay"] != null) safe["retry-max-delay"] = String(args["retry-max-delay"]);
+      if (typeof args["retry-max-retries"] === "number") safe["retry-max-retries"] = args["retry-max-retries"];
+      if (args["retry-mode"] != null) safe["retry-mode"] = String(args["retry-mode"]);
+      if (args["retry-network-timeout"] != null) safe["retry-network-timeout"] = String(args["retry-network-timeout"]);
+    // ── VSCode Copilot tools ──
+    } else if (/^list_dir$/i.test(name)) {
+      // required: ["path"]  properties: path
+      safe.path = String(args.path ?? args.dirPath ?? "");
+    } else if (/^create_directory$/i.test(name)) {
+      // required: ["dirPath"]  properties: dirPath
+      safe.dirPath = String(args.dirPath ?? args.path ?? "");
+    } else if (/^insert_edit_into_file$/i.test(name)) {
+      // required: ["explanation","filePath","code"]  properties: explanation,filePath,code
+      safe.explanation = String(args.explanation ?? "");
+      safe.filePath = String(args.filePath ?? args.path ?? args.filename ?? "");
+      safe.code = String(args.code ?? args.content ?? args.text ?? "");
+    } else if (/^(run_in_terminal|send_to_terminal)$/i.test(name)) {
+      // run_in_terminal: required ["command","explanation","goal","mode"]  send_to_terminal: required ["id","command"]
+      safe.command = String(args.command ?? args.cmd ?? "");
+      if (args.id != null) safe.id = String(args.id);
+      if (args.explanation != null) safe.explanation = String(args.explanation);
+      if (args.goal != null) safe.goal = String(args.goal);
+      if (args.mode != null) safe.mode = String(args.mode);
+      if (typeof args.isBackground === "boolean") safe.isBackground = args.isBackground;
+      if (typeof args.timeout === "number") safe.timeout = args.timeout;
+      if (typeof args.waitForOutput === "boolean") safe.waitForOutput = args.waitForOutput;
+    } else if (/^get_terminal_output$/i.test(name)) {
+      // required: ["id"]  properties: id
+      safe.id = String(args.id ?? args.terminal_id ?? "");
+    } else if (/^kill_terminal$/i.test(name)) {
+      // required: ["id"]  properties: id
+      safe.id = String(args.id ?? args.terminal_id ?? "");
+    } else if (/^semantic_search$/i.test(name)) {
+      // required: ["query"]  properties: query
+      safe.query = String(args.query ?? args.search ?? "");
+    } else if (/^fetch_webpage$/i.test(name)) {
+      // required: ["urls","query"]  properties: urls,query
+      safe.urls = args.urls ?? args.url ?? [];
+      if (!Array.isArray(safe.urls)) safe.urls = [String(safe.urls ?? "")];
+      safe.query = String(args.query ?? "");
+    } else if (/^runSubagent$/i.test(name)) {
+      // required: ["prompt","description"]  properties: prompt,description,agentName,model
+      safe.prompt = String(args.prompt ?? args.task ?? "");
+      safe.description = String(args.description ?? args.desc ?? "");
+      if (args.agentName != null) safe.agentName = String(args.agentName);
+      if (args.model != null) safe.model = String(args.model);
+    } else if (/^manage_todo_list$/i.test(name)) {
+      // required: ["todoList"]  properties: todoList
+      safe.todoList = args.todoList ?? args.todos ?? [];
+      if (!Array.isArray(safe.todoList)) safe.todoList = [safe.todoList];
+    } else if (/^memory$/i.test(name)) {
+      // required: ["command"]  properties: command,path,file_text,old_str,new_str,...
+      safe.command = String(args.command ?? "");
+      if (args.path != null) safe.path = String(args.path);
+      if (args.file_text != null) safe.file_text = String(args.file_text);
+      if (args.old_str != null) safe.old_str = String(args.old_str);
+      if (args.new_str != null) safe.new_str = String(args.new_str);
+      if (typeof args.insert_line === "number") safe.insert_line = args.insert_line;
+      if (args.insert_text != null) safe.insert_text = String(args.insert_text);
+      if (args.view_range != null) safe.view_range = args.view_range;
+      if (args.old_path != null) safe.old_path = String(args.old_path);
+      if (args.new_path != null) safe.new_path = String(args.new_path);
+    } else if (/^vscode_listCodeUsages$/i.test(name)) {
+      // required: ["symbol","lineContent"]  properties: symbol,uri,filePath,lineContent
+      safe.symbol = String(args.symbol ?? args.symbolName ?? args.query ?? "");
+      safe.lineContent = String(args.lineContent ?? args.line ?? "");
+      if (args.filePath != null) safe.filePath = String(args.filePath);
+      if (args.uri != null) safe.uri = String(args.uri);
+    } else if (/^vscode_renameSymbol$/i.test(name)) {
+      // required: ["symbol","newName","lineContent"]  properties: symbol,newName,uri,filePath,lineContent
+      safe.symbol = String(args.symbol ?? "");
+      safe.newName = String(args.newName ?? args.new_name ?? "");
+      safe.lineContent = String(args.lineContent ?? args.line ?? "");
+      if (args.filePath != null) safe.filePath = String(args.filePath);
+      if (args.uri != null) safe.uri = String(args.uri);
+    } else if (/^vscode_askQuestions$/i.test(name)) {
+      // required: ["questions"]  properties: questions
+      safe.questions = args.questions ?? args.question ?? [];
+      if (!Array.isArray(safe.questions)) safe.questions = [String(safe.questions ?? "")];
+    } else if (/^run_vscode_command$/i.test(name)) {
+      // required: ["commandId","name"]  properties: commandId,name,args,skipCheck
+      safe.commandId = String(args.commandId ?? args.command ?? "");
+      safe.name = String(args.name ?? "");
+      if (args.args != null) safe.args = args.args;
+      if (typeof args.skipCheck === "boolean") safe.skipCheck = args.skipCheck;
+    } else if (/^(create_and_run_task)$/i.test(name)) {
+      // required: ["task","workspaceFolder"]  properties: workspaceFolder,task
+      safe.task = String(args.task ?? "");
+      safe.workspaceFolder = String(args.workspaceFolder ?? args.workspace ?? "");
+    } else if (/^github_text_search$/i.test(name)) {
+      // required: ["scope","query"]  properties: scope,query,maxResults
+      safe.scope = String(args.scope ?? "repo");
+      safe.query = String(args.query ?? args.search ?? "");
+      if (typeof args.maxResults === "number") safe.maxResults = args.maxResults;
+    } else if (/^github_repo$/i.test(name)) {
+      // required: ["repo","query"]  properties: repo,query
+      safe.repo = String(args.repo ?? "");
+      safe.query = String(args.query ?? "");
+    } else if (/^(open_browser_page|read_page|navigate_page|click_element|type_in_page|hover_element|drag_element|handle_dialog|screenshot_page|run_playwright_code)$/i.test(name)) {
+      // VSCode browser/Playwright tools — pass all known params through
+      for (const [k, v] of Object.entries(args)) {
+        if (v != null) safe[k] = v;
+      }
     } else {
       return tc;
     }
@@ -533,6 +828,8 @@ app.use("*", async (c, next) => {
   await next();
   _forceClient = null;
 });
+
+
 
 // ── GET endpoints ──
 
@@ -1066,6 +1363,7 @@ app.post("/v1/chat/completions", async c => {
   }
   const streamMode = (vs2026 || vsInsiders || (clientTag && clientTag !== "vscode" && /^vs/.test(clientTag))) ? false : clientWantsStream;
   const vsTools = body.tools;
+  _dumpToolSchemas(vsTools);
   const startTime = Date.now();
   const chatId = `chatcmpl-${startTime}`;
   const created = ~~(startTime / 1000);
@@ -1710,6 +2008,7 @@ app.post("/api/chat", async c => {
       const model = mapModel(body.model);
       const apiThinking = parseThinkingMode(body.model).thinking;
   const vsTools = body.tools;
+  _dumpToolSchemas(vsTools);
 
       // Build messages with tool info in system prompt
       let systemMsg = "";
@@ -1912,13 +2211,17 @@ async function handlePassthrough(c) {
   }
 }
 
-// ── Catch-all ──
+// ── Catch-all for unknown routes — log to discover unmapped Copilot endpoints ──
 
 app.all("*", c => {
   const url = new URL(c.req.url);
   if (isPassthroughPath(url.pathname)) {
     return handlePassthrough(c);
   }
+  if (url.pathname === "/api/generate") return c.json({ error: `Not found: ${c.req.method} ${c.req.url}` }, 404);
+  const ua = c.req.header("User-Agent") || "";
+  const bag = c.req.header("baggage") || "";
+  log(`\x1b[33m[404]\x1b[0m ${c.req.method} ${c.req.path}  UA=${ua.slice(0, 50)}  bag=${bag.slice(0, 50)}`);
   return c.json({ error: `Not found: ${c.req.method} ${c.req.url}` }, 404);
 });
 

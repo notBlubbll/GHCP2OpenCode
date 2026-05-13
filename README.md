@@ -181,6 +181,21 @@ Models appear in VS Code's Copilot list as `[FREE] Model Name`, `[GO] Model Name
 
 **Paid** (requires Go API key): fetched dynamically from OpenCode — all support tool calling
 
+### Thinking Modes
+
+Some models support adjustable thinking effort. These appear in the model list both as a **default entry** (no thinking mode applied) and as separate tagged entries per thinking level:
+
+| Tag | Meaning |
+|-----|---------|
+| ` [LOW]` | Low reasoning effort |
+| ` [MED]` | Medium reasoning effort |
+| ` [HIGH]` | High reasoning effort |
+| ` [MAX]` | Maximum reasoning effort |
+
+Models that think on their own (GLM, Kimi, MiniMax, Qwen) appear without tags — their thinking is handled internally and can't be controlled.
+
+> This thinking-mode tagging on the model name will be replaced with native thinking controls once Visual Studio adds proper support for it.
+
 **M365 Copilot** (optional, requires `M365CO_PORT`): your company's Microsoft 365 Copilot chat — two models (Quick + Think), chat-only, no tools
 
 ---

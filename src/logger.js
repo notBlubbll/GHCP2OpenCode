@@ -12,18 +12,19 @@ function error(msg) {
   process.stderr.write(`\x1b[90m${ts()}\x1b[0m \x1b[31m${msg}\x1b[0m\n`);
 }
 
-function reqLog({ tag, provider, model, preview, elapsed }) {
+function reqLog({ tag, provider, model, preview, thinking, elapsed }) {
   const tsPart = `\x1b[90m${ts()}\x1b[0m`;
   const tagPart = tag ? `[${tag}]>` : "";
+  const thinkPart = thinking ? `[\x1b[36m${thinking}\x1b[0m]` : "";
   const provModel = `[${provider}/${model || "?"}]`;
-  const trail = preview ? `—${JSON.stringify(preview)}` : "";
-  process.stdout.write(`${tsPart} ${tagPart}${provModel}${trail}— … `);
+  const trail = preview ? ` — ${JSON.stringify(preview)}` : "";
+  process.stdout.write(`${tsPart} ${tagPart}${thinkPart}${provModel}${trail}— … `);
   if (elapsed != null) {
-    process.stdout.write(`\x1b[32m->\x1b[0m [${elapsed}ms]\n`);
+    process.stdout.write(`\x1b[32m→\x1b[0m [${elapsed}ms]\n`);
     return;
   }
   return (elapsed) => {
-    process.stdout.write(`\x1b[32m->\x1b[0m [${elapsed}ms]\n`);
+    process.stdout.write(`\x1b[32m→\x1b[0m [${elapsed}ms]\n`);
   };
 }
 

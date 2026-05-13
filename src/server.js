@@ -43,7 +43,7 @@ import { Hono } from "hono";
 import { stream } from "hono/streaming";
 import { cors } from "hono/cors";
 import { compress } from "hono/compress";
-import { config, getModels, initModels, resolveModel, resolveModelMetadata, isKnownModel, chatCompletion, APIError, isSeparator, isFreeTierModel, isPollModel, isM365Model, SEP_PAID, SEP_FREE, SEP_FREE_P, SEP_M365, refreshModels, validateFreeModels, bgFetchDone, getKeyStatus, fetchWithAgent } from "./opencode-client.js";
+import { config, getModels, initModels, resolveModel, resolveModelMetadata, isKnownModel, chatCompletion, APIError, isSeparator, isFreeTierModel, isPollModel, isM365Model, SEP_PAID, SEP_FREE, SEP_FREE_P, SEP_M365, refreshModels, validateFreeModels, bgFetchDone, getKeyStatus, fetchWithAgent, getThinkingModes, parseThinkingMode } from "./opencode-client.js";
 import { check as cacheCheck, store as cacheStore, cacheKey } from "./cache.js";
 import { ModelConcurrencyManager, RateLimitError, truncateToolMessagesInPayload, checkRequestBodySize } from "./concurrency.js";
 import { compactIdentity, compactToolInstructions, compactOllamaToolInstructions, compactCodeCompletionPrompt, compressMessages } from "./token-optimizer.js";
@@ -195,25 +195,42 @@ const oaiResp = (content, tool_calls, finish_reason, model, usage) => {
   };
 };
 
+let _forceClient = null; // debug: ?src=vscode|vs|vsi|sql
+let _detectedClient = null; // resolved client for logging
+
 const isVSCode = (c) => {
+  if (_forceClient) return _forceClient === "vscode";
   const ua = c.req.header("User-Agent") || "";
   return /GitHubCopilotChat\//i.test(ua);
 };
 
 const isVS2026 = (c) => {
+  if (_forceClient) return _forceClient === "vs";
   const baggage = c.req.header("baggage") || "";
   return /vs\.copilot\./i.test(baggage);
 };
 
 const isVSInsiders = (c) => {
+  if (_forceClient) return _forceClient === "vsi";
   const baggage = c.req.header("baggage") || "";
   return /VirtualAgentModeResponder/i.test(baggage);
 };
 
 const isSqlStudio = (c) => {
+  if (_forceClient) return _forceClient === "sql";
   const baggage = c.req.header("baggage") || "";
   return /SSMSAgent/i.test(baggage);
 };
+
+function resolveClient(c) {
+  const envClient = Bun.env.DEFAULT_CLIENT || "";
+  if (envClient && ["vscode","vs","vsi","sql"].includes(envClient)) return envClient;
+  if (isVSCode(c)) return "vscode";
+  if (isVSInsiders(c)) return "vsi";
+  if (isVS2026(c)) return "vs";
+  if (isSqlStudio(c)) return "sql";
+  return Bun.env.DEFAULT_CLIENT || "vscode"; // fallback or env default
+}
 
 // ── Parameter normalization (camelCase → snake_case) ──
 function normalizeOpenAIParams(body) {
@@ -332,7 +349,8 @@ function _getReasoning(msg, model) {
 const MODEL_MAP = {};
 
 function mapModel(name) {
-  let clean = (name || "").split(":")[0].trim();
+  const parsed = parseThinkingMode(name);
+  let clean = parsed.model.replace(":latest", "").split(":")[0].trim();
   clean = clean.replace(/^\s*\[(?:FREE_P|FREE|GO|M365|m365)\]\s*/i, "").trim();
   const mapped = MODEL_MAP[clean] || MODEL_MAP[clean.toLowerCase()];
   if (mapped) return mapped;
@@ -445,6 +463,17 @@ function extractToolCalls(text, workspaceRoot = "", messages = []) {
   return { content: remaining.replace(/\n{3,}/g, "\n\n").trim(), toolCalls: calls };
 }
 
+// ── Debug client override (?src=vscode|vs|vsi|sql) ──
+app.use("*", async (c, next) => {
+  const src = c.req.query("src");
+  if (src && ["vscode", "vs", "vsi", "sql"].includes(src)) {
+    _forceClient = src;
+    log(`\x1b[35m[debug]\x1b[0m src=${src}`);
+  }
+  await next();
+  _forceClient = null;
+});
+
 // ── GET endpoints ──
 
 app.get("/", c => c.json({ service: "gc2oc", status: "running" }));
@@ -455,7 +484,12 @@ app.get("/health", async c => {
     const real = models.filter(m => !isSeparator(m.model));
     const free = real.filter(m => isFreeTierModel(m.model));
     const paid = real.filter(m => !isFreeTierModel(m.model));
-    const modelNames = real.map(m => m.name).sort();
+    const modelNames = real.flatMap(m => {
+      const rawId = (m.model || "").replace(":latest", "").split(":")[0].trim();
+      const modes = getThinkingModes(rawId);
+      if (modes.length > 0) return [m.name, ...modes.map(mode => `${m.name} [${mode}]`)];
+      return [m.name];
+    }).sort();
 
     let status = "healthy";
     let reason = null;
@@ -536,31 +570,72 @@ async function handleTags(c) {
     const metadata = resolveModelMetadata(rawId);
     const caps = metadata.capabilities || [];
     const ctxLen = metadata.context_length || config.defaultContextLength;
-    models.push({
-      name: vsc ? prefix + m.name : m.name,
-      model: vsc ? id : m.model,
-      modified_at: now,
-      size: m.size || 0,
-      digest: m.digest || rawId,
-      maxParams: m.maxParams || 0,
-      capabilities: caps,
-      context_length: ctxLen,
-      max_output_tokens: 4096,
-      pricing: isM365 ? "m365" : (isPoll ? "free_poll" : (isFree ? "free" : "premium")),
-      details: {
-        parent_model: m.details?.parent_model || "",
-        format: m.details?.format || "gguf",
-        ...(sep ? {} : { family: family }),
-        ...(sep ? {} : { families: m.details?.families || [family] }),
-        parameter_size: sep ? "" : (m.details?.parameter_size || ""),
-        quantization_level: m.details?.quantization_level || "F16",
-      },
-    });
+    const thinkingModes = sep ? [] : getThinkingModes(rawId);
+
+    function thin(name) {
+      if (vsc) return name;
+      return name.length > 20 ? name.replace(/ /g, "\u2009") : name;
+    }
+
+    const SHORT_TAG = { LOW: "LO", MEDIUM: "MD", HIGH: "HI", MAXIMUM: "MX", XHIGH: "X" };
+
+    function vsTag(baseName, mode) {
+      if (vsc) return ` [${mode}]`;
+      const full = ` [${mode}]`;
+      if ((baseName + full).length <= 20) return full;
+      const short = SHORT_TAG[mode];
+      if (short) return ` [${short}]`;
+      return full;
+    }
+
+    const VSC_TAG = { LOW: "/1_(low)", MEDIUM: "/2_(medium)", HIGH: "/3_high", MAXIMUM: "/4_(maximum)", XHIGH: "/4_(xhigh)" };
+
+    function pushModel(name, modelTag, digestSuffix, parentModel) {
+      const displayFamily = family + (modelTag || "");
+      models.push({
+        name: thin(name),
+        model: `${vsc ? id + modelTag : m.model + modelTag}`,
+        modified_at: now,
+        size: m.size || 0,
+        digest: m.digest ? `${m.digest}${digestSuffix}` : `${rawId}${digestSuffix}`,
+        maxParams: m.maxParams || 0,
+        capabilities: caps,
+        context_length: ctxLen,
+        max_output_tokens: 4096,
+        pricing: isM365 ? "m365" : (isPoll ? "free_poll" : (isFree ? "free" : "premium")),
+        details: {
+          parent_model: parentModel || (m.details?.parent_model || ""),
+          format: m.details?.format || "gguf",
+          ...(sep ? {} : { family: displayFamily }),
+          ...(sep ? {} : { families: [displayFamily] }),
+          parameter_size: sep ? "" : (m.details?.parameter_size || ""),
+          quantization_level: m.details?.quantization_level || "F16",
+        },
+      });
+    }
+
+    if (thinkingModes.length > 0) {
+      const baseName = vsc ? prefix + m.name : m.name;
+      pushModel(baseName, "", "", "");
+      for (const mode of thinkingModes) {
+        const tag = vsTag(baseName, mode);
+        pushModel(
+          `${baseName}${tag}`,
+          vsc ? (VSC_TAG[mode] || `/${mode.toLowerCase()}`) : ` [${mode}]`,
+          `-${mode.toLowerCase()}`,
+          baseName,
+        );
+      }
+    } else {
+      pushModel(vsc ? prefix + m.name : m.name, "", "", "");
+    }
   }
 
   const realCount = models.filter(m => !isSeparator(m.model)).length;
   const divCount = models.length - realCount;
-  log(`/api/tags → ${realCount} models${divCount > 0 ? ` (+${divCount} dividers)` : ""}`);
+  const clientTag = _forceClient || (isVSCode(c) ? "vscode" : isVS2026(c) ? "vs" : "generic");
+  const srcTag = `[\x1b[35m${clientTag}\x1b[0m] `;
+  log(`${srcTag}/api/tags → ${realCount} models${divCount > 0 ? ` (+${divCount} dividers)` : ""}`);
   return c.json({ models });
 }
 
@@ -568,7 +643,12 @@ app.get("/api/version", c => c.json({ version: "420.96.00" }));
 
 app.get("/version", async c => {
   const models = await getModels();
-  const real = models.filter(m => !isSeparator(m.model)).map(m => m.name).sort();
+  const real = models.filter(m => !isSeparator(m.model)).flatMap(m => {
+    const rawId = (m.model || "").replace(":latest", "").split(":")[0].trim();
+    const modes = isSeparator(m.model) ? [] : getThinkingModes(rawId);
+    if (modes.length > 0) return [m.name, ...modes.map(mode => `${m.name} [${mode}]`)];
+    return [m.name];
+  }).sort();
   return c.json({
     proxy_version: "420.96.00",
     ollama_compatibility: "0.6.4",
@@ -579,29 +659,40 @@ app.get("/version", async c => {
 
 let _lastRefresh = 0;
 app.get("/api/ps", async c => {
+  const vsc = isVSCode(c);
   const allModels = await getModels();
   const real = allModels.filter(m => !isSeparator(m.model));
-  const models = real.map(m => {
+  const models = [];
+  for (const m of real) {
     const rawId = m.model.replace(":latest", "").split(":")[0].trim();
     const metadata = resolveModelMetadata(rawId);
-    return {
-      name: m.name,
-      model: m.model.replace(":latest", ""),
-      size: metadata.size || 0,
-      digest: m.digest || rawId,
-      details: {
-        parent_model: "",
-        format: "gguf",
-        family: metadata.family,
-        families: [metadata.family],
-        parameter_size: metadata.parameter_size,
-        quantization_level: metadata.quantization_level || "F16",
-      },
-      expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
-      size_vram: metadata.size_vram || 0,
-      context_length: metadata.context_length,
-    };
-  });
+    const thinkingModes = getThinkingModes(rawId);
+    function psPush(name, suffix) {
+      models.push({
+        name: name + suffix,
+        model: (m.model.replace(":latest", "") + suffix) || rawId,
+        size: metadata.size || 0,
+        digest: (m.digest || rawId) + (suffix ? suffix.toLowerCase() : ""),
+        details: {
+          parent_model: suffix ? name : "",
+          format: "gguf",
+          family: metadata.family + suffix,
+          families: [(metadata.family + suffix)],
+          parameter_size: metadata.parameter_size,
+          quantization_level: metadata.quantization_level || "F16",
+        },
+        expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        size_vram: metadata.size_vram || 0,
+        context_length: metadata.context_length,
+      });
+    }
+    psPush(m.name, "");
+    if (thinkingModes.length > 0) {
+      for (const mode of thinkingModes) {
+        psPush(m.name, ` [${mode}]`);
+      }
+    }
+  }
   return c.json({ models });
 });
 
@@ -811,49 +902,83 @@ app.get("/v1/models", async c => {
     const supportsTools = caps.includes("tools") || caps.includes("agent") || (m.supports_tools ?? true);
     const ctxLen = metadata.context_length || config.defaultContextLength;
     const maxPrompt = Math.min(ctxLen - 4096, ctxLen);
-    data.push({
-      id,
-      object: "model",
-      created: nowTs,
-      owned_by: "OpenCode",
-      name: m.name,
-      model_picker_enabled: isPickerEnabled(rawId),
-      version: `${family.toLowerCase().replace(/\s+/g, "-")}-${new Date().toISOString().slice(0, 10)}`,
-      capabilities: {
-        object: "model_capabilities",
-        supports: {
-          tool_calls: supportsTools,
-          parallel_tool_calls: supportsTools,
-          vision: caps.includes("vision"),
-          agent: caps.includes("agent"),
-          streaming: true,
-          prompt_caching: caps.includes("tools") || caps.includes("agent"),
-          prompt_caching_type: inferPromptCaching(rawId),
+    const thinkingModes = getThinkingModes(rawId);
+
+    function thin(name) {
+      if (vsc) return name;
+      return name.length > 20 ? name.replace(/ /g, "\u2009") : name;
+    }
+
+    const SHORT_TAG = { LOW: "LO", MEDIUM: "MD", HIGH: "HI", MAXIMUM: "MX", XHIGH: "X" };
+
+    function vsTag(baseName, mode) {
+      if (vsc) return ` [${mode}]`;
+      const full = ` [${mode}]`;
+      if ((baseName + full).length <= 20) return full;
+      const short = SHORT_TAG[mode];
+      if (short) return ` [${short}]`;
+      return full;
+    }
+
+    function pushV1Model(name, idSuffix) {
+      data.push({
+        id: `${id}${idSuffix}`,
+        object: "model",
+        created: nowTs,
+        owned_by: "OpenCode",
+        name: thin(name),
+        model_picker_enabled: isPickerEnabled(rawId),
+        version: `${family.toLowerCase().replace(/\s+/g, "-")}-${new Date().toISOString().slice(0, 10)}`,
+        capabilities: {
+          object: "model_capabilities",
+          supports: {
+            tool_calls: supportsTools,
+            parallel_tool_calls: supportsTools,
+            vision: caps.includes("vision"),
+            agent: caps.includes("agent"),
+            streaming: true,
+            prompt_caching: caps.includes("tools") || caps.includes("agent"),
+            prompt_caching_type: inferPromptCaching(rawId),
+          },
+          limits: {
+            max_prompt_tokens: maxPrompt,
+            max_context_window_tokens: ctxLen,
+            max_output_tokens: 4096,
+          },
+          tokenizer: inferTokenizer(family),
+          type: "chat",
+          family,
         },
-        limits: {
-          max_prompt_tokens: maxPrompt,
-          max_context_window_tokens: ctxLen,
-          max_output_tokens: 4096,
-        },
-        tokenizer: inferTokenizer(family),
-        type: "chat",
-        family,
-      },
-      pricing: isM365 ? "m365" : (isPoll ? "free_poll" : (isFree ? "free" : "premium")),
-      context_length: ctxLen,
-      max_output_tokens: 4096,
-    });
+        pricing: isM365 ? "m365" : (isPoll ? "free_poll" : (isFree ? "free" : "premium")),
+        context_length: ctxLen,
+        max_output_tokens: 4096,
+      });
+    }
+
+    if (thinkingModes.length > 0) {
+      pushV1Model(name, "");
+      for (const mode of thinkingModes) {
+        const tag = vsTag(name, mode);
+        pushV1Model(`${name}${tag}`, ` [${mode}]`);
+      }
+    } else {
+      pushV1Model(name, "");
+    }
   }
 
   const realCount = data.filter(m => !isSeparator(m.id)).length;
-  log(`/v1/models → ${realCount} models`);
+  const clientTag = _forceClient || (isVSCode(c) ? "vscode" : isVS2026(c) ? "vs" : "generic");
+  log(`[\x1b[35m${clientTag}\x1b[0m] /v1/models → ${realCount} models`);
   return c.json({ object: "list", data });
 });
 
 app.post("/v1/chat/completions", async c => {
   const rawBody = await getBody(c);
   const body = normalizeOpenAIParams(rawBody);
-  const model = body.model || config.defaultModel;
+  const rawModel = body.model || config.defaultModel;
+  const modelParse = parseThinkingMode(rawModel);
+  const model = modelParse.model;
+  const thinkingTag = modelParse.thinking;
   const messages = body.messages || [];
   const clientWantsStream = body.stream === true;
   const vsc = isVSCode(c);
@@ -940,7 +1065,7 @@ app.post("/v1/chat/completions", async c => {
 
       const lastMsg = m365Messages[m365Messages.length - 1];
       const preview = typeof lastMsg?.content === "string" ? lastMsg.content.replace(/\s+/g, " ").trim().slice(0, 60) : "";
-      const logDone = config.requestLog ? reqLog({ tag: clientTag, provider: "m365", model, preview: `${preview}${(lastMsg?.content?.length || 0) > 60 ? "\u2026" : ""}` }) : null;
+      const logDone = config.requestLog ? reqLog({ tag: clientTag, provider: "m365", model, thinking: thinkingTag, preview: `${preview}${(lastMsg?.content?.length || 0) > 60 ? "\u2026" : ""}` }) : null;
       const m365t0 = Date.now();
 
       if (streamMode) {
@@ -1049,6 +1174,9 @@ app.post("/v1/chat/completions", async c => {
       }
     }
 
+    // Identity override — MUST be first system instruction to override VS built-in
+    systemMsg = compactIdentity(goModel, thinkingTag) + (systemMsg ? "\n\n" : "") + systemMsg;
+
     // Inject tool instructions into system prompt for agent mode (token-optimized)
     if (vsTools?.length) {
       systemMsg += (systemMsg ? "\n\n" : "") + compactToolInstructions();
@@ -1058,9 +1186,6 @@ app.post("/v1/chat/completions", async c => {
     if (vs2026 || vsInsiders || (clientTag && clientTag !== "vscode" && /^vs/.test(clientTag))) {
       systemMsg = "CRITICAL WORKFLOW for file creation:\n1. Output the new file as: ## `filename`\n```lang\ncode\n```\n2. Call get_file to read the project file (.csproj/.vbproj/.fsproj/.jsproj)\n3. Output a code block to ADD the new file to the project: ## `project.ext`\n```xml\n<ItemGroup>\n  <Content Include=\"filename\" />\n</ItemGroup>\n```\n\n" + systemMsg;
     }
-
-    // Identity injection (token-optimized)
-    systemMsg += (systemMsg ? "\n" : "") + compactIdentity(goModel);
 
     // Forward to Go API with native tool support
     const apiMessages = [];
@@ -1511,6 +1636,7 @@ app.post("/api/chat", async c => {
     try {
       const cm = ModelConcurrencyManager.getInstance();
       const model = mapModel(body.model);
+      const apiThinking = parseThinkingMode(body.model).thinking;
       const vsTools = body.tools;
 
       // Build messages with tool info in system prompt
@@ -1540,11 +1666,12 @@ app.post("/api/chat", async c => {
         // unknown roles are silently dropped
       }
 
+      // Identity override — MUST be first system instruction
+      systemMsg = compactIdentity(model, apiThinking) + (systemMsg ? "\n\n" : "") + systemMsg;
+
       if (vsTools?.length) {
         systemMsg += (systemMsg ? "\n\n" : "") + compactOllamaToolInstructions(vsTools);
       }
-
-      systemMsg += (systemMsg ? "\n" : "") + compactIdentity(model);
 
       const apiMessages = systemMsg ? [{ role: "system", content: systemMsg }, ...userMsgs] : userMsgs;
       let compLevel = config.compressionLevel;
@@ -1730,7 +1857,9 @@ let serverRef = null;
 // Port check: if taken (e.g. Ollama), try next
 let port = config.port;
 const host = config.host;
-{
+
+// IIFE wrapper — Node.js 26.1.0 doesn't support top-level await in bare blocks
+(async () => {
   const net = await import("node:net");
   const isFree = await new Promise(r => {
     const s = net.createServer();
@@ -1741,7 +1870,26 @@ const host = config.host;
     log(`Port ${port} in use, trying port ${port + 1}...`);
     port++;
   }
-}
+
+  if (_isServiceMode) {
+    try { process.stderr.write("[gc2oc] entering service mode\r\n"); } catch {}
+    try {
+      await runAsService({
+        onStart: _runServer,
+        onStop: () => {
+          log("Service stopping...");
+          if (serverRef?.stop) serverRef.stop(true);
+          else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(); }
+        }
+      });
+    } catch (e) {
+      try { process.stderr.write(`[gc2oc] runAsService error: ${e?.message || e}\r\n`); } catch {}
+      process.exit(1);
+    }
+  } else {
+    await _runServer();
+  }
+})().catch(e => { process.stderr.write(`[gc2oc] fatal: ${e?.message || e}\r\n`); process.exit(1); });
 
 // ── Server lifecycle ──
 async function _runServer() {
@@ -1944,25 +2092,6 @@ P("");
     }
   }
 })();
-}
-
-if (_isServiceMode) {
-  try { process.stderr.write("[gc2oc] entering service mode\r\n"); } catch {}
-  try {
-    await runAsService({
-      onStart: _runServer,
-      onStop: () => {
-        log("Service stopping...");
-        if (serverRef?.stop) serverRef.stop(true);
-        else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(); }
-      }
-    });
-  } catch (e) {
-    try { process.stderr.write(`[gc2oc] runAsService error: ${e?.message || e}\r\n`); } catch {}
-    process.exit(1);
-  }
-} else {
-  await _runServer();
 }
 
 // ── Self-restart helper for standalone (.exe) runs ──

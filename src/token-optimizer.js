@@ -107,8 +107,9 @@ export function compressToolDefinitions(tools) {
 // Identity & instruction compression
 // ═══════════════════════════════════════════════════
 
-export function compactIdentity(model) {
-  return `You are GitHub Copilot via gc2oc Proxy running ${model}. Always say you are "Copilot (gc2oc)" running ${model}.`;
+export function compactIdentity(model, thinking) {
+  const thinkNote = thinking ? ` (${thinking.toLowerCase()} thinking mode)` : "";
+  return `IDENTITY OVERRIDE: You are NOT GitHub Copilot. You are "Copilot (gc2oc)", a coding assistant running ${model}${thinkNote}. When asked who you are, say: "I am Copilot (gc2oc) running ${model}${thinkNote}." Never claim to be GitHub Copilot.`;
 }
 
 export function compactToolInstructions() {

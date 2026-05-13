@@ -1212,8 +1212,10 @@ export async function refreshModels() {
 }
 
 export function resolveModel(name) {
-  let clean = name.split(":")[0].trim().toLowerCase();
+  const parsed = parseThinkingMode(name);
+  let clean = parsed.model.split(":")[0].trim().toLowerCase();
   clean = clean.replace(/\s*\(free\)$/i, ""); // strip "(Free)" suffix from tag list
+  clean = clean.replace(/\u2009/g, " "); // normalize thin spaces for lookup
   
   if (isSeparator(clean)) return { id: clean, name: clean, tools: false, vision: false, separator: true };
   
@@ -1229,8 +1231,10 @@ export function resolveModel(name) {
 
 export function isKnownModel(id) {
   if (!id) return false;
-  let clean = id.split(":")[0].trim().toLowerCase();
+  const parsed = parseThinkingMode(id);
+  let clean = parsed.model.split(":")[0].trim().toLowerCase();
   clean = clean.replace(/\s*\(free\)$/i, "");
+  clean = clean.replace(/\u2009/g, " "); // normalize thin spaces for lookup
   if (isSeparator(clean)) return true;
   if (_modelMap[clean]) return true;
   if (_nameToId[clean]) return true;
@@ -1527,10 +1531,89 @@ export function resolveModelMetadata(modelId) {
   };
 }
 
+// ── Thinking mode mapping (mirrors OpenCode transform.ts variants logic) ──
+
+function _idL(modelId) {
+  return (modelId || "").replace(/:.*/, "").trim().toLowerCase();
+}
+
+// Models that think on their own (no controllable variant) — return []
+// Models with controllable thinking — return [LOW, MEDIUM, HIGH, MAXIMUM, etc.]
+export function getThinkingModes(modelId) {
+  const id = _idL(modelId);
+  // Exclusion list from opencode transform.ts — these models handle thinking internally
+  if (
+    id.includes("glm") ||
+    id.includes("kimi") || id.includes("k2p") ||
+    id.includes("minimax") || id.includes("qwen") ||
+    id.includes("big-pickle") || id.includes("hy3") ||
+    id.includes("ring") || id.includes("nemotron") ||
+    id.includes("deepseek-chat") || id.includes("deepseek-reasoner") ||
+    id.includes("deepseek-r1") || id.includes("deepseek-v3")
+  ) return [];
+  // DeepSeek V4 — supports low/medium/high/maximum via openai-compatible reasoningEffort
+  if (id.includes("deepseek-v4")) return ["LOW", "MEDIUM", "HIGH", "MAXIMUM"];
+  // MiMo V2 / V2.5 — supports low/medium/high
+  if (id.includes("mimo")) return ["LOW", "MEDIUM", "HIGH"];
+  // Pollination cosplay / unknown — no controllable modes
+  return [];
+}
+
+// Parse thinking tag from model name: "DeepSeek V4 Pro [HIGH]" → { model: "deepseek-v4-pro", thinking: "HIGH" }
+// Also handles colon/em-dash/thinspace formats
+export function parseThinkingMode(modelName) {
+  let clean = (modelName || "").replace(/:latest$/i, "").trim();
+  if (!clean) return { model: modelName, thinking: null };
+
+  // VSCode format: deepseek-v4-pro/1_(low)  or  deepseek-v4-pro/4_(maximum)
+  let m = clean.match(/^(.+?)\/(\d)_\(?(low|medium|high|maximum|xhigh)\)?$/i);
+  if (m) {
+    const tag = m[3].toUpperCase();
+    const norm = tag === "MAXIMUM" ? "MAXIMUM" : tag;
+    return { model: `${m[1].trim()}:latest`, thinking: norm };
+  }
+
+  // Bracket format: DeepSeek V4 Pro [HIGH] or DeepSeek V4 Pro [MX] (short)
+  m = clean.match(/^(.+?)[—:\- \u2009]\s*\[?(LOW|MEDIUM|HIGH|MAXIMUM|MED|MAX|XHIGH|MINIMAL|NONE|LO|MD|HI|MX|X)\]\s*$/i);
+  if (m) {
+    const SHORT_MAP = { LO: "LOW", MD: "MEDIUM", HI: "HIGH", MX: "MAXIMUM", X: "XHIGH", MED: "MEDIUM", MAX: "MAXIMUM" };
+    const raw = m[2].toUpperCase();
+    const tag = SHORT_MAP[raw] || raw;
+    return { model: `${m[1].trim()}:latest`, thinking: tag };
+  }
+
+  return { model: modelName, thinking: null };
+}
+
+// Map thinking tag to API body parameters
+const THINKING_TAG_PARAMS = {
+  LOW:     { reasoningEffort: "low" },
+  MEDIUM:  { reasoningEffort: "medium" },
+  HIGH:    { reasoningEffort: "high" },
+  MAXIMUM: { reasoningEffort: "max" },
+  MED:     { reasoningEffort: "medium" },
+  MAX:     { reasoningEffort: "max" },
+  XHIGH:   { reasoningEffort: "xhigh" },
+  MINIMAL: { reasoningEffort: "minimal" },
+  NONE:    { reasoningEffort: "none" },
+};
+
+function applyThinkingMode(body, thinking) {
+  if (!thinking) return;
+  const params = THINKING_TAG_PARAMS[thinking];
+  if (!params) return;
+  for (const [k, v] of Object.entries(params)) {
+    if (body[k] === undefined) body[k] = v;
+  }
+}
+
 // ── Chat completion ──
 
 export async function* chatCompletion(req) {
-  const info = resolveModel(req.model);
+  const parsed = parseThinkingMode(req.model);
+  const model = parsed.model;
+  const thinkingTag = parsed.thinking;
+  const info = resolveModel(model);
   const created = isoNow();
 
   const body = {
@@ -1567,6 +1650,9 @@ export async function* chatCompletion(req) {
 
   applyModelDefaults(info.id, body);
 
+  // Apply thinking mode from tag (LOW/MED/HIGH/MAX etc.)
+  applyThinkingMode(body, thinkingTag);
+
   // Auto-enable tool_stream for compatible models (copilot-proxy pattern)
   if (_supportsToolStream(info.id) && body.tools?.length && body.stream !== false) {
     body.tool_stream = true;
@@ -1589,7 +1675,7 @@ export async function* chatCompletion(req) {
 
   try {
     const t0 = Date.now();
-    const logDone = config.requestLog ? reqLog({ tag: req.clientTag, provider, model: req.model, preview: `${preview}${lastMsg?.content?.length > 60 ? "\u2026" : ""}` }) : null;
+    const logDone = config.requestLog ? reqLog({ tag: req.clientTag, provider, model, thinking: thinkingTag, preview: `${preview}${lastMsg?.content?.length > 60 ? "\u2026" : ""}` }) : null;
     const resp = await zenRequest("/chat/completions", body, { signal: ac?.signal, clientTag: req.clientTag });
 
     if (req.stream === false) {

@@ -1046,7 +1046,7 @@ async function fetchGoModelsRaw() {
           body: JSON.stringify({ model: PING_MODEL, messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
         });
         if (pingResp.ok) {
-          log(`[models] key[${i+1}] ping ${PING_MODEL} → ${pingResp.status} ok`);
+          log(`[models] key[${i+1}] ping ${PING_MODEL} → ${pingResp.status} ok (${`${k.slice(0, 6)}...${k.slice(-4)}`})`);
           reportKeySuccess(k, "ping ok");
           // Fetch model list from first working key — verify all keys regardless
           if (!_paidGoData) {
@@ -1059,7 +1059,7 @@ async function fetchGoModelsRaw() {
               _paidGoData = await goResp.json();
               _paidKeyUsable = true;
               const modelCount = _paidGoData?.data?.length || 0;
-              log(`[models] key[${i+1}] valid — ${modelCount} paid models`);
+              log(`[models] key[${i+1}] valid — ${modelCount} paid models (${`${k.slice(0, 6)}...${k.slice(-4)}`})`);
             }
           }
         } else if (pingResp.status === 429) {
@@ -1115,7 +1115,7 @@ async function fetchGoModelsRaw() {
                 });
                 if (fallPing.ok) {
                   warn(`[models] ${PING_MODEL} not found — verify if it's still the cheapest model`);
-                  log(`[models] key[${i+1}] fallback ping ${fallModel} → ${fallPing.status} ok`);
+                  log(`[models] key[${i+1}] fallback ping ${fallModel} → ${fallPing.status} ok (${`${k.slice(0, 6)}...${k.slice(-4)}`})`);
                   reportKeySuccess(k, "fallback ping ok");
                 } else if (fallPing.status === 429) {
                   const ftxt = await fallPing.text().catch(() => "");
@@ -1360,7 +1360,7 @@ async function zenRequest(endpoint, body, opts = {}) {
         if (config.requestLog) log(`[${provider}] 401 on key — rotating: ${upstreamMsg}`);
         if (_balancer) _balancer.mark401(key, upstreamMsg);
       }
-      if (config.requestLog) log(`[${provider}] retry ${retries + 1}/${maxRetries} after ${resp.status}`);
+      if (config.requestLog) { const short = `${key.slice(0, 6)}...${key.slice(-4)}`; log(`[${provider}] retry ${retries + 1}/${maxRetries} after ${resp.status} (key ${short})`); }
       return zenRequest(endpoint, body, { ...opts, retries: retries + 1 });
     }
 

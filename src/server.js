@@ -1824,7 +1824,7 @@ const modeLabel = (hasPaid
   ? (config.hideFree ? " \x1b[32m(premium mode)\x1b[90m" : " \x1b[32m(premium+free mode)\x1b[90m")
   : (hasPoll ? " \x1b[33m(free+poll mode)\x1b[90m" : " \x1b[33m(free mode)\x1b[90m"))
   + (hasM365 ? " \x1b[36m+ M365\x1b[90m" : "");
-if (hasPaid) log("\x1b[32m[status] Authenticated — Premium+Free\x1b[0m");
+if (hasPaid) { const ks = getKeyStatus(); const firstKey = ks[0]?.keyPrefix || "?"; log(`\x1b[32m[status] Authenticated — Premium+Free (${firstKey})\x1b[0m`); }
 else if (hasPoll) log("\x1b[33m[status] Free mode — OpenCode free + Pollinations\x1b[0m");
 else log("\x1b[33m[status] Free mode — no API key\x1b[0m");
 if (hasM365) log("\x1b[36m[status] M365 Copilot connected\x1b[0m");
@@ -1931,9 +1931,9 @@ P("");
     });
     process.stdin.resume();
     if (canUpdate) {
-      log("\x1b[96mr/restart\x1b[90m | \x1b[96ms/stop\x1b[90m | \x1b[96me/exit\x1b[90m | \x1b[96mu/update\x1b[0m");
+      log("\x1b[96mr\x1b[37m/\x1b[96mrestart\x1b[90m | \x1b[96ms\x1b[37m/\x1b[96mstop\x1b[90m | \x1b[96me\x1b[37m/\x1b[96mexit\x1b[90m | \x1b[96mu\x1b[37m/\x1b[96mupdate\x1b[0m");
     } else {
-      log("\x1b[96mr/restart\x1b[90m | \x1b[96ms/stop\x1b[90m | \x1b[96me/exit\x1b[0m");
+      log("\x1b[96mr\x1b[37m/\x1b[96mrestart\x1b[90m | \x1b[96ms\x1b[37m/\x1b[96mstop\x1b[90m | \x1b[96me\x1b[37m/\x1b[96mexit\x1b[0m");
     }
   }
 })();

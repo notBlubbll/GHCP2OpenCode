@@ -22,7 +22,9 @@ GitHub Copilot extension             src/server.js                       OpenCod
                                     ┌───┴──────────────┐                  │
                                     │ Client detection  │                  │
                                     │ ├─ isVS2026()     │                  │  Pollinations (free)
-                                    │ ├─ isVSCode()     │                  │  https://text.pollinations.ai/openai
+                                    │ ├─ isVSInsiders() │                  │  https://text.pollinations.ai/openai
+                                    │ ├─ isVSCode()     │                  │
+                                    │ ├─ isSqlStudio()  │                  │
                                     │ └─ LocalPilot     │                  │
                                     └───┬──────────────┘                  │
                                         │                                  │  M365 Copilot (opt)
@@ -56,7 +58,7 @@ GitHub Copilot extension             src/server.js                       OpenCod
 **Main entry point.** HTTP routing, request orchestration, response formatting.
 
 - `restartSelf(exitCode)` — spawn `cmd /c start` → new console → inner `cmd /c` runs the exe. Uses `process.execPath` (NOT `process.argv[0]` — in Bun-compiled binaries `argv[0]` is `"bun"`, not the exe path). Wrapped mode (`GC2OC_WRAPPED=1`): just `process.exit()`.
-- `isVSCode(c)` / `isVS2026(c)` — client detection from User-Agent
+- `isVSCode(c)` / `isVS2026(c)` / `isVSInsiders(c)` / `isSqlStudio(c)` — client detection from `User-Agent` (VS Code) and `baggage` header (VS/VS Insiders/SQL Studio)
 - `extractVSContext()` / `getWorkspaceRoot()` / `getActiveFile()` — extract workspace paths from VS context blocks
 - `extractToolCalls()` — parse AI response text into tool calls (markdown blocks → `create_file`)
 - `processThinkTags()` — `<think>` tag extraction for DeepSeek reasoning
@@ -180,9 +182,10 @@ Detected in priority order:
 | Client | Detection | Tag | Key behaviors |
 |--------|-----------|-----|---------------|
 | **LocalPilot** | Content has `## [LP]`, `## TASK`, `</task_type>`, etc. | `lp` | Orphan tool messages dropped |
-| **VS 2026** | UA matches `/OpenAI\/.*\.NET/i` | `vs` | Non-streaming upstream, markdown tool extraction, file creation workflow, simulated SSE |
-| **VS Code** | UA matches `/githubcopilot/i` | `vscode` | Separators stripped from model lists, `[FREE]`/`[GO]`/`[M365]` prefixes in model names |
-| **Unknown** | No system message, first is user; or content has `github copilot` | `vs` | No special handling |
+| **SQL Studio** | `baggage` contains `SSMSAgent` | `sql` | No special handling |
+| **VS Insiders** | `baggage` contains `VirtualAgentModeResponder` | `vsi` | Non-streaming upstream, markdown tool extraction, file creation workflow, simulated SSE |
+| **VS 2026** | `baggage` contains `vs.copilot.` (not `VirtualAgentModeResponder`) | `vs` | Non-streaming upstream, markdown tool extraction, file creation workflow, simulated SSE |
+| **VS Code** | UA matches `/GitHubCopilotChat\//i` | `vscode` | Separators stripped from model lists, `[FREE]`/`[GO]`/`[M365]` prefixes in model names |
 
 ---
 

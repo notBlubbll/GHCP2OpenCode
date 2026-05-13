@@ -1285,12 +1285,11 @@ async function zenRequest(endpoint, body, opts = {}) {
   }
   
   const lastMsg = body.messages?.[body.messages.length - 1];
-  const prompt = typeof lastMsg?.content === "string" ? lastMsg.content : "";
-  const preview = prompt.replace(/\s+/g, " ").trim().slice(0, 60);
+  const preview = (typeof lastMsg?.content === "string" ? lastMsg.content : "").replace(/\s+/g, " ").trim().slice(0, 60);
   if (config.requestLog) {
     const tag = clientTag ? ` [${clientTag}]` : "";
     const label = isPoll ? " (poll)" : (isFree ? " (free)" : "");
-    console.log(`[zen]${tag} ${body.model || "?"}${label} — "${preview}${prompt.length > 60 ? "\u2026" : ""}"`);
+    console.log(`[zen]${tag} ${body.model || "?"}${label} — "${preview}${lastMsg?.content?.length > 60 ? "\u2026" : ""}"`);
   }
 
   const headers = {

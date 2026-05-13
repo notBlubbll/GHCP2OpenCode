@@ -128,10 +128,7 @@ const ts = () => new Date().toLocaleTimeString("en-US", { hour12: false });
 const logReq = (c) => {
   if (!config.requestLog) return;
   const pathname = new URL(c.req.url).pathname;
-  const headers = [];
-  c.req.raw.headers.forEach((v, k) => headers.push(`${k}: ${v}`));
   process.stdout.write(`\x1b[90m${ts()}\x1b[0m ${c.req.method} ${pathname}\n`);
-  for (const h of headers) process.stdout.write(`  \x1b[90m${h}\x1b[0m\n`);
 };
 const log = (msg) => process.stdout.write(`\x1b[90m${ts()}\x1b[0m ${msg}\n`);
 const err = (msg) => process.stderr.write(`\x1b[90m${ts()}\x1b[0m \x1b[31m${msg}\x1b[0m\n`);
@@ -196,8 +193,13 @@ const isVSCode = (c) => {
 };
 
 const isVS2026 = (c) => {
-  const ua = c.req.header("User-Agent") || "";
-  return /OpenAI\/.*\.NET/i.test(ua);
+  const baggage = c.req.header("baggage") || "";
+  return /vs\.copilot\./i.test(baggage);
+};
+
+const isVSInsiders = (c) => {
+  const baggage = c.req.header("baggage") || "";
+  return /VirtualAgentModeResponder/i.test(baggage);
 };
 
 const isSqlStudio = (c) => {
@@ -849,8 +851,8 @@ app.post("/v1/chat/completions", async c => {
   const clientWantsStream = body.stream === true;
   const vsc = isVSCode(c);
   const vs2026 = isVS2026(c);
+  const vsInsiders = isVSInsiders(c);
   const mea = isSqlStudio(c);
-  // Check for LocalPilot first (takes precedence over UA detection)
   let clientTag = "";
   if (messages?.length) {
     for (const m of messages) {
@@ -858,24 +860,19 @@ app.post("/v1/chat/completions", async c => {
       if (Array.isArray(m.content)) raw = m.content.map(p => (p?.text || p?.content || "").trim()).join("\n");
       const c = raw.toLowerCase();
       if (c.startsWith("## [lp]") || c.startsWith("## [pilot]") || c.startsWith("## task") || c.includes("[lp]") || c.includes("</task_type>") || c.includes("</instruction>")) { clientTag = "lp"; break; }
+      const vsEnv = raw.match(/visual\s+studio\s+(enterprise|professional|community)?\s*\d{4}\s*\((\d+\.\d+\.\d+)(-insiders)?\)/i);
+      if (vsEnv) {
+        const edition = vsEnv[1] ? `-${vsEnv[1].toLowerCase().slice(0, 1)}` : "";
+        const version = vsEnv[2];
+        clientTag = vsEnv[3] ? `vsi${edition}-${version}` : `vs${edition}-${version}`;
+        break;
+      }
     }
   }
-  // Fall back to UA-based detection
   if (!clientTag) {
-    clientTag = mea ? "sql" : (vs2026 ? "vs" : (vsc ? "vscode" : ""));
+    clientTag = mea ? "sql" : (vsInsiders ? "vsi" : (vs2026 ? "vs" : (vsc ? "vscode" : "")));
   }
-  if (!clientTag && messages?.length) {
-    const allContent = messages.map(m => m.content || "").join(" ");
-    const lc = allContent.toLowerCase();
-    if (lc.includes("github copilot") || lc.includes('"github copilot"')) clientTag = "vs";
-    else if (allContent.startsWith("<context>") || lc.includes("<edito")) clientTag = "vscode";
-  }
-  if (!clientTag) {
-    const hasSystem = messages?.some(m => m.role === "system");
-    if (!hasSystem && messages?.length && messages[0].role === "user") clientTag = "vs";
-  }
-  // VS 2026: force non-streaming upstream so extractToolCalls converts markdown to create_file tool calls
-  const streamMode = vs2026 ? false : clientWantsStream;
+  const streamMode = (vs2026 || vsInsiders || (clientTag && clientTag !== "vscode" && /^vs/.test(clientTag))) ? false : clientWantsStream;
   const vsTools = body.tools;
   const startTime = Date.now();
   const chatId = `chatcmpl-${startTime}`;
@@ -1047,8 +1044,8 @@ app.post("/v1/chat/completions", async c => {
       systemMsg += (systemMsg ? "\n\n" : "") + compactToolInstructions();
     }
 
-    // VS 2026: prepend project file update instruction at TOP for maximum attention
-    if (isVS2026(c)) {
+    // VS: prepend project file update instruction at TOP for maximum attention
+    if (vs2026 || vsInsiders || (clientTag && clientTag !== "vscode" && /^vs/.test(clientTag))) {
       systemMsg = "CRITICAL WORKFLOW for file creation:\n1. Output the new file as: ## `filename`\n```lang\ncode\n```\n2. Call get_file to read the project file (.csproj/.vbproj/.fsproj/.jsproj)\n3. Output a code block to ADD the new file to the project: ## `project.ext`\n```xml\n<ItemGroup>\n  <Content Include=\"filename\" />\n</ItemGroup>\n```\n\n" + systemMsg;
     }
 
@@ -1490,6 +1487,14 @@ app.post("/api/chat", async c => {
     if (Array.isArray(m.content)) raw = m.content.map(p => (p?.text || p?.content || "").trim()).join("\n");
     const c = raw.toLowerCase();
     if (c.startsWith("## [lp]") || c.startsWith("## [pilot]") || c.startsWith("## task") || c.includes("[lp]") || c.includes("</task_type>") || c.includes("</instruction>")) { clientTag = "lp"; break; }
+  }
+  if (!clientTag) {
+    const mea = isSqlStudio(c);
+    const vsInsiders = isVSInsiders(c);
+    if (mea) clientTag = "sql";
+    else if (vsInsiders) clientTag = "vsi";
+    else if (isVS2026(c)) clientTag = "vs";
+    else if (isVSCode(c)) clientTag = "vscode";
   }
 
   return stream(c, async s => {

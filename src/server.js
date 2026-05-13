@@ -127,11 +127,11 @@ async function checkVersion() {
 const ts = () => new Date().toLocaleTimeString("en-US", { hour12: false });
 const logReq = (c) => {
   if (!config.requestLog) return;
-  if (c.req.method === "POST" && !Bun.env.DEBUG) return;
-  const ua = (c.req.header("User-Agent") || "none").slice(0, 60);
-  const accept = (c.req.header("Accept") || "none").slice(0, 40);
   const pathname = new URL(c.req.url).pathname;
-  process.stdout.write(`\x1b[90m${ts()}\x1b[0m ${c.req.method} ${pathname} ua=${ua} accept=${accept}\n`);
+  const headers = [];
+  c.req.raw.headers.forEach((v, k) => headers.push(`${k}: ${v}`));
+  process.stdout.write(`\x1b[90m${ts()}\x1b[0m ${c.req.method} ${pathname}\n`);
+  for (const h of headers) process.stdout.write(`  \x1b[90m${h}\x1b[0m\n`);
 };
 const log = (msg) => process.stdout.write(`\x1b[90m${ts()}\x1b[0m ${msg}\n`);
 const err = (msg) => process.stderr.write(`\x1b[90m${ts()}\x1b[0m \x1b[31m${msg}\x1b[0m\n`);
@@ -192,12 +192,17 @@ const oaiResp = (content, tool_calls, finish_reason, model, usage) => {
 
 const isVSCode = (c) => {
   const ua = c.req.header("User-Agent") || "";
-  return /githubcopilot/i.test(ua);
+  return /GitHubCopilotChat\//i.test(ua);
 };
 
 const isVS2026 = (c) => {
   const ua = c.req.header("User-Agent") || "";
   return /OpenAI\/.*\.NET/i.test(ua);
+};
+
+const isSqlStudio = (c) => {
+  const baggage = c.req.header("baggage") || "";
+  return /SSMSAgent/i.test(baggage);
 };
 
 // ── Parameter normalization (camelCase → snake_case) ──
@@ -844,6 +849,7 @@ app.post("/v1/chat/completions", async c => {
   const clientWantsStream = body.stream === true;
   const vsc = isVSCode(c);
   const vs2026 = isVS2026(c);
+  const mea = isSqlStudio(c);
   // Check for LocalPilot first (takes precedence over UA detection)
   let clientTag = "";
   if (messages?.length) {
@@ -856,7 +862,7 @@ app.post("/v1/chat/completions", async c => {
   }
   // Fall back to UA-based detection
   if (!clientTag) {
-    clientTag = vsc ? (vs2026 ? "vs" : "vscode") : "";
+    clientTag = mea ? "sql" : (vs2026 ? "vs" : (vsc ? "vscode" : ""));
   }
   if (!clientTag && messages?.length) {
     const allContent = messages.map(m => m.content || "").join(" ");

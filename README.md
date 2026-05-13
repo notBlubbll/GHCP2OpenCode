@@ -28,7 +28,7 @@ Ollama-emulating proxy that connects **GitHub Copilot Chat&Agent** to the [OpenC
 | What | Why |
 |------|-----|
 | [Bun](https://bun.sh) or [Node.js](https://nodejs.org) | Runtime (Bun preferred, Node as fallback) |
-| Visual Studio 2026 **Insiders** | Ollama provider is Insiders-only |
+| Visual Studio 2026 **(18.6.0+ incl. Insiders)** | Ollama provider (18.6.0+) |
 
 ---
 
@@ -36,15 +36,17 @@ Ollama-emulating proxy that connects **GitHub Copilot Chat&Agent** to the [OpenC
 
 | Client | Status |
 |--------|--------|
-| VS 2026 Insiders | ✓ Supported |
-| VS 2026 (regular) | ✗ Needs Insiders or LocalPilot |
+| VS 2026 (18.6.0+) | ✓ Supported |
+| VS 2026 Insiders | ✓ Supported (features may be in flux) |
 | VS 2026 (LocalPilot) | ⚠ Unsupported but working |
 | VS Code | ⚠ Supported, not fully tested |
-| SQL Server Management Studio | ✗ No Ollama provider |
+| SQL Studio (22.6.0+) | ✓ Supported |
 
+> **VS 2026**: Ollama provider available in Visual Studio 2026 18.6.0 and later (regular + Insiders). Insiders features may be in flux due to its preview nature — expect occasional regressions.
+>
 > **VS Code**: Works via the GitHub Copilot extension's Ollama provider, but has not been thoroughly tested. Tool calling and streaming may have edge cases.
 >
-> **LocalPilot (VS 2026)**: The proxy detects LocalPilot requests automatically via `## TASK` / `## [LP]` prompt prefixes and handles orphan tool messages. Not officially supported, but functional.
+> **SQL Studio**: Ollama provider available in SQL Server Management Studio 22.6.0 and later.
 
 ---
 
@@ -60,7 +62,7 @@ npm run node       # Node.js fallback
 
 ### 2. Add to Visual Studio
 
-**Requires VS 2026 Insiders** — the Ollama provider is not in the regular release.
+**Requires Visual Studio 2026 18.6.0+ (regular or Insiders).**
 
 1. Open the Copilot Chat panel
 2. Click the model dropdown (next to the agent selector) → **Manage Models**

@@ -416,6 +416,19 @@ function _injectProjectUpdate(calls, messages, workspaceRoot) {
   // Reserved for future project file injection
 }
 
+function normalizeToolCall(tc) {
+  const name = tc.function?.name || "";
+  if (/^(get_file|read_file)$/i.test(name)) {
+    try {
+      const args = JSON.parse(tc.function.arguments || "{}");
+      if (args.startLine == null || args.startLine < 1) args.startLine = 1;
+      if (args.endLine != null && args.endLine < args.startLine) delete args.endLine;
+      return { ...tc, function: { ...tc.function, arguments: JSON.stringify(args) } };
+    } catch {}
+  }
+  return tc;
+}
+
 function extractToolCalls(text, workspaceRoot = "", messages = []) {
   if (!text) return { content: text || "", toolCalls: [] };
   const calls = [];
@@ -430,10 +443,11 @@ function extractToolCalls(text, workspaceRoot = "", messages = []) {
   while ((tb = toolBlockRe.exec(text)) !== null) {
     try {
       const parsed = JSON.parse(tb[1]);
-      calls.push({
+      const tc = normalizeToolCall({
         id: callId(), type: "function",
-        function: { name: parsed.name, arguments: JSON.stringify(parsed.arguments) },
+        function: { name: parsed.name, arguments: JSON.stringify(parsed.arguments || {}) },
       });
+      calls.push(tc);
       remaining = remaining.replace(tb[0], "");
     } catch {}
   }
@@ -1313,7 +1327,7 @@ app.post("/v1/chat/completions", async c => {
             }
           }
         }
-        let allToolCalls = [...tcBuilders.values()];
+        let allToolCalls = [...tcBuilders.values()].map(normalizeToolCall);
         if (!allToolCalls.length && vsTools?.length && fullText) {
           const extracted = extractToolCalls(fullText, getWorkspaceRoot(messages), messages);
           if (extracted.toolCalls.length) {
@@ -1395,7 +1409,7 @@ app.post("/v1/chat/completions", async c => {
 
     let allToolCalls = [];
     if (nativeCalls?.length) {
-      allToolCalls = nativeCalls;
+      allToolCalls = nativeCalls.map(normalizeToolCall);
       cleanText = "";
     } else if (vsTools?.length) {
       const extracted = extractToolCalls(fullText, getWorkspaceRoot(messages), messages);

@@ -418,14 +418,35 @@ function _injectProjectUpdate(calls, messages, workspaceRoot) {
 
 function normalizeToolCall(tc) {
   const name = tc.function?.name || "";
-  if (/^(get_file|read_file)$/i.test(name)) {
-    try {
-      const args = JSON.parse(tc.function.arguments || "{}");
-      if (args.startLine == null || args.startLine < 1) args.startLine = 1;
-      if (args.endLine != null && args.endLine < args.startLine) delete args.endLine;
-      return { ...tc, function: { ...tc.function, arguments: JSON.stringify(args) } };
-    } catch {}
-  }
+  try {
+    const raw = tc.function.arguments || "{}";
+    const args = JSON.parse(raw);
+    const safe = {};
+
+    if (/^(get_file|read_file)$/i.test(name)) {
+      const fp = (args.filePath ?? args.filename ?? args.path ?? args.uri ?? args.resource ?? "").toString().replace(/\\/g, "/");
+      if (fp) safe.filename = fp;
+      safe.startLine = (typeof args.startLine === "number" && args.startLine >= 1) ? args.startLine : 1;
+      // endLine required by VS schema; if AI doesn't provide one, read to end of file
+      safe.endLine = (typeof args.endLine === "number" && args.endLine >= safe.startLine) ? args.endLine : 999999;
+    } else if (/^(grep_search|search_content|search_file)$/i.test(name)) {
+      if (args.query != null) safe.query = String(args.query);
+      else if (args.pattern != null) safe.query = String(args.pattern);
+      else if (args.search != null) safe.query = String(args.search);
+      else if (args.searchTerm != null) safe.query = String(args.searchTerm);
+      safe.isRegexp = (typeof args.isRegexp === "boolean") ? args.isRegexp : (typeof args.regex === "boolean" ? args.regex : false);
+      if (args.includePattern != null) safe.includePattern = String(args.includePattern);
+      else if (args.include != null) safe.includePattern = String(args.include);
+      else if (args.fileTypes != null) safe.includePattern = String(args.fileTypes);
+      else if (args.glob != null) safe.includePattern = String(args.glob);
+      safe.maxResults = (typeof args.maxResults === "number" && args.maxResults >= 1) ? args.maxResults : 20;
+    } else {
+      return tc;
+    }
+
+    const fixed = JSON.stringify(safe);
+    return { ...tc, function: { ...tc.function, arguments: fixed } };
+  } catch {}
   return tc;
 }
 
@@ -452,7 +473,32 @@ function extractToolCalls(text, workspaceRoot = "", messages = []) {
     } catch {}
   }
 
-  // 2. Markdown file creation: ## `path` ```lang\ncontent\n```
+  // 2. VS Copilot <function_calls> XML blocks
+  const fcBlockRe = /<function_calls>\s*([\s\S]*?)\s*<\/function_calls>/g;
+  let fc;
+  while ((fc = fcBlockRe.exec(text)) !== null) {
+    const inner = fc[1];
+    const invokeRe = /<invoke\s+name\s*=\s*"([^"]+)"\s*>([\s\S]*?)<\/invoke>/g;
+    let inv;
+    while ((inv = invokeRe.exec(inner)) !== null) {
+      const fnName = inv[1];
+      const fnBody = inv[2];
+      const args = {};
+      const paramRe = /<parameter\s+name\s*=\s*"([^"]+)"\s*>([\s\S]*?)<\/parameter>/g;
+      let p;
+      while ((p = paramRe.exec(fnBody)) !== null) {
+        args[p[1]] = p[2];
+      }
+      const tc = normalizeToolCall({
+        id: callId(), type: "function",
+        function: { name: fnName, arguments: JSON.stringify(args) },
+      });
+      if (tc) calls.push(tc);
+    }
+    remaining = remaining.replace(fc[0], "");
+  }
+
+  // 3. Markdown file creation: ## `path` ```lang\ncontent\n```
   const createRe = /(?:^|\n)(?:##\s*)?`([^`\n]+\.\w+)`\s*\n```[\w-]*\n([\s\S]*?)```/gi;
   let m;
   while ((m = createRe.exec(text)) !== null) {
@@ -1129,11 +1175,15 @@ app.post("/v1/chat/completions", async c => {
       }
     }
 
+    let toolFailStreak = 0;
+    let toolLoopBroken = false;
     for (const m of messages) {
       const role = (m.role || "").toLowerCase().trim();
       if (role === "system") {
         systemMsg += (systemMsg ? "\n" : "") + (typeof m.content === "string" ? m.content : "");
       } else if (role === "assistant") {
+          // After 3+ consecutive tool errors, drop retry attempts
+          if (toolLoopBroken && m.tool_calls?.length) continue;
           const hasTools = m.tool_calls && Array.isArray(m.tool_calls) && m.tool_calls.length > 0;
           const hasContent = m.content != null && (
             typeof m.content === "string" ? m.content.trim().length > 0 :
@@ -1180,10 +1230,18 @@ app.post("/v1/chat/completions", async c => {
             continue;
           }
         }
+        const tc = typeof m.content === "string" ? m.content : JSON.stringify(m.content || "");
+        if (toolLoopBroken) continue;
+        if (/error|fail|invalid|timeout/i.test(tc)) {
+          toolFailStreak++;
+          if (toolFailStreak > 3) { toolLoopBroken = true; log("  breaking tool retry loop (>3 consecutive errors)"); continue; }
+        } else {
+          toolFailStreak = 0;
+        }
         userMsgs.push({
           role: "tool",
           tool_call_id: m.tool_call_id || "unknown",
-          content: typeof m.content === "string" ? m.content : JSON.stringify(m.content || ""),
+          content: tc,
         });
       }
     }
@@ -1198,7 +1256,7 @@ app.post("/v1/chat/completions", async c => {
 
     // VS: prepend project file update instruction at TOP for maximum attention
     if (vs2026 || vsInsiders || (clientTag && clientTag !== "vscode" && /^vs/.test(clientTag))) {
-      systemMsg = "CRITICAL WORKFLOW for file creation:\n1. Output the new file as: ## `filename`\n```lang\ncode\n```\n2. Call get_file to read the project file (.csproj/.vbproj/.fsproj/.jsproj)\n3. Output a code block to ADD the new file to the project: ## `project.ext`\n```xml\n<ItemGroup>\n  <Content Include=\"filename\" />\n</ItemGroup>\n```\n\n" + systemMsg;
+      systemMsg = "CRITICAL WORKFLOW for file creation:\n1. Output the new file as: ## `filename`\n```lang\ncode\n```\n2. Output a code block to ADD the new file to the project: ## `project.ext`\n```xml\n<ItemGroup>\n  <Content Include=\"filename\" />\n</ItemGroup>\n```\n\n" + systemMsg;
     }
 
     // Forward to Go API with native tool support
@@ -1651,7 +1709,7 @@ app.post("/api/chat", async c => {
       const cm = ModelConcurrencyManager.getInstance();
       const model = mapModel(body.model);
       const apiThinking = parseThinkingMode(body.model).thinking;
-      const vsTools = body.tools;
+  const vsTools = body.tools;
 
       // Build messages with tool info in system prompt
       let systemMsg = "";

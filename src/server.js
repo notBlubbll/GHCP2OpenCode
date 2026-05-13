@@ -896,6 +896,22 @@ function normalizeToolCall(tc) {
         }
       } catch {}
     }
+    if (/^(grep_search|search_content|search_file)$/i.test(name)) {
+      try {
+        const safe = {};
+        const qMatch = raw2.match(/"query"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+        safe.query = qMatch ? qMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "";
+        safe.isRegexp = /"isRegexp"\s*:\s*true/i.test(raw2);
+        const ipMatch = raw2.match(/"includePattern"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+        safe.includePattern = ipMatch ? ipMatch[1] : null;
+        const mrMatch = raw2.match(/"maxResults"\s*:\s*(\d+)/);
+        safe.maxResults = mrMatch ? parseInt(mrMatch[1], 10) : null;
+        if (safe.query) {
+          log(`\x1b[33m[${name}] salvaged query="${safe.query}" isRegexp=${safe.isRegexp} includePattern=${safe.includePattern} maxResults=${safe.maxResults}\x1b[0m`);
+          return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
+        }
+      } catch {}
+    }
     if (/^plan$/i.test(name)) {
       try {
         const pmMatch = raw2.match(/"planMarkdown"\s*:\s*"((?:[^"\\]|\\.)*)/);

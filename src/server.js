@@ -48,6 +48,7 @@ import { ModelConcurrencyManager, RateLimitError, truncateToolMessagesInPayload,
 import { compactIdentity, compactToolInstructions, compactOllamaToolInstructions, compactCodeCompletionPrompt, compressMessages } from "./token-optimizer.js";
 import { m365ChatCompletion, m365ChatCompletionStream, M365CopilotError } from "./m365-client.js";
 import { handleServiceCommand, runAsService } from "./win-service.js";
+import { log, error as logErr, reqLog } from "./logger.js";
 
 // ── Service command routing (early exit for install/uninstall) ──
 {
@@ -123,15 +124,11 @@ async function checkVersion() {
 }
 
 // ── Logging ──
-
-const ts = () => new Date().toLocaleTimeString("en-US", { hour12: false });
 const logReq = (c) => {
   if (!config.requestLog) return;
-  const pathname = new URL(c.req.url).pathname;
-  process.stdout.write(`\x1b[90m${ts()}\x1b[0m ${c.req.method} ${pathname}\n`);
+  log(`${c.req.method} ${new URL(c.req.url).pathname}`);
 };
-const log = (msg) => process.stdout.write(`\x1b[90m${ts()}\x1b[0m ${msg}\n`);
-const err = (msg) => process.stderr.write(`\x1b[90m${ts()}\x1b[0m \x1b[31m${msg}\x1b[0m\n`);
+const err = (msg) => logErr(msg);
 
 // Auto-create .env if missing
 (async () => {
@@ -843,7 +840,6 @@ app.get("/v1/models", async c => {
 });
 
 app.post("/v1/chat/completions", async c => {
-  logReq(c);
   const rawBody = await getBody(c);
   const body = normalizeOpenAIParams(rawBody);
   const model = body.model || config.defaultModel;
@@ -862,7 +858,7 @@ app.post("/v1/chat/completions", async c => {
       if (c.startsWith("## [lp]") || c.startsWith("## [pilot]") || c.startsWith("## task") || c.includes("[lp]") || c.includes("</task_type>") || c.includes("</instruction>")) { clientTag = "lp"; break; }
       const vsEnv = raw.match(/visual\s+studio\s+(enterprise|professional|community)?\s*\d{4}\s*\((\d+\.\d+\.\d+)(-insiders)?\)/i);
       if (vsEnv) {
-        const edition = vsEnv[1] ? `-${vsEnv[1].toLowerCase().slice(0, 1)}` : "";
+        const edition = vsEnv[1] ? `_${vsEnv[1].toLowerCase().slice(0, 1)}` : "";
         const version = vsEnv[2];
         clientTag = vsEnv[3] ? `vsi${edition}-${version}` : `vs${edition}-${version}`;
         break;
@@ -933,8 +929,7 @@ app.post("/v1/chat/completions", async c => {
 
       const lastMsg = m365Messages[m365Messages.length - 1];
       const preview = typeof lastMsg?.content === "string" ? lastMsg.content.replace(/\s+/g, " ").trim().slice(0, 60) : "";
-      const tag = clientTag ? ` [${clientTag}]` : "";
-      if (config.requestLog) log(`[m365]${tag} ${model} — "${preview}${(lastMsg?.content?.length || 0) > 60 ? "\u2026" : ""}"`);
+      if (config.requestLog) reqLog({ tag: clientTag, provider: "m365", model, preview: `${preview}${(lastMsg?.content?.length || 0) > 60 ? "\u2026" : ""}` });
 
       if (streamMode) {
         return stream(c, async (s) => {

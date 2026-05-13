@@ -13,6 +13,7 @@
 //   Stacked   (78-95%)— RTK first, then Caveman — best for mixed prompts with tool logs + prose
 //
 // Also compresses tool descriptions, schemas, identity prompts, and tool instructions.
+import { log } from "./logger.js";
 //
 // Compression strategies:
 //   1. Strip verbose prefixes ("This tool allows you to", "Use this function to")
@@ -587,7 +588,7 @@ export function compressMessages(messages, level = "stacked", progressiveAging =
       msgs = _dropOldToolOutputs(msgs, keepCount);
       if (msgs.length < before) {
         const dropped = before - msgs.length;
-        process.stdout.write(`\x1b[90m[compress]\x1b[0m dropped ${dropped} old tool pair${dropped !== 1 ? "s" : ""} (kept last ${keepCount})\n`);
+        log(`[compress] dropped ${dropped} old tool pair${dropped !== 1 ? "s" : ""} (kept last ${keepCount})`);
       }
     }
   }

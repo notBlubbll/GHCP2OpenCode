@@ -10,7 +10,8 @@ if (typeof Bun === 'undefined') {
   globalThis.Bun = { env: process.env };
 }
 
-const log = (msg) => process.stdout.write(`\x1b[90m[queue]\x1b[0m ${msg}\n`);
+import { log as modLog } from "./logger.js";
+const log = (msg) => modLog(`[queue] ${msg}`);
 
 // ── Config helpers ──
 function getConfig() {

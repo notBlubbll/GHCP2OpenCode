@@ -254,6 +254,14 @@ const config = {
   get keyRevalidationMs() {
     return parseInt(Bun.env.KEY_REVALIDATION_INTERVAL || "300000", 10);
   },
+  get terminalFallback() {
+    const v = Bun.env.TERMINAL_FALLBACK;
+    return v === undefined ? true : v === "true" || v === "1";
+  },
+  get proxyTerm() {
+    const v = Bun.env.PROXY_TERM;
+    return v === undefined ? true : v === "true" || v === "1";
+  },
 };
 
 export function setApiKey(key) { Bun.env.OPENCODE_API_KEY = key; }

@@ -127,7 +127,9 @@ Prompt: "Generate a Bicep template for an App Service with Key Vault secrets"
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `projectName` | string | ~ | Target project (omit for whole solution) |
+| `solutionDirectory` | string | **Yes** | Path to the solution directory |
+| `projectPaths` | string[] | **Yes** | Array of project paths to fix |
+| `includePrerelease` | boolean | **Yes** | Whether to include prerelease package versions |
 
 ### Confirmed schemas (VS Insiders 18.7 — from live tool dumps)
 
@@ -169,6 +171,7 @@ Prompt: "Generate a Bicep template for an App Service with Key Vault secrets"
 | `nuget_get_package_context` | `solutionDirectory`,`packageName`,`packageVersion` | `solutionDirectory`,`packageName`,`packageVersion` |
 | `nuget_upgrade_packages_to_latest` | `solutionDirectory`,`projectPaths`,`includeVulnerable`,`includePrerelease` | `solutionDirectory`,`projectPaths`,`includeVulnerable`,`includePrerelease` |
 | `nuget_fix_vulnerable_packages` | `solutionDirectory`,`projectPaths`,`includePrerelease` | `solutionDirectory`,`projectPaths`,`includePrerelease` |
+| `lookup_vs` | `terms` | `terms` |
 | `task_complete` | (pass-through) | (pass-through) |
 
 ### Azure MCP Server tools (confirmed)
@@ -189,8 +192,7 @@ Most: `required: ["intent"]`, `properties: ["intent","command","parameters","lea
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `query` | string | **Yes** | Natural-language question about the codebase |
-| `explanation` | string | ~ | Optional context for the search intent |
+| `searchQueries` | string[] | **Yes** | Array of natural-language or code queries |
 
 Semantic/vector search that understands meaning — "where is auth implemented?" vs text grep.
 
@@ -209,18 +211,19 @@ Semantic/vector search that understands meaning — "where is auth implemented?"
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `query` | string | **Yes** | Filename or glob pattern |
-| `searchPattern` | string | ~ | Additional file-type filter (glob) |
-| `maxResults` | integer | ~ | Max results (default: 20) |
+| `queries` | string[] | **Yes** | Array of filename or glob patterns |
+| `maxResults` | integer | **Yes** | Max results |
 
 ### `find_symbol`
 
-**Channel:** `builtin` — VS 2026+ only. Supported: C++, C#, Razor, TypeScript, and any LSP-enabled language.
+**Channel:** `builtin` — Supported: C++, C#, Razor, TypeScript, and any LSP-enabled language.
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `query` | string | **Yes** | Symbol name or partial name |
-| `includeReferences` | boolean | ~ | Also return references (default: `true`) |
+| `navigationType` | string | **Yes** | Type of navigation (e.g. `"findReferences"`) |
+| `filepath` | string | **Yes** | File path to search within |
+| `symbolName` | string | **Yes** | Symbol name or partial name |
+| `lineText` | string | **Yes** | Line text for context matching |
 
 Returns type info, declarations, scope, and all references.
 
@@ -243,8 +246,7 @@ Returns type info, declarations, scope, and all references.
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `projectName` | string | **Yes** | Project name within the solution |
-| `searchPattern` | string | ~ | Optional glob filter (e.g. `"**/*.cs"`) |
+| `projectPath` | string | **Yes** | Project path within the solution |
 
 ### `get_projects_in_solution`
 
@@ -271,8 +273,8 @@ No required parameters. Returns a flat list of all projects in the currently ope
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `filePath` | string | **Yes** | Target file |
-| `replacements` | array | **Yes** | Array of `{oldString, newString}` objects |
+| `replacements` | array | **Yes** | Array of `{filePath, oldString, newString}` objects |
+| `explanation` | string | **Yes** | Explanation of the changes being made |
 
 ### `remove_file`
 
@@ -281,7 +283,6 @@ No required parameters. Returns a flat list of all projects in the currently ope
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
 | `filePath` | string | **Yes** | Path of file to delete |
-| `explanation` | string | ~ | Reason for deletion (shown in UI) |
 
 ### `replace_string_in_file`
 
@@ -303,8 +304,7 @@ No required parameters. Returns a flat list of all projects in the currently ope
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `projectName` | string | ~ | Filter errors by project |
-| `filePath` | string | ~ | Filter errors by file |
+| `filePaths` | string[] | **Yes** | Array of file paths to get errors for |
 
 Returns structured error-list data (file, line, column, severity, message, error code).
 
@@ -314,8 +314,8 @@ Returns structured error-list data (file, line, column, severity, message, error
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `projectName` | string | ~ | Test project to scan |
-| `filePath` | string | ~ | Specific test file to scan |
+| `filterTypes` | string[] | **Yes** | Filter types (project, file, namespace, etc.) |
+| `filterValues` | string[] | **Yes** | Corresponding filter values |
 
 Discovers test methods with their full names, traits, and parameterized variants.
 
@@ -323,10 +323,7 @@ Discovers test methods with their full names, traits, and parameterized variants
 
 **Channel:** `builtin`
 
-| Parameter | Type | Required | Description |
-|-----------|------|:--------:|-------------|
-| `projectName` | string | ~ | Specific project to build (omit = entire solution) |
-| `configuration` | string | ~ | Build configuration (e.g. `"Debug"`, `"Release"`) |
+No required parameters. Builds the solution or a specific project.
 
 ### `run_tests`
 
@@ -334,9 +331,9 @@ Discovers test methods with their full names, traits, and parameterized variants
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `projectName` | string | ~ | Test project to run |
-| `testName` | string | ~ | Fully-qualified test name |
-| `framework` | string | ~ | Test framework hint (xUnit / NUnit / MSTest) |
+| `filterTypes` | string[] | **Yes** | Filter types (project, test name, framework, etc.) |
+| `filterValues` | string[] | **Yes** | Corresponding filter values |
+| `framework` | string | No | Test framework hint (xUnit / NUnit / MSTest) |
 
 ---
 
@@ -348,7 +345,11 @@ Discovers test methods with their full names, traits, and parameterized variants
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `terminalId` | string | ~ | Specific terminal handle (omit = all background terminals) |
+| `terminal_id` | string | **Yes** | Terminal identifier |
+| `headLines` | integer | **Yes** | Number of lines from the head |
+| `tailLines` | integer | **Yes** | Number of lines from the tail |
+| `stop` | boolean | **Yes** | Whether to stop the terminal |
+| `waitMs` | integer | **Yes** | Milliseconds to wait for output |
 
 ### `run_command_in_terminal`
 
@@ -357,9 +358,10 @@ Discovers test methods with their full names, traits, and parameterized variants
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
 | `command` | string | **Yes** | Shell command to execute |
-| `cwd` | string | ~ | Working directory (default: solution root) |
-| `timeout` | integer | ~ | Timeout in milliseconds |
-| `runInBackground` | boolean | ~ | Keep running in background (default: `false`) |
+| `summary` | string | **Yes** | Short summary of what the command does |
+| `background` | boolean | **Yes** | Whether to run in background |
+| `cwd` | string | No | Working directory (default: solution root) |
+| `timeout` | integer | No | Timeout in milliseconds |
 
 **Security:** Runs with the same permissions as the VS process. Requires user approval by default.
 
@@ -377,7 +379,7 @@ Plan files land in `%TEMP%\VisualStudio\copilot-vs\` as `plan-{sessionId}.md` (h
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `changes` | string | **Yes** | Description of what needs to change in the plan |
+| `observation` | string | **Yes** | Description of what needs to change in the plan |
 
 Refines or reorders the plan based on new information or discovered issues.
 
@@ -387,7 +389,7 @@ Refines or reorders the plan based on new information or discovered issues.
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `question` | string | **Yes** | Clarifying question to ask the user |
+| `questions` | string[] | **Yes** | Array of clarifying questions to ask the user |
 
 ### `detect_memories`
 
@@ -395,7 +397,8 @@ Refines or reorders the plan based on new information or discovered issues.
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `query` | string | ~ | Filter/context for memory retrieval |
+| `memory` | string | **Yes** | Memory content or query to store/retrieve |
+| `confidence` | number | **Yes** | Confidence score (0.0–1.0) |
 
 Detects relevant user preferences from past conversations (Copilot Memories feature).
 
@@ -411,8 +414,7 @@ No parameters. Finalizes the plan — all steps are complete.
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `task` | string | **Yes** | High-level task description |
-| `context` | object | ~ | Additional context (file list, constraints, etc.) |
+| `planMarkdown` | string | **Yes** | Plan content in Markdown format |
 
 Generates the initial structured plan with goals and ordered steps.
 
@@ -430,7 +432,11 @@ Captures information that may influence subsequent steps.
 
 **Channel:** `planning`
 
-No parameters. Signals to the user that the plan is ready for review before execution begins.
+| Parameter | Type | Required | Description |
+|-----------|------|:--------:|-------------|
+| `planTitle` | string | **Yes** | Title of the plan being signaled ready |
+
+Signals to the user that the plan is ready for review before execution begins.
 
 ### `update_plan_progress`
 
@@ -440,6 +446,8 @@ No parameters. Signals to the user that the plan is ready for review before exec
 |-----------|------|:--------:|-------------|
 | `stepId` | string | **Yes** | Step identifier being updated |
 | `status` | string | **Yes** | One of: `pending`, `in_progress`, `completed`, `failed` |
+| `message` | string | **Yes** | Status message or detail |
+| `autoAdvance` | boolean | **Yes** | Whether to auto-advance to the next step |
 
 Synchronizes the JSON and Markdown plan files.
 
@@ -453,7 +461,7 @@ Synchronizes the JSON and Markdown plan files.
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `prompt` | string | **Yes** | Performance profiling question or command |
+| `reason` | string | **Yes** | Performance profiling question or command |
 
 Capabilities: CPU/memory tracing, BenchmarkDotNet generation, .NET Counters analysis, C++ unit-test-based profiling.
 
@@ -463,7 +471,7 @@ Capabilities: CPU/memory tracing, BenchmarkDotNet generation, .NET Counters anal
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `query` | string | **Yes** | KQL query for Azure Resource Graph |
+| `prompt` | string | **Yes** | KQL query for Azure Resource Graph |
 
 Cross-subscription resource queries. Example KQL: `resources | where type == "microsoft.compute/virtualmachines"`.
 
@@ -473,9 +481,9 @@ Cross-subscription resource queries. Example KQL: `resources | where type == "mi
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `agentName` | string | **Yes** | Name of the subagent (e.g. `"code-reviewer"`) |
 | `prompt` | string | **Yes** | Task description for the subagent |
-| `context` | object | ~ | Additional context (files, constraints) |
+| `description` | string | **Yes** | Short description of the sub-task |
+| `agentName` | string | **Yes** | Name of the subagent (e.g. `"code-reviewer"`) |
 
 Launches a focused subagent to parallelize or delegate a sub-task.
 
@@ -486,7 +494,8 @@ Launches a focused subagent to parallelize or delegate a sub-task.
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
 | `query` | string | **Yes** | What to search for |
-| `source` | string | ~ | Search scope: `"code"`, `"docs"`, `"web"`, `"agents"` |
+| `description` | string | **Yes** | Short description of the search |
+| `details` | string | **Yes** | Detailed information about the search scope |
 
 Discovers built-in agents, custom agents, agent skills, and MCP tools available in the environment.
 
@@ -494,10 +503,7 @@ Discovers built-in agents, custom agents, agent skills, and MCP tools available 
 
 **Channel:** `agent` — Wraps the `@modernize` built-in agent for .NET/C++ upgrades.
 
-| Parameter | Type | Required | Description |
-|-----------|------|:--------:|-------------|
-| `targetFramework` | string | **Yes** | Target framework (e.g. `"net9.0"`, `"net10.0"`) |
-| `projectName` | string | ~ | Specific project to upgrade (omit = assess entire solution) |
+No required parameters. Starts the modernization assessment workflow.
 
 Three-stage process: Assessment → Plan → Task Execution.
 
@@ -511,8 +517,7 @@ Three-stage process: Assessment → Plan → Task Execution.
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `projectName` | string | ~ | Filter by project |
-| `filePath` | string | ~ | Filter by file |
+| `filePaths` | string[] | **Yes** | Array of file paths to get errors for |
 
 Returns structured compilation errors/warnings from the Error List window (file, line, column, severity, code, message).
 
@@ -522,8 +527,7 @@ Returns structured compilation errors/warnings from the Error List window (file,
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `outputPane` | string | ~ | Pane name: `"Build"`, `"Debug"`, `"Diagnostics Hub"`, etc. |
-| `maxLines` | integer | ~ | Max lines to return (default: all recent) |
+| `paneId` | string | **Yes** | Output pane identifier |
 
 ### `get_web_pages`
 
@@ -531,10 +535,26 @@ Returns structured compilation errors/warnings from the Error List window (file,
 
 | Parameter | Type | Required | Description |
 |-----------|------|:--------:|-------------|
-| `url` | string | **Yes** | URL to fetch (HTTPS) |
-| `format` | string | ~ | Output format: `"text"`, `"markdown"`, `"html"` (default: `"markdown"`) |
+| `urls` | string[] | **Yes** | Array of URLs to fetch (HTTPS) |
 
 Fetches and parses web content for documentation lookup or API reference.
+
+### `lookup_vs`
+
+**Channel:** `builtin` — VS 2026 agent-mode only.
+
+| Parameter | Type | Required | Description |
+|-----------|------|:--------:|-------------|
+| `terms` | string[] | **Yes** | Array of search terms for VS help/documentation lookup |
+
+Performs Visual Studio help and documentation lookups. Searches MSDN/learn.microsoft.com,
+.NET API reference, NuGet package docs, and VS feature documentation. Similar to pressing F1
+in Visual Studio but scoped and invoked automatically by the agent.
+
+**Schema:** `required: ["terms"]`, properties: `["terms"]` (array of strings)
+
+**Normalization:** The proxy accepts `query`, `queries`, `search`, or `searchTerms` as aliases
+for `terms` and coerces single strings to arrays.
 
 ### `task_complete`
 

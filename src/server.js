@@ -317,8 +317,12 @@ async function _simStream(w, base, hasTools, toolCalls, text, reasoningContent) 
 }
 
 // Cache reasoning_content from DeepSeek thinking mode (VS doesn't relay it)
-// Keyed by content/tool hash — each assistant message gets its own reasoning
-const reasoningCache = new Map(); // contentHash -> reasoningContent
+// Primary: position-based FIFO (guarantees correct ordering per-request)
+// Fallback: content/tool hash + model-key
+const _assistantReasonings = []; // FIFO queue, populated per-AI-response
+let _reasoningIndex = 0;          // cursor reset per-request
+const reasoningCache = new Map(); // contentHash -> reasoningContent (hash fallback)
+function _resetReasoning() { _reasoningIndex = 0; }
 function _msgHash(msg) {
   if (msg.content != null) {
     const c = (typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content))
@@ -334,15 +338,22 @@ function _msgHash(msg) {
 
 function _cacheReasoning(msg, model, reasoning) {
   if (!reasoning) return;
+  _assistantReasonings.push(reasoning);
+  if (_assistantReasonings.length > 50) _assistantReasonings.shift();
   const h = _msgHash(msg);
   if (h) reasoningCache.set(h, reasoning);
   reasoningCache.set(`mdl:${model}`, reasoning); // model-key fallback
 }
 
 function _getReasoning(msg, model) {
+  // First try exact hash cache match
   const h = _msgHash(msg);
   if (h && reasoningCache.has(h)) return reasoningCache.get(h);
-  return reasoningCache.get(`mdl:${model}`); // fallback
+  // Position-based fallback (guarantees correct per-message ordering)
+  if (_reasoningIndex < _assistantReasonings.length) {
+    return _assistantReasonings[_reasoningIndex++];
+  }
+  return reasoningCache.get(`mdl:${model}`); // model-key fallback
 }
 
 // Ollama -> Go model mappings (what VS Copilot sends vs what Go API expects)
@@ -442,8 +453,7 @@ function normalizeToolCall(tc) {
     // ── Confirmed VS schemas (VS Insiders 18.7) ──
     if (/^get_file$/i.test(name)) {
       // VS: required ["filename","startLine","endLine"]  properties: filename,startLine,endLine,includeLineNumbers
-      const fp = (args.filePath ?? args.filename ?? args.path ?? args.uri ?? args.resource ?? "").toString().replace(/\\/g, "/");
-      if (fp) safe.filename = fp;
+      safe.filename = String(args.filename ?? args.filePath ?? args.path ?? args.uri ?? args.resource ?? "");
       safe.startLine = (typeof args.startLine === "number" && args.startLine >= 1) ? args.startLine : 1;
       safe.endLine = (typeof args.endLine === "number" && args.endLine >= safe.startLine) ? args.endLine : 999999;
       if (typeof args.includeLineNumbers === "boolean") safe.includeLineNumbers = args.includeLineNumbers;
@@ -493,8 +503,6 @@ function normalizeToolCall(tc) {
       safe.command = String(args.command ?? args.cmd ?? "");
       safe.summary = String(args.summary ?? args.description ?? "");
       safe.background = (typeof args.background === "boolean") ? args.background : (typeof args.runInBackground === "boolean" ? args.runInBackground : false);
-      if (args.cwd != null) safe.cwd = String(args.cwd);
-      if (typeof args.timeout === "number") safe.timeout = args.timeout;
     } else if (/^get_background_terminal_output$/i.test(name)) {
       // required: ["terminal_id","headLines","tailLines","stop","waitMs"]  properties: terminal_id,headLines,tailLines,stop,waitMs
       safe.terminal_id = String(args.terminal_id ?? args.terminalId ?? args.terminal ?? "");
@@ -526,7 +534,6 @@ function normalizeToolCall(tc) {
       if (!Array.isArray(safe.filterTypes)) safe.filterTypes = [String(safe.filterTypes ?? "")];
       safe.filterValues = args.filterValues ?? args.filter_values ?? args.testName ?? args.test ?? [];
       if (!Array.isArray(safe.filterValues)) safe.filterValues = [String(safe.filterValues ?? "")];
-      if (args.framework != null) safe.framework = String(args.framework);
     } else if (/^(get_tests|list_tests|discover_tests)$/i.test(name)) {
       // required: ["filterTypes","filterValues"]  properties: filterTypes,filterValues
       safe.filterTypes = args.filterTypes ?? args.filter_types ?? [];
@@ -545,10 +552,11 @@ function normalizeToolCall(tc) {
       safe.urls = args.urls ?? args.url ?? [];
       if (!Array.isArray(safe.urls)) safe.urls = [String(safe.urls ?? "")];
     } else if (/^(find_symbol|search_symbol)$/i.test(name)) {
-      // required: ["navigationType","filepath","symbolName","lineText"]  properties: navigationType,filepath,symbolName,lineText
-      safe.navigationType = String(args.navigationType ?? args.navType ?? "findReferences");
+      // Actual VS schema (live dump): required ["navigationType","filepath","symbolName","lineText"]
+      const q = String(args.query ?? args.symbolName ?? args.symbol ?? args.name ?? "");
+      safe.symbolName = q;
+      safe.navigationType = String(args.navigationType ?? args.navType ?? args.type ?? "findReferences");
       safe.filepath = String(args.filepath ?? args.filePath ?? args.filename ?? "");
-      safe.symbolName = String(args.symbolName ?? args.symbol ?? args.query ?? args.name ?? "");
       safe.lineText = String(args.lineText ?? args.line ?? args.text ?? "");
     } else if (/^nuget_get_latest_package_version$/i.test(name)) {
       // required: ["solutionDirectory","packageName","includePrerelease"]  properties: solutionDirectory,packageName,includePrerelease
@@ -735,6 +743,10 @@ function normalizeToolCall(tc) {
       for (const [k, v] of Object.entries(args)) {
         if (v != null) safe[k] = v;
       }
+    } else if (/^lookup_vs$/i.test(name)) {
+      // required: ["terms"]  properties: terms
+      const rawTerms = args.terms ?? args.query ?? args.queries ?? args.search ?? args.searchTerms ?? "";
+      safe.terms = Array.isArray(rawTerms) ? rawTerms.map(String) : [String(rawTerms)];
     } else {
       return tc;
     }
@@ -1475,6 +1487,7 @@ app.post("/v1/chat/completions", async c => {
 
     let toolFailStreak = 0;
     let toolLoopBroken = false;
+    _resetReasoning(); // position-based reasoning cache cursor
     for (const m of messages) {
       const role = (m.role || "").toLowerCase().trim();
       if (role === "system") {
@@ -1528,7 +1541,63 @@ app.post("/v1/chat/completions", async c => {
             continue;
           }
         }
-        const tc = typeof m.content === "string" ? m.content : JSON.stringify(m.content || "");
+        let tc = typeof m.content === "string" ? m.content : JSON.stringify(m.content || "");
+        // Terminal fallback: execute commands server-side when VS terminal is unavailable
+        if (config.terminalFallback !== false && /Failed to find a valid Visual Studio terminal/i.test(tc)) {
+          const callId = m.tool_call_id;
+          const lastMsg = userMsgs.length > 0 ? userMsgs[userMsgs.length - 1] : null;
+          if (lastMsg?.role === "assistant" && lastMsg?.tool_calls) {
+            const matchingCall = lastMsg.tool_calls.find(c => c.id === callId && /^(run_command_in_terminal|execute_command)$/i.test(c.function?.name));
+            if (matchingCall) {
+              try {
+                const callArgs = typeof matchingCall.function.arguments === "string" ?
+                  JSON.parse(matchingCall.function.arguments) : (matchingCall.function.arguments || {});
+                const cmdRaw = String(callArgs.command || callArgs.cmd || "");
+                let cmd = cmdRaw;
+                if (cmd) {
+                  // Auto-fix: replace pwsh with powershell (pwsh/PS Core may not be installed)
+                  cmd = cmd.replace(/^pwsh(\.exe)?(\s+-)/i, "powershell$2");
+                  const cwd = callArgs.cwd || process.cwd();
+                  const { exec } = await import("node:child_process");
+                  log(`[term] proxy-exec: ${cmd}`);
+                  // Wrap in powershell -EncodedCommand to avoid quoting issues
+                  const encoded = Buffer.from(cmd, "utf16le").toString("base64");
+                  let result, exitCode;
+                  try {
+                    const outcome = await new Promise((resolve, reject) => {
+                      exec(`powershell -NoProfile -EncodedCommand ${encoded}`, {
+                        encoding: "utf8",
+                        timeout: 60000,
+                        cwd,
+                        maxBuffer: 1024 * 1024,
+                        windowsHide: true,
+                      }, (error, stdout, stderr) => {
+                        if (error) {
+                          resolve({ text: ((stdout || "") + (stderr || "")).trim(), code: error.code || 1 });
+                        } else {
+                          resolve({ text: (stdout || "").trim(), code: 0 });
+                        }
+                      });
+                    });
+                    result = outcome.text;
+                    exitCode = outcome.code;
+                  } catch (execErr) {
+                    result = execErr.message;
+                    exitCode = 1;
+                  }
+                  // Truncate huge outputs so the AI can still parse the result
+                  const maxLen = 6000;
+                  if (result.length > maxLen) {
+                    result = result.slice(0, maxLen) + `\n\n[truncated ${result.length - maxLen} chars]`;
+                  }
+                  tc = `Command output (exit ${exitCode}):\n${result}`;
+                }
+              } catch (execErr) {
+                log(`[term] proxy-exec fail: ${execErr.message}`);
+              }
+            }
+          }
+        }
         if (toolLoopBroken) continue;
         if (/error|fail|invalid|timeout/i.test(tc)) {
           toolFailStreak++;
@@ -1550,6 +1619,10 @@ app.post("/v1/chat/completions", async c => {
     // Inject tool instructions into system prompt for agent mode (token-optimized)
     if (vsTools?.length) {
       systemMsg += (systemMsg ? "\n\n" : "") + compactToolInstructions();
+      // Terminal guidance: tell AI how to handle VS terminal unavailability
+      if (config.terminalFallback !== false && vsTools.some(t => t.function?.name === "run_command_in_terminal" || t.function?.name === "execute_command")) {
+        systemMsg += "\n\nVS TERMINAL: The Visual Studio terminal may not be available. If run_command_in_terminal fails with 'Failed to find a valid Visual Studio terminal', output the command in a ```powershell code block for the user to paste into Developer PowerShell (View > Terminal in VS).";
+      }
     }
 
     // VS: prepend project file update instruction at TOP for maximum attention

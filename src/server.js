@@ -925,6 +925,21 @@ function normalizeToolCall(tc) {
         }
       } catch {}
     }
+    if (/^get_file$/i.test(name)) {
+      try {
+        const safe = {};
+        const fnMatch = raw2.match(/"filename"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+        safe.filename = fnMatch ? fnMatch[1].replace(/\\+/g, "/").replace(/\/{2,}/g, "/") : "";
+        const slMatch = raw2.match(/"startLine"\s*:\s*(\d+)/);
+        safe.startLine = slMatch ? parseInt(slMatch[1], 10) : 1;
+        const elMatch = raw2.match(/"endLine"\s*:\s*(\d+)/);
+        safe.endLine = elMatch ? parseInt(elMatch[1], 10) : 999999;
+        if (safe.filename) {
+          log(`\x1b[33m[get_file] salvaged filename=${safe.filename} startLine=${safe.startLine} endLine=${safe.endLine}\x1b[0m`);
+          return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
+        }
+      } catch {}
+    }
     if (/^replace_string_in_file$/i.test(name)) {
       try {
         const safe = {};

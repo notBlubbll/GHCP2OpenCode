@@ -976,7 +976,12 @@ function normalizeToolCall(tc) {
         safe.query = qMatch ? qMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "";
         safe.isRegexp = /"isRegexp"\s*:\s*true/i.test(raw2);
         const ipMatch = raw2.match(/"includePattern"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-        safe.includePattern = ipMatch ? ipMatch[1] : null;
+        if (ipMatch) {
+          safe.includePattern = ipMatch[1];
+        } else {
+          const unq = raw2.match(/"includePattern"\s*:\s*([^,}\s]+)/);
+          safe.includePattern = (unq && unq[1] !== 'null') ? unq[1] : null;
+        }
         const mrMatch = raw2.match(/"maxResults"\s*:\s*(\d+)/);
         safe.maxResults = mrMatch ? parseInt(mrMatch[1], 10) : null;
         if (safe.query) {

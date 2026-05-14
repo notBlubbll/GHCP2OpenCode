@@ -262,6 +262,17 @@ const config = {
     const v = Bun.env.PROXY_TERM;
     return v === undefined ? true : v === "true" || v === "1";
   },
+  get sessionKeepaliveEnabled() {
+    const v = Bun.env.SESSION_KEEPALIVE_ENABLED;
+    return v === undefined ? true : v === "true" || v === "1";
+  },
+  get sessionKeepaliveIntervalMs() {
+    return Math.max(30000, parseInt(Bun.env.SESSION_KEEPALIVE_INTERVAL_MS || "120000", 10));
+  },
+  get sessionKeepaliveIdleTimeoutMs() {
+    const interval = this.sessionKeepaliveIntervalMs;
+    return Math.max(interval * 2, parseInt(Bun.env.SESSION_KEEPALIVE_IDLE_TIMEOUT_MS || "600000", 10));
+  },
 };
 
 export function setApiKey(key) { Bun.env.OPENCODE_API_KEY = key; }

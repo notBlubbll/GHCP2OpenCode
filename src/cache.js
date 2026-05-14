@@ -33,11 +33,12 @@ function normMessages(msgs) {
   }).join("\n").replace(/\s+/g, " ").trim();
 }
 
-export function cacheKey(req) {
+export function cacheKey(req, sessionId) {
   const parts = [
     req.model,
     String(req.options?.temperature ?? 1),
     String(req.tools?.length ?? 0),
+    sessionId || "",
     normMessages(req.messages || []),
   ];
   return hash(parts.join("|")).toString(36);

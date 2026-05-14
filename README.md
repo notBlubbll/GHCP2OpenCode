@@ -308,11 +308,11 @@ Persists per-key cooldown state between restarts. See [Key Cooldown Checker](#ke
 
 ### Prompt cache (in-memory LRU)
 
-LRU with TTL. Responses keyed by hash of model + temperature + tool count + normalized messages. Cache hits replay instantly with zero tokens. Controlled by `CACHE_ENABLED`/`CACHE_MAX_SIZE`/`CACHE_TTL_SEC`.
+LRU with TTL. Responses keyed by hash of model + temperature + tool count + **session discriminator** + normalized messages. Cache hits replay instantly with zero tokens. Controlled by `CACHE_ENABLED`/`CACHE_MAX_SIZE`/`CACHE_TTL_SEC`.
 
-### Reasonings cache (in-memory)
+### Reasonings cache (in-memory, session-scoped)
 
-Per-message reasoning text from `<think>` tags is cached and re-attached when a cached prompt-response pair is replayed. Ensures DeepSeek-style reasoning isn't lost on cache hits.
+Per-session reasoning text from `<think>` tags is cached and re-attached when a cached prompt-response pair is replayed. Ensures DeepSeek-style reasoning isn't lost on cache hits. **Session-scoped** — different conversations never share reasoning data, even if they produce the same text.
 
 ### Free model validation
 
@@ -321,6 +321,33 @@ On startup and refresh, each free model is pinged with a lightweight request (`m
 ### Connectivity ping
 
 A quick `big-pickle` ping runs at startup to verify Zen API reachability: `200 ok`, `401 key denied`, or `unreachable`.
+
+---
+
+## Session Tracking
+
+The proxy detects and numbers distinct conversation sessions. Each new chat tab or task context gets a monotonic session ID, visible in the console:
+
+```
+new session 3 (vscode, go/deepseek-v4-flash, c:\workspace\project)
+[vscode][3]>[go/deepseek-v4-flash]
+[vscode][3] stream done (42 chunks)
+```
+
+### How sessions are detected
+
+A session is identified by hashing:
+
+1. **All user messages before the first assistant/tool message** — VS sends the context block + the user's query as separate user messages, and the combined hash uniquely identifies each chat tab
+2. **Workspace root** — same query in a different project is treated as a different session
+
+Switching models mid-conversation keeps the same session — the message history and cached context carry over.
+
+This means different chat tabs, different workspaces, and different models get separate session IDs with isolated caches.
+
+### Cache isolation
+
+All in-memory caches (prompt-response LRU, reasoning/`<think>` text) are **session-scoped** — data from one conversation never leaks into another. Two different users asking the same question will never get each other's cached responses or reasoning text.
 
 ---
 

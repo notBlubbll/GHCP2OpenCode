@@ -48,6 +48,7 @@ import { check as cacheCheck, store as cacheStore, cacheKey } from "./cache.js";
 import { ModelConcurrencyManager, RateLimitError, truncateToolMessagesInPayload, checkRequestBodySize } from "./concurrency.js";
 import { compactIdentity, compactToolInstructions, compactOllamaToolInstructions, compactCodeCompletionPrompt, compressMessages } from "./token-optimizer.js";
 import { m365ChatCompletion, m365ChatCompletionStream, M365CopilotError } from "./m365-client.js";
+import { trackSession, touchSession, shutdown as keepaliveShutdown, stats as keepaliveStats } from "./session-keepalive.js";
 import { handleServiceCommand, runAsService } from "./win-service.js";
 import { log, error as logErr, reqLog } from "./logger.js";
 
@@ -388,13 +389,27 @@ async function _simStream(w, base, hasTools, toolCalls, text, reasoningContent) 
   }
 }
 
-// Cache reasoning_content from DeepSeek thinking mode (VS doesn't relay it)
-// Primary: position-based FIFO (guarantees correct ordering per-request)
-// Fallback: content/tool hash + model-key
-const _assistantReasonings = []; // FIFO queue, populated per-AI-response
-let _reasoningIndex = 0;          // cursor reset per-request
-const reasoningCache = new Map(); // contentHash -> reasoningContent (hash fallback)
-function _resetReasoning() { _reasoningIndex = 0; }
+// Reasoning content cache — bridges across requests within same session
+// Keyed by conversation ID (first user msg + model + workspace) to prevent cross-session poisoning
+const _crossReqReasoningCache = new Map(); // convId:contentHash → reasoningContent
+
+// Session tracking — detect and number distinct conversation contexts
+const _sessionRegistry = new Map(); // convId → { id, clientTag, createdAt }
+let _sessionCounter = 0;
+
+function _convId(messages, model, workspaceRoot) {
+  const preAssistant = [];
+  for (const m of messages) {
+    const role = (m.role || "").toLowerCase().trim();
+    if (role === "assistant" || role === "tool") break;
+    if (role === "user") preAssistant.push(typeof m.content === "string" ? m.content : JSON.stringify(m.content));
+  }
+  const anchor = preAssistant.join("\n") + "|" + (workspaceRoot || "");
+  let h = 5381;
+  for (let i = 0; i < anchor.length; i++) h = ((h << 5) + h + anchor.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+
 function _msgHash(msg) {
   if (msg.content != null) {
     const c = (typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content))
@@ -408,24 +423,54 @@ function _msgHash(msg) {
   return "";
 }
 
-function _cacheReasoning(msg, model, reasoning) {
-  if (!reasoning) return;
-  _assistantReasonings.push(reasoning);
-  if (_assistantReasonings.length > 50) _assistantReasonings.shift();
-  const h = _msgHash(msg);
-  if (h) reasoningCache.set(h, reasoning);
-  reasoningCache.set(`mdl:${model}`, reasoning); // model-key fallback
-}
+// Create per-request reasoning context — isolates concurrent sessions
+function createReasoningContext(messages, model, workspaceRoot, clientTag, provider, thinkingTag) {
+  const conv = _convId(messages, model, workspaceRoot);
+  const fifo = [];
+  let cursor = 0;
 
-function _getReasoning(msg, model) {
-  // First try exact hash cache match
-  const h = _msgHash(msg);
-  if (h && reasoningCache.has(h)) return reasoningCache.get(h);
-  // Position-based fallback (guarantees correct per-message ordering)
-  if (_reasoningIndex < _assistantReasonings.length) {
-    return _assistantReasonings[_reasoningIndex++];
+  let sessionEntry = _sessionRegistry.get(conv);
+  if (!sessionEntry) {
+    _sessionCounter++;
+    sessionEntry = { id: _sessionCounter, clientTag, createdAt: new Date().toISOString() };
+    _sessionRegistry.set(conv, sessionEntry);
+    log(`\x1b[36mnew session ${_sessionCounter} \x1b[90m(\x1b[0m${clientTag}\x1b[90m, \x1b[0m${provider}/${model}\x1b[90m, \x1b[0m${workspaceRoot || "?"}\x1b[90m)\x1b[0m`);
   }
-  return reasoningCache.get(`mdl:${model}`); // model-key fallback
+
+  const sessionId = sessionEntry.id;
+  const tagPrefix = `\x1b[35m${clientTag}\x1b[0m`;
+  const sessionPrefix = `${tagPrefix}[\x1b[36m${sessionId}\x1b[0m]`;
+
+  const prefixed = (key) => `c:${conv}:${key}`;
+
+  log(`${sessionPrefix}>\x1b[33m[\x1b[0m${provider}/\x1b[1m${model}\x1b[0m\x1b[33m]\x1b[0m`);
+
+  function seslog(msg) {
+    log(`${sessionPrefix} ${msg}`);
+  }
+
+  return {
+    conv,
+    sessionId,
+    sessionPrefix,
+    seslog,
+    reset() { cursor = 0; },
+    cache(msg, mdl, reasoning) {
+      if (!reasoning) return;
+      fifo.push(reasoning);
+      if (fifo.length > 50) fifo.shift();
+      const h = _msgHash(msg);
+      if (h) _crossReqReasoningCache.set(prefixed(h), reasoning);
+      _crossReqReasoningCache.set(prefixed(`mdl:${mdl}`), reasoning);
+    },
+    get(msg, mdl) {
+      const h = _msgHash(msg);
+      if (h && _crossReqReasoningCache.has(prefixed(h))) return _crossReqReasoningCache.get(prefixed(h));
+      if (cursor < fifo.length) return fifo[cursor++];
+      return _crossReqReasoningCache.get(prefixed(`mdl:${mdl}`));
+    },
+    crossCacheSize() { return _crossReqReasoningCache.size; },
+  };
 }
 
 // Ollama -> Go model mappings (what VS Copilot sends vs what Go API expects)
@@ -1280,8 +1325,9 @@ app.get("/api/stats", async c => {
     uptime: process.uptime(),
     models: { total: models.length, free: free.length, paid: paid.length },
     concurrency: queueStats,
-    reasoning_cache: reasoningCache.size,
+    reasoning_cache: _crossReqReasoningCache.size,
     keys: { configured: config.hasKey },
+    keepalive: keepaliveStats(),
   });
 });
 
@@ -1691,7 +1737,9 @@ app.post("/v1/chat/completions", async c => {
 
     let toolFailStreak = 0;
     let toolLoopBroken = false;
-    _resetReasoning(); // position-based reasoning cache cursor
+    const provider = isM365Model(goModel) ? "m365" : isPollModel(goModel) ? "poll" : isFreeTierModel(goModel) ? "zen" : "go";
+    const reasoningCtx = createReasoningContext(messages, goModel, getWorkspaceRoot(messages), clientTag, provider, thinkingTag);
+    reasoningCtx.reset();
     for (const m of messages) {
       const role = (m.role || "").toLowerCase().trim();
       if (role === "system") {
@@ -1719,7 +1767,7 @@ app.post("/v1/chat/completions", async c => {
             if (m.reasoning_content) {
               msg.reasoning_content = m.reasoning_content;
             } else {
-              const rc = _getReasoning(m, goModel);
+              const rc = reasoningCtx.get(m, goModel);
               if (rc) msg.reasoning_content = rc;
             }
             userMsgs.push(msg);
@@ -1727,9 +1775,9 @@ app.post("/v1/chat/completions", async c => {
             const msg = { role: "assistant", content: m.content };
             if (m.reasoning_content) {
               msg.reasoning_content = m.reasoning_content;
-              _cacheReasoning(m, goModel, m.reasoning_content);
+              reasoningCtx.cache(m, goModel, m.reasoning_content);
             } else {
-              const rc = _getReasoning(m, goModel);
+              const rc = reasoningCtx.get(m, goModel);
               if (rc) msg.reasoning_content = rc;
             }
             userMsgs.push(msg);
@@ -1857,12 +1905,15 @@ app.post("/v1/chat/completions", async c => {
     if (body.chat_template_kwargs != null) ollamaReq.chat_template_kwargs = body.chat_template_kwargs;
     if (body.thinking_token_budget != null) ollamaReq.thinking_token_budget = body.thinking_token_budget;
 
+    // Session keepalive — save compressed messages so background pings keep KV cache warm
+    trackSession(reasoningCtx.sessionId, goModel, compressedMessages, clientTag);
+
     // Cache check (non-streaming only)
-    const ck = streamMode ? null : cacheKey(ollamaReq);
+    const ck = streamMode ? null : cacheKey(ollamaReq, reasoningCtx.conv);
     const cached = ck ? cacheCheck(ck) : null;
     if (cached) {
       const { text, toolCalls, hasTools, reasoningContent } = cached.value;
-      if (toolCalls?.length) log(`\x1b[35m[cache-hit] returning ${toolCalls.length} cached tool calls: ${toolCalls.map(tc => tc.function?.name).join(", ")}\x1b[0m`);
+      if (toolCalls?.length) reasoningCtx.seslog(`\x1b[35m[cache-hit] returning ${toolCalls.length} cached tool calls: ${toolCalls.map(tc => tc.function?.name).join(", ")}\x1b[0m`);
 
       if (clientWantsStream) {
         return stream(c, async (s) => {
@@ -1986,7 +2037,7 @@ app.post("/v1/chat/completions", async c => {
           const virtualMsg = allToolCalls.length > 0
             ? { tool_calls: allToolCalls }
             : { content: rawFullText };
-          _cacheReasoning(virtualMsg, goModel, reasoningContent);
+          reasoningCtx.cache(virtualMsg, goModel, reasoningContent);
         }
 
         // Cache collected output for future non-streaming hits
@@ -1994,7 +2045,7 @@ app.post("/v1/chat/completions", async c => {
           cacheStore(ck, { text: fullText, toolCalls: allToolCalls, hasTools: hasTools || allToolCalls.length > 0, reasoningContent });
         }
 
-        log(`stream done (${tokenCount} chunk${tokenCount !== 1 ? "s" : ""})`);
+        reasoningCtx.seslog(`stream done (${tokenCount} chunk${tokenCount !== 1 ? "s" : ""})`);
         } finally {
           release();
         }
@@ -2097,14 +2148,14 @@ app.post("/v1/chat/completions", async c => {
       const virtualMsg = hasTools
         ? { tool_calls: allToolCalls }
         : { content: rawFullText };
-      _cacheReasoning(virtualMsg, goModel, reasoningContent);
+      reasoningCtx.cache(virtualMsg, goModel, reasoningContent);
     }
 
     if (ck) cacheStore(ck, { text: cleanText, toolCalls: allToolCalls, hasTools, reasoningContent });
 
     const resp = oaiResp(hasTools ? null : cleanText, hasTools ? allToolCalls : undefined, hasTools ? "tool_calls" : "stop", model, usage);
-    if (hasTools) log(`\x1b[35m[TOOLS-TO-VS] ${allToolCalls.map(tc => `${tc.function.name}(${tc.function.arguments})`).join(" | ")}\x1b[0m`);
-    else log(`\x1b[35m[TEXT-TO-VS] ${cleanText.replace(/\n/g,"\\n")}\x1b[0m`);
+    if (hasTools) reasoningCtx.seslog(`\x1b[35m[TOOLS-TO-VS] ${allToolCalls.map(tc => `${tc.function.name}(${tc.function.arguments})`).join(" | ")}\x1b[0m`);
+    else reasoningCtx.seslog(`\x1b[35m[TEXT-TO-VS] ${cleanText.replace(/\n/g,"\\n")}\x1b[0m`);
     if (reasoningContent) {
       const choice = resp.choices[0];
       addReasoningAliases(choice.message, reasoningContent);
@@ -2471,6 +2522,7 @@ app.post("/api/generate", async c => {
 
 app.get("/stop", c => {
   log("Shutdown requested via /stop");
+  keepaliveShutdown();
   setTimeout(() => process.exit(0), 100);
   return c.json({ status: "shutting down" });
 });
@@ -2829,6 +2881,7 @@ function gracefulShutdown(signal) {
   if (_shuttingDown) return;
   _shuttingDown = true;
   log(`Received ${signal} — gracefully shutting down (30s timeout)...`);
+  keepaliveShutdown();
   setTimeout(() => { err("Forced exit after shutdown timeout"); process.exit(1); }, 30000);
   if (serverRef?.stop) {
     serverRef.stop(true);

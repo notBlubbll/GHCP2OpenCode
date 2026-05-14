@@ -63,7 +63,10 @@ GitHub Copilot extension             src/server.js                       OpenCod
 - `extractToolCalls()` — parse AI response text into tool calls (markdown blocks → `create_file`)
 - `processThinkTags()` — `<think>` tag extraction for DeepSeek reasoning
 - `_simStream()` — simulated SSE streaming from non-stream responses (VS 2026)
-- `_cacheReasoning()` / `_getReasoning()` — per-message reasoning cache (DeepSeek)
+- `createReasoningContext(messages, model, workspace, clientTag, provider, thinking)` — per-request reasoning cache factory with conversation-scoped isolation (prevents cross-session poisoning)
+- `_convId(messages, model, workspace)` — stable session identifier from hashed pre-assistant user messages + model + workspace
+- `_msgHash(msg)` — content/tool-call hash for per-message reasoning lookup
+- `_sessionRegistry` / `_sessionCounter` — global session tracking (Map of convId → { id, clientTag, createdAt }), assigns monotonic session numbers
 - `normalizeOpenAIParams()` — camelCase → snake_case parameter mapping
 - `sanitizeContent()` — strip `<|im_start|>`, `<|im_end|>` tokens
 - `mapModel(name)` — resolve model names, strip `[FREE]`/`[GO]`/`[M365]` prefixes
@@ -101,10 +104,19 @@ GitHub Copilot extension             src/server.js                       OpenCod
 - `truncateToolMessagesInPayload(payload, opts)` — truncate tool outputs
 - `checkRequestBodySize(bodyJson, maxBytes)` — 413 guard
 
+### `src/session-keepalive.js`
+**Session keepalive — periodically pings active upstream sessions to prevent KV cache eviction.** Inspired by [TaskSync #98](https://github.com/4regab/TaskSync/issues/98).
+
+- `trackSession(sessionId, model, messages, clientTag)` — save compressed messages after each real request, schedule keepalive timer
+- `touchSession(sessionId)` — reset idle timer on incoming request (keeps session alive across active usage)
+- `doKeepalive(sessionId)` — send minimal upstream ping (`max_tokens:1`, `stream:false`, no tools) to keep KV cache warm. Stops after `SESSION_KEEPALIVE_IDLE_TIMEOUT_MS` of inactivity
+- `shutdown()` — clean up all timers on graceful shutdown
+- `stats()` — returns session count, total pings, config values
+
 ### `src/cache.js` (93 lines)
 **In-memory LRU prompt-response cache with TTL.**
 
-- `cacheKey(req)` — hash of model + temperature + tool count + normalized messages
+- `cacheKey(req, sessionId)` — hash of model + temperature + tool count + session discriminator + normalized messages
 - `check(key)` / `store(key, value)` — cache operations
 - `invalidate()` / `stats()` / `configure(opts)` — cache management
 
@@ -373,8 +385,8 @@ Cooldown reason is `"401"` (auth denied, 7-day cooldown) or `"429"` (rate limite
 
 | Cache | Module | Type | Key |
 |-------|--------|------|-----|
-| Prompt-response | `src/cache.js` | LRU with TTL | Hash of model + temperature + tool count + normalized messages |
-| Reasonings | `src/server.js` `_cacheReasoning()` | Plain Map | Per-message `<think>` tag text |
+| Prompt-response | `src/cache.js` | LRU with TTL | Hash of model + temperature + tool count + session discriminator + normalized messages |
+| Reasonings | `src/server.js` `createReasoningContext()` | Per-session Map + per-request FIFO | Conversation-scoped: `convId:contentHash`; per-request position-based fallback |
 | Free models | `src/opencode-client.js` `FREE_TIER_MODELS` | Static array | Hardcoded — validated via ping on startup |
 | HIDE_FREE | `Bun.env.HIDE_FREE` | Env var | `false` — hide free tier + separators, show only premium models |
 | Paid models | `src/opencode-client.js` `_paidGoData` | Module var | Fetched from `/zen/go/v1/models` |
@@ -398,3 +410,65 @@ initModels()
       ├─ Build cooldownFromDisk Map (direct safety net)
       └─ Per-key ping (skipping keys in cooldown)
 ```
+
+---
+
+## Session Tracking & Isolation
+
+Distinct conversation contexts are detected and numbered. Each session gets a monotonic ID, and all cache keys are scoped by session to prevent cross-session data poisoning between concurrent users.
+
+### Session detection
+
+A session is identified by a **conversation ID** (convId) — a djb2 hash of:
+1. **All user messages before the first assistant/tool message** — this captures the VS context block + the user's actual first query, differentiating between different chat tabs even in the same workspace
+2. **Workspace root path** — same query in a different project is a different session
+
+```javascript
+function _convId(messages, model, workspace) {
+  // Hash ALL pre-assistant user messages (NOT just the first)
+  // VS sends context block + user query as separate user messages
+  const preAssistant = [];
+  for (const m of messages) {
+    if (role === "assistant" || role === "tool") break;
+    if (role === "user") preAssistant.push(content);
+  }
+  // Model is NOT included — switching models preserves the session
+  return hash(preAssistant.join("\n") + "|" + workspace);
+}
+```
+
+The convId is **stable across turns** in the same conversation (the pre-assistant prefix never changes), but **different across chat tabs** (the user's first query differs).
+
+### Session registry
+
+| Variable | Type | Purpose |
+|----------|------|---------|
+| `_sessionRegistry` | `Map<convId, {id, clientTag, createdAt}>` | Maps convId to session metadata |
+| `_sessionCounter` | `number` | Monotonic counter, incremented per new session |
+
+### Console output
+
+**New session:**
+```
+new session 3 (vscode, go/deepseek-v4-flash, c:\workspace\project)
+```
+
+**Every request (new or existing):**
+```
+[vscode][3]>[go/deepseek-v4-flash]
+[vscode][3] stream done (42 chunks)
+[vscode][3] [TOOLS-TO-VS] create_file(...) | grep_search(...)
+```
+
+Format: `[clientTag][sessionId]>[provider/model]` for request headers, `[clientTag][sessionId]` prefix for internal log lines.
+
+### Reasoning cache scoping
+
+The reasoning cache (`_crossReqReasoningCache`) is a global Map keyed by `c:{convId}:{contentHash}`. Two different sessions with the same assistant message content (e.g. both say "Ok, I'll do that") will never collide because the convId segment differs.
+
+The per-request FIFO (`_assistantReasonings` / cursor) is created fresh in `createReasoningContext()` — concurrent requests can never read each other's reasonings.
+
+### Prompt-response cache scoping
+
+`cacheKey(req, sessionId)` in `src/cache.js` includes the session discriminator (`convId`) in the cache key. Two different sessions with identical full message histories (vanishingly unlikely) are still isolated.
+

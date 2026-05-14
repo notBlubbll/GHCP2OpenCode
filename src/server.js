@@ -928,7 +928,8 @@ function normalizeToolCall(tc) {
     if (/^get_file$/i.test(name)) {
       try {
         const safe = {};
-        const fnMatch = raw2.match(/"filename"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+        let fnMatch = raw2.match(/"filename"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+        if (!fnMatch) fnMatch = raw2.match(/"filename"\s*:\s*"((?:[^"\\]|\\.)*)/);
         safe.filename = fnMatch ? fnMatch[1].replace(/\\+/g, "/").replace(/\/{2,}/g, "/") : "";
         const slMatch = raw2.match(/"startLine"\s*:\s*(\d+)/);
         safe.startLine = slMatch ? parseInt(slMatch[1], 10) : 1;
@@ -1968,8 +1969,19 @@ app.post("/v1/chat/completions", async c => {
     const ck = streamMode ? null : cacheKey(ollamaReq, reasoningCtx.conv);
     const cached = ck ? cacheCheck(ck) : null;
     if (cached) {
-      const { text, toolCalls, hasTools, reasoningContent } = cached.value;
+      let { text, toolCalls, hasTools, reasoningContent } = cached.value;
       if (toolCalls?.length) reasoningCtx.seslog(`\x1b[35m[cache-hit] returning ${toolCalls.length} cached tool calls: ${toolCalls.map(tc => tc.function?.name).join(", ")}\x1b[0m`);
+
+      // Loop-break on cache hit: if AI text is telling user to call task_complete, auto-inject it
+      if (!toolCalls?.length && text && vsTools?.length) {
+        const hasTaskComplete = vsTools.some(t => t.function?.name === "task_complete");
+        if (hasTaskComplete && /\b(?:task_complete|mark(?:ed)?\s+the\s+task\s+as\s+complete)\b/i.test(text)) {
+          reasoningCtx.seslog(`\x1b[33m[cache] LOOP-BREAK: auto-calling task_complete\x1b[0m`);
+          toolCalls = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
+          hasTools = true;
+          text = "";
+        }
+      }
 
       if (clientWantsStream) {
         return stream(c, async (s) => {
@@ -2197,6 +2209,19 @@ app.post("/v1/chat/completions", async c => {
       cleanText = postThink.content;
       if (!reasoningContent && postThink.reasoning) reasoningContent = postThink.reasoning;
     }
+
+    // Prevent infinite "call task_complete" loop:
+    // When the AI's text response is telling the user to call task_complete
+    // and task_complete is in the available tools, auto-inject the call.
+    if (!allToolCalls.length && cleanText && vsTools?.length) {
+      const hasTaskComplete = vsTools.some(t => t.function?.name === "task_complete");
+      if (hasTaskComplete && /\b(?:task_complete|mark\s+the\s+task\s+as\s+complete)\b/i.test(cleanText)) {
+        reasoningCtx.seslog(`\x1b[33m[LOOP-BREAK] auto-calling task_complete to prevent infinite loop\x1b[0m`);
+        allToolCalls = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
+        cleanText = "";
+      }
+    }
+
     const hasTools = allToolCalls.length > 0;
 
     // Store reasoning keyed by content/tool hash

@@ -4,91 +4,6 @@ if (typeof Bun === 'undefined') {
 }
 try { process.stderr.write(`[gc2oc] startup pid=${process.pid} argv=${JSON.stringify(process.argv)}\r\n`); } catch {}
 
-// Console debug helpers — NO code-page changes (SetConsoleOutputCP triggers raster font!)
-let _getConsoleCP = () => -1;
-let _getConsoleOutCP = () => -1;
-let _dbgCP = (lbl) => {};
-if (process.platform === 'win32') {
-  try {
-    if (typeof Bun !== 'undefined') {
-      const { dlopen, FFIType } = await import('bun:ffi');
-      const k32 = dlopen('kernel32.dll', {
-        GetConsoleOutputCP: { args: [], returns: FFIType.u32 },
-        GetConsoleCP:       { args: [], returns: FFIType.u32 },
-      });
-      _getConsoleOutCP = () => k32.symbols.GetConsoleOutputCP();
-      _getConsoleCP = () => k32.symbols.GetConsoleCP();
-    } else {
-      _getConsoleOutCP = _getConsoleCP = () => {
-        try {
-          const out = require('child_process').execSync('chcp', { encoding: 'utf8' }).trim();
-          return parseInt(out.split(':')[1] || out, 10);
-        } catch { return -1; }
-      };
-    }
-  } catch {}
-  _dbgCP = (lbl) => {
-    try {
-      const o = _getConsoleOutCP(), i = _getConsoleCP();
-      process.stderr.write(`\x1b[35m[CP-DBG] ${lbl} out=${o} in=${i}\x1b[0m\r\n`);
-    } catch {}
-  };
-}
-_dbgCP('startup');
-
-// Force Consolas font — SetConsoleOutputCP triggers raster fallback, set font instead
-if (process.platform === 'win32') {
-  try {
-    if (typeof Bun !== 'undefined') {
-      const { dlopen, FFIType } = await import('bun:ffi');
-      const k32 = dlopen('kernel32.dll', {
-        GetStdHandle: { args: [FFIType.i32], returns: FFIType.pointer },
-        SetCurrentConsoleFontEx: { args: [FFIType.pointer, FFIType.bool, { type: 'pointer' }], returns: FFIType.bool },
-        GetCurrentConsoleFontEx: { args: [FFIType.pointer, FFIType.bool, { type: 'pointer' }], returns: FFIType.bool },
-      });
-      // Build CONSOLE_FONT_INFO_EX: cbSize(4) nFont(4) dwFontSizeX(2) dwFontSizeY(2) FontFamily(4) FontWeight(4) FaceName(64)
-      const buf = new ArrayBuffer(84);
-      const dv = new DataView(buf);
-      dv.setUint32(0, 84, true); // cbSize
-      dv.setUint32(4, 0, true);  // nFont
-      dv.setInt16(8, 0, true);   // dwFontSizeX
-      dv.setInt16(10, 14, true); // dwFontSizeY = 14
-      dv.setUint32(12, 54, true); // FontFamily
-      dv.setUint32(16, 400, true); // FontWeight
-      const name = new Uint8Array(buf, 20, 64);
-      new TextEncoder().encodeInto("Consolas\0", name); // FaceName
-      const handle = k32.symbols.GetStdHandle(-11); // STD_OUTPUT_HANDLE
-      if (handle != null) {
-        try { k32.symbols.SetCurrentConsoleFontEx(handle, false, buf); } catch {}
-      }
-    } else {
-      const ps = `Add-Type -Name CF -Namespace Z @'\r\n` +
-        `[DllImport("kernel32.dll")] public static extern bool SetCurrentConsoleFontEx(IntPtr h, bool mw, ref Font f);\r\n` +
-        `[DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int n);\r\n` +
-        `public struct Font { public int cb; public uint n; public short sx; public short sy; public int fam; public int wt;\r\n` +
-        `[Runtime.InteropServices.MarshalAs(Runtime.InteropServices.UnmanagedType.ByValTStr,SizeConst=32)] public string fn; }\r\n` +
-        `'@\r\n` +
-        `$f=New-Object Z.Font; $f.cb=84; $f.fn='Consolas'; $f.sx=0; $f.sy=14; $f.fam=54; $f.wt=400;\r\n` +
-        `[Z.CF]::SetCurrentConsoleFontEx([Z.CF]::GetStdHandle(-11),$false,[ref]$f)`;
-      const encoded = Buffer.from(ps, 'utf16le').toString('base64');
-      require('child_process').execSync(`powershell -NoProfile -EncodedCommand ${encoded}`, { stdio: 'ignore', timeout: 5000 });
-    }
-  } catch {}
-}
-
-// Watchdog — logs if something changes the code page
-if (process.platform === 'win32') {
-  let _lastCP = _getConsoleOutCP();
-  const _ivMs = typeof Bun !== 'undefined' ? 500 : 2000;
-  setInterval(() => {
-    const cur = _getConsoleOutCP();
-    if (cur !== _lastCP) {
-      _dbgCP(`CP-CHANGED! was ${_lastCP} → now ${cur}`);
-      _lastCP = cur;
-    }
-  }, _ivMs).unref();
-}
-
 // 1b. Crypto polyfill (Node.js < 19)
 if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
   const nodeCrypto = await import("node:crypto");
@@ -2809,7 +2724,6 @@ async function _runServer() {
   await new Promise((resolve) => {
     serverRef.listen(port, host, 1024, () => {
       log(`Listening on http://${host}:${port}`);
-      _dbgCP('server-started');
       resolve();
     });
   });
@@ -2817,8 +2731,6 @@ async function _runServer() {
 
 // Load models & show banner in background
 let models = await initModels();
-
-_dbgCP('pre-banner');
 
 process.stdout.write("\x1b]2;gc2oc\x07");
 
@@ -2836,11 +2748,14 @@ const W = "\x1b[37m";
 const boxW = 64;
 const P = (s) => process.stdout.write(s + "\n");
 const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, "").length;
+// CJK-safe: use ASCII | and - for borders (Unicode box-drawing is double-width in CJK fonts)
+const V = "|";   // vertical border
+const H = "-";   // horizontal border
 const line = (l) => {
   const pad = boxW - 4 - vis(l);
-  return S + "\u2502" + R + "  " + l + " ".repeat(Math.max(0, pad)) + S + "\u2502" + R;
+  return S + V + R + "  " + l + " ".repeat(Math.max(0, pad)) + S + V + R;
 };
-const hr = S + "\u2500".repeat(boxW - 2);
+const hr = S + H.repeat(boxW - 2);
 
 const hasPaid = models.some(m => m.model === `${SEP_PAID}:latest`);
 const hasPoll = models.some(m => m.model === `${SEP_FREE_P}:latest`);
@@ -2855,15 +2770,14 @@ else log("\x1b[33m[status] Free mode — no API key\x1b[0m");
 if (hasM365) log("\x1b[36m[status] M365 Copilot connected\x1b[0m");
 
 P("");
-_dbgCP('banner-line1');
-P(W + "\u256d" + hr + W + "\u256e" + R);
-P(line(S + B + "\u250f\u2513\u2513\u250f\u250f\u2513\u250f\u2513\u250f\u2513\u250f\u2513\u250f\u2513" + R));
+P(W + "+" + hr + W + "+" + R);                                            // ╭───╮
+P(line(S + B + "\u250f\u2513\u2513\u250f\u250f\u2513\u250f\u2513\u250f\u2513\u250f\u2513\u250f\u2513" + R));  // gc2oc logo
 P(line(S + B + "\u2503\u2513\u2523\u252b\u2503 \u2503\u2503\u250f\u251b\u2503\u2503\u2503 " + R + " " + S + "github copilot proxy" + modeLabel + R));
 P(line(S + B + "\u2517\u251b\u251b\u2517\u2517\u251b\u2523\u251b\u2517\u2501\u2517\u251b\u2517\u251b" + R));
-P(W + "\u251c" + hr + W + "\u2524" + R);
+P(W + "+" + hr + W + "+" + R);                                            // ├───┤
 const portLabel = port === 11434 ? `port: ${port} (default)` : `port: ${port}`;
-P(line(S + portLabel + "  │  vs2026  │  models.dev" + R));
-P(W + "\u251c" + hr + W + "\u2524" + R);
+P(line(S + portLabel + "  |  vs2026  |  models.dev" + R));
+P(W + "+" + hr + W + "+" + R);                                            // ├───┤
 
 // Split models into sections by separator order (M365 → Free → Poll → Premium)
 const m365Start = models.findIndex(m => m.model === `${SEP_M365}:latest`);
@@ -2888,38 +2802,38 @@ function printTable(list) {
       ? (m.model.replace(":latest", "")).slice(0, 23) + "\u2026"
       : (m.model.replace(":latest", "")).padEnd(24);
     const params = m.maxParams ? m.maxParams.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".").padEnd(9) : "-".padEnd(9);
-    P(line(name + S + " \u2502 " + R + id + S + " \u2502 " + R + params + R));
+    P(line(name + S + " | " + R + id + S + " | " + R + params + R));
   }
 }
 
 if (hasM365) {
   P(line(S + "M365 Copilot: " + S + `(${m365Models.length})` + R));
-  P(line(S + "Name".padEnd(20) + " \u2502 " + "ID".padEnd(24) + " \u2502 " + "Context" + R));
+  P(line(S + "Name".padEnd(20) + " | " + "ID".padEnd(24) + " | " + "Context" + R));
   printTable(m365Models);
 }
 
 if (!config.hideFree && freeModels.length) {
   if (hasM365) P(line(""));
   P(line(S + "Free: " + S + `(${freeModels.length})` + R));
-  P(line(S + "Name".padEnd(20) + " \u2502 " + "ID".padEnd(24) + " \u2502 " + "Context" + R));
+  P(line(S + "Name".padEnd(20) + " | " + "ID".padEnd(24) + " | " + "Context" + R));
   printTable(freeModels);
 }
 
 if (config.showPollModels && pollModels.length) {
   if (!config.hideFree && freeModels.length) P(line(""));
   P(line(S + "Pollinations: " + S + `(${pollModels.length})` + R));
-  P(line(S + "Name".padEnd(20) + " \u2502 " + "ID".padEnd(24) + " \u2502 " + "Context" + R));
+  P(line(S + "Name".padEnd(20) + " | " + "ID".padEnd(24) + " | " + "Context" + R));
   printTable(pollModels);
 }
 
 if (hasPaid) {
   if (!config.hideFree) P(line(""));
   P(line(S + "Premium: " + S + `(${paidModels.length})` + R));
-  P(line(S + "Name".padEnd(20) + " \u2502 " + "ID".padEnd(24) + " \u2502 " + "Context" + R));
+  P(line(S + "Name".padEnd(20) + " | " + "ID".padEnd(24) + " | " + "Context" + R));
   printTable(paidModels);
 }
 
-P(W + "\u2570" + hr + W + "\u256f" + R);
+P(W + "+" + hr + W + "+" + R);                                            // ╰───╯
 P("");
 
 // Console commands

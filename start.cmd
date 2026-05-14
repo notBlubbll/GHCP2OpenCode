@@ -31,7 +31,7 @@ REM 3. Set libuv thread pool size for DNS/file I/O concurrency
 if "%UV_THREADPOOL_SIZE%"=="" set UV_THREADPOOL_SIZE=8
 
 REM 4. Try Bun first
-bun --version >nul 2>&1
+where bun >nul 2>&1
 if %ERRORLEVEL% equ 0 (
     echo [INFO] Runtime: Bun
     if not exist node_modules (
@@ -50,7 +50,7 @@ if %ERRORLEVEL% equ 0 (
 )
 
 REM 5. Fallback to Node.js
-node --version >nul 2>&1
+where node >nul 2>&1
 if %ERRORLEVEL% equ 0 (
     echo [INFO] Runtime: Node.js
     if not exist node_modules\.package-lock.json (

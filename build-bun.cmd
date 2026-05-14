@@ -118,11 +118,31 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.ServiceProcess;
 using System.Threading;
 
 class StartWrapper
 {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetCurrentConsoleFontEx(IntPtr hConsoleOutput, bool bMaximumWindow, ref CONSOLE_FONT_INFO_EX lpConsoleCurrentFontEx);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr GetStdHandle(int nStdHandle);
+    const int STD_OUTPUT_HANDLE = -11;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct CONSOLE_FONT_INFO_EX
+    {
+        public int cbSize;
+        public uint nFont;
+        public short dwFontSizeX;
+        public short dwFontSizeY;
+        public int FontFamily;
+        public int FontWeight;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+        public string FaceName;
+    }
+
     public static volatile bool stopping;
     static Process currentProc;
     static string appId;
@@ -130,6 +150,7 @@ class StartWrapper
     static int Main(string[] args)
     {
         Environment.SetEnvironmentVariable("GC2OC_WRAPPED", "1");
+        try { SetConsoleFont(); } catch {}
         appId = GetAppId();
 
         if (!Environment.UserInteractive)
@@ -302,6 +323,24 @@ class StartWrapper
                 currentProc.Kill();
                 currentProc.WaitForExit(5000);
             }
+        }
+        catch { }
+    }
+
+    static void SetConsoleFont()
+    {
+        try
+        {
+            var font = new CONSOLE_FONT_INFO_EX();
+            font.cbSize = Marshal.SizeOf(font);
+            font.FaceName = "Consolas";
+            font.dwFontSizeX = 0;
+            font.dwFontSizeY = 14;
+            font.FontFamily = 54;
+            font.FontWeight = 400;
+            var handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            if (handle == new IntPtr(-1)) return;
+            SetCurrentConsoleFontEx(handle, false, ref font);
         }
         catch { }
     }

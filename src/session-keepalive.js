@@ -11,6 +11,8 @@
 //   - After KEEPALIVE_INTERVAL_MS of inactivity, send a minimal ping (max_tokens:1)
 //     to the upstream API with the same conversation prefix
 //   - After KEEPALIVE_IDLE_TIMEOUT_MS of total inactivity, stop pinging and clean up
+//   - After KEEPALIVE_MAX_LIFETIME_MS from session creation, stop unconditionally
+//     (upstream KV caches don't survive beyond ~24h — pinging a dead cache wastes resources)
 //   - Incoming real requests reset the idle timer
 
 import { config, chatCompletion, isFreeTierModel, isPollModel, isM365Model } from "./opencode-client.js";
@@ -19,8 +21,9 @@ import { log } from "./logger.js";
 const KEEPALIVE_ENABLED = (Bun.env.SESSION_KEEPALIVE_ENABLED || "true") !== "false";
 const KEEPALIVE_INTERVAL_MS = Math.max(30000, parseInt(Bun.env.SESSION_KEEPALIVE_INTERVAL_MS || "120000", 10)); // 2 min, min 30s
 const KEEPALIVE_IDLE_TIMEOUT_MS = Math.max(KEEPALIVE_INTERVAL_MS * 2, parseInt(Bun.env.SESSION_KEEPALIVE_IDLE_TIMEOUT_MS || "600000", 10)); // 10 min
+const KEEPALIVE_MAX_LIFETIME_MS = Math.max(3600000, parseInt(Bun.env.SESSION_KEEPALIVE_MAX_LIFETIME_MS || "86400000", 10)); // 24h, min 1h
 
-const _sessions = new Map(); // sessionId → { model, messages, clientTag, provider, lastActivity, timer, pingCount }
+const _sessions = new Map(); // sessionId → { model, messages, clientTag, provider, lastActivity, createdAt, timer, pingCount }
 
 let _totalPings = 0;
 
@@ -51,6 +54,16 @@ async function doKeepalive(sessionId) {
     if (entry.timer) clearTimeout(entry.timer);
     _sessions.delete(sessionId);
     return;
+  }
+
+  // 24h lifetime cycle — upstream KV caches expire ~24h, so restart the clock
+  // to establish a fresh cache entry rather than pinging a dead one
+  const ageMs = Date.now() - (entry.createdAt || Date.now());
+  if (ageMs >= KEEPALIVE_MAX_LIFETIME_MS) {
+    log(`\x1b[90m[keepalive] session ${sessionId} lifetime ${Math.round(ageMs / 3600000)}h exceeded — cycling upstream cache\x1b[0m`);
+    entry.createdAt = Date.now();
+    entry.pingCount = 0;
+    // Fall through — continue with ping to establish new upstream KV cache
   }
 
   try {
@@ -104,6 +117,7 @@ export function trackSession(sessionId, model, messages, clientTag) {
     clientTag,
     provider,
     lastActivity: Date.now(),
+    createdAt: existing?.createdAt || Date.now(),
     timer: existing?.timer || null,
     pingCount: existing?.pingCount || 0,
   });
@@ -116,6 +130,14 @@ export function touchSession(sessionId) {
   if (entry) {
     entry.lastActivity = Date.now();
     scheduleKeepalive(sessionId);
+  }
+}
+
+export function stopSession(sessionId) {
+  const entry = _sessions.get(sessionId);
+  if (entry) {
+    if (entry.timer) clearTimeout(entry.timer);
+    _sessions.delete(sessionId);
   }
 }
 
@@ -137,8 +159,9 @@ export function stats() {
     enabled: KEEPALIVE_ENABLED,
     intervalMs: KEEPALIVE_INTERVAL_MS,
     idleTimeoutMs: KEEPALIVE_IDLE_TIMEOUT_MS,
+    maxLifetimeMs: KEEPALIVE_MAX_LIFETIME_MS,
     totalPings: _totalPings,
   };
 }
 
-export { KEEPALIVE_ENABLED, KEEPALIVE_INTERVAL_MS, KEEPALIVE_IDLE_TIMEOUT_MS };
+export { KEEPALIVE_ENABLED, KEEPALIVE_INTERVAL_MS, KEEPALIVE_IDLE_TIMEOUT_MS, KEEPALIVE_MAX_LIFETIME_MS };

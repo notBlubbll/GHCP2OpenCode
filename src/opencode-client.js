@@ -273,6 +273,9 @@ const config = {
     const interval = this.sessionKeepaliveIntervalMs;
     return Math.max(interval * 2, parseInt(Bun.env.SESSION_KEEPALIVE_IDLE_TIMEOUT_MS || "600000", 10));
   },
+  get sessionKeepaliveMaxLifetimeMs() {
+    return Math.max(3600000, parseInt(Bun.env.SESSION_KEEPALIVE_MAX_LIFETIME_MS || "86400000", 10));
+  },
 };
 
 export function setApiKey(key) { Bun.env.OPENCODE_API_KEY = key; }
@@ -1694,7 +1697,7 @@ export async function* chatCompletion(req) {
 
   try {
     const t0 = Date.now();
-    const logDone = config.requestLog ? reqLog({ tag: req.clientTag, provider, model, thinking: thinkingTag, preview: `${preview}${lastMsg?.content?.length > 60 ? "\u2026" : ""}` }) : null;
+    const logDone = config.requestLog ? reqLog({ tag: req.clientTag, sessionId: req.sessionId, provider, model, thinking: thinkingTag, preview: `${preview}${lastMsg?.content?.length > 60 ? "\u2026" : ""}` }) : null;
     const resp = await zenRequest("/chat/completions", body, { signal: ac?.signal, clientTag: req.clientTag });
 
     if (req.stream === false) {

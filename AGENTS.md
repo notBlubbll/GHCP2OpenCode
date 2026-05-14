@@ -42,12 +42,19 @@ GitHub Copilot extension             src/server.js                       OpenCod
                                     │ └─ standard queue │                  │
                                     └───┬──────────────┘                  │
                                         │                                  │
-                                    ┌───┴──────────────┐                  │
-                                    │ Response pipeline │                  │
-                                    │ ├─ tool extraction│                  │
-                                    │ ├─ think parsing  │                  │
-                                    │ └─ SSE formatting │                  │
-                                    └──────────────────┘                  ▼
+                                     ┌───┴──────────────┐                  │
+                                     │ Response pipeline │                  │
+                                     │ ├─ tool extraction│                  │
+                                     │ ├─ think parsing  │                  │
+                                     │ └─ SSE formatting │                  │
+                                     └───┬──────────────┘                  │
+                                         │                                  │
+                                     ┌───┴──────────────┐                  │
+                                     │ Session keepalive│                  │
+                                     │ ├─ track session  │                  │
+                                     │ ├─ KV cache ping  │                  │
+                                     │ └─ idle cleanup   │                  │
+                                     └──────────────────┘                  ▼
 ```
 
 ---
@@ -109,7 +116,7 @@ GitHub Copilot extension             src/server.js                       OpenCod
 
 - `trackSession(sessionId, model, messages, clientTag)` — save compressed messages after each real request, schedule keepalive timer
 - `touchSession(sessionId)` — reset idle timer on incoming request (keeps session alive across active usage)
-- `doKeepalive(sessionId)` — send minimal upstream ping (`max_tokens:1`, `stream:false`, no tools) to keep KV cache warm. Stops after `SESSION_KEEPALIVE_IDLE_TIMEOUT_MS` of inactivity
+- `doKeepalive(sessionId)` — send minimal upstream ping (`max_tokens:1`, `stream:false`, no tools) to keep KV cache warm. Stops after `SESSION_KEEPALIVE_IDLE_TIMEOUT_MS` of inactivity. Cycles (resets `createdAt` + resumes pinging) after `SESSION_KEEPALIVE_MAX_LIFETIME_MS` (24h) to re-establish upstream KV cache
 - `shutdown()` — clean up all timers on graceful shutdown
 - `stats()` — returns session count, total pings, config values
 
@@ -362,6 +369,46 @@ On startup and model refresh (`refreshModels` → `fetchGoModelsRaw`), the proxy
 ```
 
 Cooldown reason is `"401"` (auth denied, 7-day cooldown) or `"429"` (rate limited, duration varies).
+
+---
+
+## Session Keepalive (KV Cache Warming)
+
+Keeps upstream LLM provider KV caches warm between consecutive turns by sending lightweight background pings. Inspired by [TaskSync #98](https://github.com/4regab/TaskSync/issues/98) — without session warming, each new prompt rebuilds the entire conversation prefix at full input token pricing. With warming, the cached prefix serves at ~10x cheaper cache-read pricing.
+
+### How it works
+
+1. After each real request completes, gc2oc saves the **compressed message list** (the conversation prefix) per session
+2. After `SESSION_KEEPALIVE_INTERVAL_MS` (default 2min) of inactivity, a background **ping** is sent to the upstream API:
+   - Same conversation prefix (messages) → KV cache hit
+   - `max_tokens: 1` → negligible output cost
+   - `stream: false`, no tools → minimal overhead
+3. After `SESSION_KEEPALIVE_IDLE_TIMEOUT_MS` (default 10min) of total inactivity, pinging stops and the session is cleaned up
+4. After `SESSION_KEEPALIVE_MAX_LIFETIME_MS` (default 24h) from session creation, the keepalive **cycles**: resets its clock and continues pinging. This ensures the upstream KV cache (which has a ~24h TTL) is re-established rather than pointlessly pinged
+5. Incoming real requests **reset** the idle timer — active sessions stay warm automatically
+
+### Configuration
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `SESSION_KEEPALIVE_ENABLED` | `true` | Enable/disable session keepalive |
+| `SESSION_KEEPALIVE_INTERVAL_MS` | `120000` | Milliseconds between pings (min 30000) |
+| `SESSION_KEEPALIVE_IDLE_TIMEOUT_MS` | `600000` | Milliseconds of inactivity before stopping (min 2x interval) |
+| `SESSION_KEEPALIVE_MAX_LIFETIME_MS` | `86400000` | Maximum session lifetime before cycling upstream cache (default 24h, min 1h) |
+
+### Exclusions
+
+- **M365 sessions** are excluded (WebSocket-based, not HTTP prefix-cacheable)
+- **Empty message lists** are excluded (no prefix to cache)
+
+### Cost impact (from TaskSync #98)
+
+| Scenario | Input token cost |
+|----------|-----------------|
+| Without warming | Full input price on every turn (~$5.00 for 25K tokens × N turns) |
+| With warming | ~10x cheaper cache reads on turns 2+ (~$0.50 per turn after the first) |
+
+A 40-minute agentic session with warming can cost **8x less** than a 5-minute session without.
 
 ---
 

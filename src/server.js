@@ -4,6 +4,91 @@ if (typeof Bun === 'undefined') {
 }
 try { process.stderr.write(`[gc2oc] startup pid=${process.pid} argv=${JSON.stringify(process.argv)}\r\n`); } catch {}
 
+// Console debug helpers — NO code-page changes (SetConsoleOutputCP triggers raster font!)
+let _getConsoleCP = () => -1;
+let _getConsoleOutCP = () => -1;
+let _dbgCP = (lbl) => {};
+if (process.platform === 'win32') {
+  try {
+    if (typeof Bun !== 'undefined') {
+      const { dlopen, FFIType } = await import('bun:ffi');
+      const k32 = dlopen('kernel32.dll', {
+        GetConsoleOutputCP: { args: [], returns: FFIType.u32 },
+        GetConsoleCP:       { args: [], returns: FFIType.u32 },
+      });
+      _getConsoleOutCP = () => k32.symbols.GetConsoleOutputCP();
+      _getConsoleCP = () => k32.symbols.GetConsoleCP();
+    } else {
+      _getConsoleOutCP = _getConsoleCP = () => {
+        try {
+          const out = require('child_process').execSync('chcp', { encoding: 'utf8' }).trim();
+          return parseInt(out.split(':')[1] || out, 10);
+        } catch { return -1; }
+      };
+    }
+  } catch {}
+  _dbgCP = (lbl) => {
+    try {
+      const o = _getConsoleOutCP(), i = _getConsoleCP();
+      process.stderr.write(`\x1b[35m[CP-DBG] ${lbl} out=${o} in=${i}\x1b[0m\r\n`);
+    } catch {}
+  };
+}
+_dbgCP('startup');
+
+// Force Consolas font — SetConsoleOutputCP triggers raster fallback, set font instead
+if (process.platform === 'win32') {
+  try {
+    if (typeof Bun !== 'undefined') {
+      const { dlopen, FFIType } = await import('bun:ffi');
+      const k32 = dlopen('kernel32.dll', {
+        GetStdHandle: { args: [FFIType.i32], returns: FFIType.pointer },
+        SetCurrentConsoleFontEx: { args: [FFIType.pointer, FFIType.bool, { type: 'pointer' }], returns: FFIType.bool },
+        GetCurrentConsoleFontEx: { args: [FFIType.pointer, FFIType.bool, { type: 'pointer' }], returns: FFIType.bool },
+      });
+      // Build CONSOLE_FONT_INFO_EX: cbSize(4) nFont(4) dwFontSizeX(2) dwFontSizeY(2) FontFamily(4) FontWeight(4) FaceName(64)
+      const buf = new ArrayBuffer(84);
+      const dv = new DataView(buf);
+      dv.setUint32(0, 84, true); // cbSize
+      dv.setUint32(4, 0, true);  // nFont
+      dv.setInt16(8, 0, true);   // dwFontSizeX
+      dv.setInt16(10, 14, true); // dwFontSizeY = 14
+      dv.setUint32(12, 54, true); // FontFamily
+      dv.setUint32(16, 400, true); // FontWeight
+      const name = new Uint8Array(buf, 20, 64);
+      new TextEncoder().encodeInto("Consolas\0", name); // FaceName
+      const handle = k32.symbols.GetStdHandle(-11); // STD_OUTPUT_HANDLE
+      if (handle != null) {
+        try { k32.symbols.SetCurrentConsoleFontEx(handle, false, buf); } catch {}
+      }
+    } else {
+      const ps = `Add-Type -Name CF -Namespace Z @'\r\n` +
+        `[DllImport("kernel32.dll")] public static extern bool SetCurrentConsoleFontEx(IntPtr h, bool mw, ref Font f);\r\n` +
+        `[DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int n);\r\n` +
+        `public struct Font { public int cb; public uint n; public short sx; public short sy; public int fam; public int wt;\r\n` +
+        `[Runtime.InteropServices.MarshalAs(Runtime.InteropServices.UnmanagedType.ByValTStr,SizeConst=32)] public string fn; }\r\n` +
+        `'@\r\n` +
+        `$f=New-Object Z.Font; $f.cb=84; $f.fn='Consolas'; $f.sx=0; $f.sy=14; $f.fam=54; $f.wt=400;\r\n` +
+        `[Z.CF]::SetCurrentConsoleFontEx([Z.CF]::GetStdHandle(-11),$false,[ref]$f)`;
+      const encoded = Buffer.from(ps, 'utf16le').toString('base64');
+      require('child_process').execSync(`powershell -NoProfile -EncodedCommand ${encoded}`, { stdio: 'ignore', timeout: 5000 });
+    }
+  } catch {}
+}
+
+// Watchdog — logs if something changes the code page
+if (process.platform === 'win32') {
+  let _lastCP = _getConsoleOutCP();
+  const _ivMs = typeof Bun !== 'undefined' ? 500 : 2000;
+  setInterval(() => {
+    const cur = _getConsoleOutCP();
+    if (cur !== _lastCP) {
+      _dbgCP(`CP-CHANGED! was ${_lastCP} → now ${cur}`);
+      _lastCP = cur;
+    }
+  }, _ivMs).unref();
+}
+
 // 1b. Crypto polyfill (Node.js < 19)
 if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
   const nodeCrypto = await import("node:crypto");
@@ -48,7 +133,7 @@ import { check as cacheCheck, store as cacheStore, cacheKey } from "./cache.js";
 import { ModelConcurrencyManager, RateLimitError, truncateToolMessagesInPayload, checkRequestBodySize } from "./concurrency.js";
 import { compactIdentity, compactToolInstructions, compactOllamaToolInstructions, compactCodeCompletionPrompt, compressMessages } from "./token-optimizer.js";
 import { m365ChatCompletion, m365ChatCompletionStream, M365CopilotError } from "./m365-client.js";
-import { trackSession, touchSession, shutdown as keepaliveShutdown, stats as keepaliveStats } from "./session-keepalive.js";
+import { trackSession, touchSession, stopSession as keepaliveStopSession, shutdown as keepaliveShutdown, stats as keepaliveStats } from "./session-keepalive.js";
 import { handleServiceCommand, runAsService } from "./win-service.js";
 import { log, error as logErr, reqLog } from "./logger.js";
 
@@ -144,7 +229,7 @@ const err = (msg) => logErr(msg);
   try {
     const fs = await import("node:fs");
     if (!fs.existsSync(".env")) {
-      fs.writeFileSync(".env", "# OpenCode API key (optional — free models work without it)\n# Get yours at: https://opencode.ai\nOPENCODE_API_KEY=\n\n# Multi-key rotation (optional)\n# OPENCODE_API_KEYS=[\"key1\",\"key2\"]\n\n# Hide free models from the list (default false)\nHIDE_FREE=false\n\n# Show Pollinations free models (pol/ prefix) — true by default\nSHOW_POLL_MODELS=true\n\n# Hide Pollinations cosplay aliases (GPT-5, Claude, Gemini, DeepSeek, Llama-4, Mistral)\n# — true by default, shows only the real GPT-OSS 20B model. Set to false to show all 7.\nHIDE_POLL_COSPLAY=true\n\n# Log incoming requests (default true)\nREQUEST_LOG=true\n\n# ── Prompt Compression (OmniRoute RTK+Caveman stacked) ──\n# auto / off / lite / caveman / aggressive / ultra / rtk / stacked (default: auto)\n# auto picks: off for <=3 msgs, stacked for free/poll, caveman for paid\nCOMPRESSION_LEVEL=auto\n\n# ── DLP / Content Blocklist (ghcp-proxy enrichment) ──\n# Enable prompt content filtering (default false)\nBLOCKLIST_ENABLED=false\n\n# Blocklist mode: \"block\" (deny with 403) or \"report\" (allow but log)\nBLOCKLIST_MODE=block\n\n# Comma-separated keywords to block (case-insensitive)\n# BLOCKLIST_KEYWORDS=secret,confidential,password\n\n# Comma-separated file name patterns to block\n# BLOCKLIST_FILEPATTERNS=passwords.txt,.env.production\n\n# Comma-separated regex patterns to block\n# BLOCKLIST_REGEX=sk-[A-Za-z0-9]{20,}\n\n# ── Concurrency & Rate Limiting (antigravity-copilot enrichment) ──\n# Maximum concurrent requests for thinking models (keep low to avoid upstream 429s)\n# CONCURRENCY_THINKING=1\n\n# Maximum concurrent requests for standard models\n# CONCURRENCY_STANDARD=3\n\n# Retry attempts for 429 / RESOURCE_EXHAUSTED errors (0 to disable)\n# RETRY_MAX=3\n\n# Base delay before first retry in ms (exponential backoff follows)\n# RETRY_BASE_DELAY_MS=100\n\n# Abort thinking model requests after this many ms (prevents quota exhaustion)\n# THINKING_TIMEOUT_MS=60000\n\n# Abort standard model requests after this many ms\n# REQUEST_TIMEOUT_MS=120000\n\n# Truncate large tool outputs (e.g., git diff) to reduce context size\n# TRUNCATE_TOOL_OUTPUT=true\n\n# Max chars kept per tool output after truncation\n# MAX_TOOL_OUTPUT_CHARS=12000\n\n# Chars kept from start of tool output when truncating\n# TOOL_OUTPUT_HEAD_CHARS=6000\n\n# Chars kept from end of tool output when truncating\n# TOOL_OUTPUT_TAIL_CHARS=2000\n\n# Absolute max request body size in bytes (returns 413 if exceeded)\n# MAX_REQUEST_BODY_BYTES=10485760\n\n# ── User Auth (ghcp-proxy allowed_users pattern) ──\n# Comma-separated list of allowed users (Proxy-Authorization or X-User-ID header)\n# ALLOWED_USERS=dev1,dev2\n\n# ── Model metadata (lmstudio-ollama-proxy enrichment) ──\n# Force all models to report full capabilities (chat/completion/vision/tools/agent)\nFORCE_ALL_CAPABILITIES=true\n\n# Force a specific context length for all models (0 = use auto-detection)\n# FORCE_CONTEXT_LENGTH=131072\n\n# Default context length fallback when not available from models.dev\nDEFAULT_CONTEXT_LENGTH=131072\n\n# Per-model metadata overrides (JSON). Example:\n# MODEL_METADATA_JSON={\"my-model\":{\"context_length\":32768,\"capabilities\":[\"chat\",\"tools\"],\"family\":\"my-family\",\"parameter_size\":\"7B\"}}\n\n# Passthrough base URL — forward unmatched paths to this upstream\n# PASSTHROUGH_BASE_URL=https://opencode.ai/zen/go/v1\n# Passthrough path prefixes (comma-separated, default /v1)\n# PASSTHROUGH_PREFIXES=/v1,/api/v0\n");
+      fs.writeFileSync(".env", "# OpenCode API key (optional — free models work without it)\n# Get yours at: https://opencode.ai\nOPENCODE_API_KEY=\n\n# Multi-key rotation (optional)\n# OPENCODE_API_KEYS=[\"key1\",\"key2\"]\n\n# Hide free models from the list (default false)\nHIDE_FREE=false\n\n# Show Pollinations free models (pol/ prefix) — true by default\nSHOW_POLL_MODELS=true\n\n# Hide Pollinations cosplay aliases (GPT-5, Claude, Gemini, DeepSeek, Llama-4, Mistral)\n# — true by default, shows only the real GPT-OSS 20B model. Set to false to show all 7.\nHIDE_POLL_COSPLAY=true\n\n# Log incoming requests (default true)\nREQUEST_LOG=true\n\n# ── Prompt Compression (OmniRoute RTK+Caveman stacked) ──\n# auto / off / lite / caveman / aggressive / ultra / rtk / stacked (default: auto)\n# auto picks: off for <=3 msgs, stacked for free/poll, caveman for paid\nCOMPRESSION_LEVEL=auto\n\n# ── DLP / Content Blocklist (ghcp-proxy enrichment) ──\n# Enable prompt content filtering (default false)\nBLOCKLIST_ENABLED=false\n\n# Blocklist mode: \"block\" (deny with 403) or \"report\" (allow but log)\nBLOCKLIST_MODE=block\n\n# Comma-separated keywords to block (case-insensitive)\n# BLOCKLIST_KEYWORDS=secret,confidential,password\n\n# Comma-separated file name patterns to block\n# BLOCKLIST_FILEPATTERNS=passwords.txt,.env.production\n\n# Comma-separated regex patterns to block\n# BLOCKLIST_REGEX=sk-[A-Za-z0-9]{20,}\n\n# ── Concurrency & Rate Limiting (antigravity-copilot enrichment) ──\n# Maximum concurrent requests for thinking models (keep low to avoid upstream 429s)\n# CONCURRENCY_THINKING=1\n\n# Maximum concurrent requests for standard models\n# CONCURRENCY_STANDARD=3\n\n# Retry attempts for 429 / RESOURCE_EXHAUSTED errors (0 to disable)\n# RETRY_MAX=3\n\n# Base delay before first retry in ms (exponential backoff follows)\n# RETRY_BASE_DELAY_MS=100\n\n# Abort thinking model requests after this many ms (prevents quota exhaustion)\n# THINKING_TIMEOUT_MS=60000\n\n# Abort standard model requests after this many ms\n# REQUEST_TIMEOUT_MS=120000\n\n# Truncate large tool outputs (e.g., git diff) to reduce context size\n# TRUNCATE_TOOL_OUTPUT=true\n\n# Max chars kept per tool output after truncation\n# MAX_TOOL_OUTPUT_CHARS=12000\n\n# Chars kept from start of tool output when truncating\n# TOOL_OUTPUT_HEAD_CHARS=6000\n\n# Chars kept from end of tool output when truncating\n# TOOL_OUTPUT_TAIL_CHARS=2000\n\n# Absolute max request body size in bytes (returns 413 if exceeded)\n# MAX_REQUEST_BODY_BYTES=10485760\n\n# ── User Auth (ghcp-proxy allowed_users pattern) ──\n# Comma-separated list of allowed users (Proxy-Authorization or X-User-ID header)\n# ALLOWED_USERS=dev1,dev2\n\n# ── Model metadata (lmstudio-ollama-proxy enrichment) ──\n# Force all models to report full capabilities (chat/completion/vision/tools/agent)\nFORCE_ALL_CAPABILITIES=true\n\n# Force a specific context length for all models (0 = use auto-detection)\n# FORCE_CONTEXT_LENGTH=131072\n\n# Default context length fallback when not available from models.dev\nDEFAULT_CONTEXT_LENGTH=131072\n\n# Per-model metadata overrides (JSON). Example:\n# MODEL_METADATA_JSON={\"my-model\":{\"context_length\":32768,\"capabilities\":[\"chat\",\"tools\"],\"family\":\"my-family\",\"parameter_size\":\"7B\"}}\n\n# SESSION_KEEPALIVE_IDLE_TIMEOUT_MS=600000\n\n# Maximum session lifetime before cycling upstream KV cache in ms (default 86400000 = 24h, min 1h)\n# After this, keepalive restarts to establish a fresh upstream cache rather than pinging a dead one\n# SESSION_KEEPALIVE_MAX_LIFETIME_MS=86400000\n\n# Passthrough base URL — forward unmatched paths to this upstream\n# PASSTHROUGH_BASE_URL=https://opencode.ai/zen/go/v1\n# Passthrough path prefixes (comma-separated, default /v1)\n# PASSTHROUGH_PREFIXES=/v1,/api/v0\n");
       log("Created .env — add your OPENCODE_API_KEY there to unlock paid models");
     }
   } catch { /* fs not available, ignore */ }
@@ -391,10 +476,14 @@ async function _simStream(w, base, hasTools, toolCalls, text, reasoningContent) 
 
 // Reasoning content cache — bridges across requests within same session
 // Keyed by conversation ID (first user msg + model + workspace) to prevent cross-session poisoning
+// Also keyed by workspace root for cross-session continuity (new session in same workspace
+// can read reasoning from a prior session — TaskSync-inspired conversation continuity)
 const _crossReqReasoningCache = new Map(); // convId:contentHash → reasoningContent
 
 // Session tracking — detect and number distinct conversation contexts
-const _sessionRegistry = new Map(); // convId → { id, clientTag, createdAt }
+const _sessionRegistry = new Map(); // convId → { id, clientTag, createdAt, workspaceRoot }
+// Workspace continuity — track most recent session per workspace+model for cross-session context
+const _workspaceSessions = new Map(); // `${workspaceRoot}|${model}` → { convId, sessionId, lastSeen, clientTag }
 let _sessionCounter = 0;
 
 function _convId(messages, model, workspaceRoot) {
@@ -429,21 +518,36 @@ function createReasoningContext(messages, model, workspaceRoot, clientTag, provi
   const fifo = [];
   let cursor = 0;
 
+  // ── Workspace continuity detection ──
+  const wsKey = workspaceRoot ? `${workspaceRoot}|${model}` : null;
+  const wsPrev = wsKey ? _workspaceSessions.get(wsKey) : null;
+  const isContinuation = wsPrev && wsPrev.convId !== conv; // different conversation, same workspace+model
+
   let sessionEntry = _sessionRegistry.get(conv);
   if (!sessionEntry) {
     _sessionCounter++;
-    sessionEntry = { id: _sessionCounter, clientTag, createdAt: new Date().toISOString() };
+    sessionEntry = { id: _sessionCounter, clientTag, createdAt: new Date().toISOString(), workspaceRoot };
     _sessionRegistry.set(conv, sessionEntry);
-    log(`\x1b[36mnew session ${_sessionCounter} \x1b[90m(\x1b[0m${clientTag}\x1b[90m, \x1b[0m${provider}/${model}\x1b[90m, \x1b[0m${workspaceRoot || "?"}\x1b[90m)\x1b[0m`);
+
+    if (isContinuation) {
+      log(`\x1b[36mcontinued session ${_sessionCounter} \x1b[90m(was session ${wsPrev.sessionId}, \x1b[0m${clientTag}\x1b[90m, \x1b[0m${provider}/${model}\x1b[90m, \x1b[0m${workspaceRoot || "?"}\x1b[90m)\x1b[0m`);
+    } else {
+      log(`\x1b[36mnew session ${_sessionCounter} \x1b[90m(\x1b[0m${clientTag}\x1b[90m, \x1b[0m${provider}/${model}\x1b[90m, \x1b[0m${workspaceRoot || "?"}\x1b[90m)\x1b[0m`);
+    }
+  }
+
+  // Update workspace registry (always — tracks the most recent session per workspace+model)
+  if (wsKey) {
+    _workspaceSessions.set(wsKey, { convId: conv, sessionId: _sessionCounter, lastSeen: new Date().toISOString(), clientTag });
   }
 
   const sessionId = sessionEntry.id;
   const tagPrefix = `\x1b[35m${clientTag}\x1b[0m`;
   const sessionPrefix = `${tagPrefix}[\x1b[36m${sessionId}\x1b[0m]`;
 
-  const prefixed = (key) => `c:${conv}:${key}`;
-
-  log(`${sessionPrefix}>\x1b[33m[\x1b[0m${provider}/\x1b[1m${model}\x1b[0m\x1b[33m]\x1b[0m`);
+  const prefixedConv = (key) => `c:${conv}:${key}`;
+  // Workspace-scoped cache key — allows reasoning lookup across sessions in same workspace
+  const prefixedWs = wsKey ? (key) => `w:${wsKey}:${key}` : null;
 
   function seslog(msg) {
     log(`${sessionPrefix} ${msg}`);
@@ -454,20 +558,29 @@ function createReasoningContext(messages, model, workspaceRoot, clientTag, provi
     sessionId,
     sessionPrefix,
     seslog,
+    workspaceContinuity: isContinuation ? { previousSessionId: wsPrev.sessionId, workspaceRoot } : null,
     reset() { cursor = 0; },
     cache(msg, mdl, reasoning) {
       if (!reasoning) return;
       fifo.push(reasoning);
       if (fifo.length > 50) fifo.shift();
       const h = _msgHash(msg);
-      if (h) _crossReqReasoningCache.set(prefixed(h), reasoning);
-      _crossReqReasoningCache.set(prefixed(`mdl:${mdl}`), reasoning);
+      if (h) {
+        _crossReqReasoningCache.set(prefixedConv(h), reasoning);
+        // Also store workspace-scoped — enables cross-session reasoning lookup
+        if (prefixedWs) _crossReqReasoningCache.set(prefixedWs(h), reasoning);
+      }
+      _crossReqReasoningCache.set(prefixedConv(`mdl:${mdl}`), reasoning);
     },
     get(msg, mdl) {
       const h = _msgHash(msg);
-      if (h && _crossReqReasoningCache.has(prefixed(h))) return _crossReqReasoningCache.get(prefixed(h));
+      if (h) {
+        // Try conversation-scoped first (exact match), then workspace-scoped (cross-session)
+        if (_crossReqReasoningCache.has(prefixedConv(h))) return _crossReqReasoningCache.get(prefixedConv(h));
+        if (prefixedWs && _crossReqReasoningCache.has(prefixedWs(h))) return _crossReqReasoningCache.get(prefixedWs(h));
+      }
       if (cursor < fifo.length) return fifo[cursor++];
-      return _crossReqReasoningCache.get(prefixed(`mdl:${mdl}`));
+      return _crossReqReasoningCache.get(prefixedConv(`mdl:${mdl}`));
     },
     crossCacheSize() { return _crossReqReasoningCache.size; },
   };
@@ -1868,6 +1981,14 @@ app.post("/v1/chat/completions", async c => {
     // Identity override — MUST be first system instruction to override VS built-in
     systemMsg = compactIdentity(goModel, thinkingTag) + (systemMsg ? "\n\n" : "") + systemMsg;
 
+    // Workspace continuity — if this is a new chat in a previously active workspace,
+    // enrich the system prompt with a hint that prior context is available (TaskSync-inspired)
+    if (reasoningCtx.workspaceContinuity) {
+      const wsContinuity = reasoningCtx.workspaceContinuity;
+      systemMsg = `CONTEXT: You previously worked on this project (workspace: ${wsContinuity.workspaceRoot}). Your prior knowledge of this codebase still applies. Continue where you left off.\n\n` + systemMsg;
+      reasoningCtx.seslog(`\x1b[90m[continuity] workspace continued from session ${wsContinuity.previousSessionId}\x1b[0m`);
+    }
+
     // Inject tool instructions into system prompt for agent mode (token-optimized)
     if (vsTools?.length) {
       systemMsg += (systemMsg ? "\n\n" : "") + compactToolInstructions();
@@ -1901,7 +2022,7 @@ app.post("/v1/chat/completions", async c => {
     }
     const compressedMessages = compressMessages(validatedMessages, compLevel, true);
 
-    const ollamaReq = { model: goModel, messages: compressedMessages, stream: streamMode, tools: vsTools || undefined, clientTag };
+    const ollamaReq = { model: goModel, messages: compressedMessages, stream: streamMode, tools: vsTools || undefined, clientTag, sessionId: reasoningCtx.sessionId };
     if (body.chat_template_kwargs != null) ollamaReq.chat_template_kwargs = body.chat_template_kwargs;
     if (body.thinking_token_budget != null) ollamaReq.thinking_token_budget = body.thinking_token_budget;
 
@@ -2688,6 +2809,7 @@ async function _runServer() {
   await new Promise((resolve) => {
     serverRef.listen(port, host, 1024, () => {
       log(`Listening on http://${host}:${port}`);
+      _dbgCP('server-started');
       resolve();
     });
   });
@@ -2695,6 +2817,8 @@ async function _runServer() {
 
 // Load models & show banner in background
 let models = await initModels();
+
+_dbgCP('pre-banner');
 
 process.stdout.write("\x1b]2;gc2oc\x07");
 
@@ -2731,6 +2855,7 @@ else log("\x1b[33m[status] Free mode — no API key\x1b[0m");
 if (hasM365) log("\x1b[36m[status] M365 Copilot connected\x1b[0m");
 
 P("");
+_dbgCP('banner-line1');
 P(W + "\u256d" + hr + W + "\u256e" + R);
 P(line(S + B + "\u250f\u2513\u2513\u250f\u250f\u2513\u250f\u2513\u250f\u2513\u250f\u2513\u250f\u2513" + R));
 P(line(S + B + "\u2503\u2513\u2523\u252b\u2503 \u2503\u2503\u250f\u251b\u2503\u2503\u2503 " + R + " " + S + "github copilot proxy" + modeLabel + R));

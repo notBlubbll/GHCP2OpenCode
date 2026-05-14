@@ -170,6 +170,10 @@ This means a key rate-limited from a previous session will never be pinged on re
 | `CACHE_TTL_SEC` | `300` | Cache TTL |
 | `REQUEST_LOG` | `true` | Log incoming requests to console |
 | `HIDE_FREE` | `false` | Hide free models and `[FREE]`/`[GO]` tags & dividers |
+| `SESSION_KEEPALIVE_ENABLED` | `true` | Keep KV cache warm between turns |
+| `SESSION_KEEPALIVE_INTERVAL_MS` | `120000` | Keepalive ping interval (ms) |
+| `SESSION_KEEPALIVE_IDLE_TIMEOUT_MS` | `600000` | Stop keepalive after idle (ms) |
+| `SESSION_KEEPALIVE_MAX_LIFETIME_MS` | `86400000` | Cycle upstream cache after (ms, 24h) |
 
 ---
 
@@ -348,6 +352,25 @@ This means different chat tabs, different workspaces, and different models get s
 ### Cache isolation
 
 All in-memory caches (prompt-response LRU, reasoning/`<think>` text) are **session-scoped** — data from one conversation never leaks into another. Two different users asking the same question will never get each other's cached responses or reasoning text.
+
+### Session Keepalive & Continuity
+
+When you do iterative development on the same code area, most context (system prompt, loaded files, tool results) is identical across turns. The proxy keeps the upstream LLM provider's **KV cache warm** between turns, so subsequent prompts pay **~10x cheaper cache-read pricing** instead of full input token pricing.
+
+**Keepalive** — after `SESSION_KEEPALIVE_INTERVAL_MS` (default 2min) of inactivity, a background ping is sent to the upstream API with the same conversation prefix (`max_tokens:1`, no tools, no stream). This prevents KV cache eviction. After `SESSION_KEEPALIVE_IDLE_TIMEOUT_MS` (default 10min) of total inactivity, pinging stops. After `SESSION_KEEPALIVE_MAX_LIFETIME_MS` (default 24h), the keepalive cycles to re-establish a fresh upstream cache.
+
+**Conversation continuity** — when VS/VS Code opens a new chat in the same workspace, the proxy detects it and:
+- Enriches the system prompt with `"You previously worked on this project..."` so the model knows prior knowledge applies
+- Shares the reasoning cache across sessions in the same workspace (workspace-scoped fallback when conversation-scoped lookup misses)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SESSION_KEEPALIVE_ENABLED` | `true` | Enable/disable session keepalive |
+| `SESSION_KEEPALIVE_INTERVAL_MS` | `120000` | Milliseconds between pings (min 30000) |
+| `SESSION_KEEPALIVE_IDLE_TIMEOUT_MS` | `600000` | Milliseconds of inactivity before stopping |
+| `SESSION_KEEPALIVE_MAX_LIFETIME_MS` | `86400000` | Max session life before cycling upstream cache (24h) |
+
+> Inspired by [TaskSync #98](https://github.com/4regab/TaskSync/issues/98). A 40-minute agentic session with warming can cost **8x less** than a 5-minute session without.
 
 ---
 

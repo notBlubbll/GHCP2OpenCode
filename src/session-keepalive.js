@@ -18,9 +18,9 @@
 import { config, chatCompletion, isFreeTierModel, isPollModel, isM365Model } from "./opencode-client.js";
 import { log } from "./logger.js";
 
-const KEEPALIVE_ENABLED = (Bun.env.SESSION_KEEPALIVE_ENABLED || "true") !== "false";
-const KEEPALIVE_INTERVAL_MS = Math.max(30000, parseInt(Bun.env.SESSION_KEEPALIVE_INTERVAL_MS || "120000", 10)); // 2 min, min 30s
-const KEEPALIVE_IDLE_TIMEOUT_MS = Math.max(KEEPALIVE_INTERVAL_MS * 2, parseInt(Bun.env.SESSION_KEEPALIVE_IDLE_TIMEOUT_MS || "600000", 10)); // 10 min
+const KEEPALIVE_ENABLED = (Bun.env.SESSION_KEEPALIVE_ENABLED || "false") !== "false";
+const KEEPALIVE_INTERVAL_MS = Math.max(30000, parseInt(Bun.env.SESSION_KEEPALIVE_INTERVAL_MS || "300000", 10)); // 5 min, min 30s
+const KEEPALIVE_IDLE_TIMEOUT_MS = Math.max(KEEPALIVE_INTERVAL_MS * 2, parseInt(Bun.env.SESSION_KEEPALIVE_IDLE_TIMEOUT_MS || "1500000", 10)); // 25 min
 const KEEPALIVE_MAX_LIFETIME_MS = Math.max(3600000, parseInt(Bun.env.SESSION_KEEPALIVE_MAX_LIFETIME_MS || "86400000", 10)); // 24h, min 1h
 
 const _sessions = new Map(); // sessionId → { model, messages, clientTag, provider, lastActivity, createdAt, timer, pingCount }

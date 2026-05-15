@@ -1060,6 +1060,121 @@ function normalizeToolCall(tc) {
         }
       } catch {}
     }
+    if (/^(find_symbol|search_symbol)$/i.test(name)) {
+      try {
+        const safe = {};
+        safe.symbolName = "";
+        const smMatch = raw2.match(/"symbolName"\s*:\s*"((?:[^"\\]|\\.)*)"/) || raw2.match(/"symbolName"\s*:\s*"((?:[^"\\]|\\.)*)/);
+        if (smMatch) safe.symbolName = smMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+        if (!safe.symbolName) {
+          const qMatch = raw2.match(/"(?:query|symbol|name)"\s*:\s*"((?:[^"\\]|\\.)*)"/) || raw2.match(/"(?:query|symbol|name)"\s*:\s*"((?:[^"\\]|\\.)*)/);
+          if (qMatch) safe.symbolName = qMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+        }
+        const ntMatch = raw2.match(/"navigationType"\s*:\s*(\d+)/);
+        safe.navigationType = ntMatch ? parseInt(ntMatch[1], 10) : 1;
+        const fpMatch = raw2.match(/"(?:filepath|filePath|filename)"\s*:\s*"((?:[^"\\]|\\.)*)"/) || raw2.match(/"(?:filepath|filePath|filename)"\s*:\s*"((?:[^"\\]|\\.)*)/);
+        safe.filepath = fpMatch ? fpMatch[1].replace(/\\+/g, "/").replace(/\/{2,}/g, "/") : "";
+        const ltMatch = raw2.match(/"lineText"\s*:\s*"((?:[^"\\]|\\.)*)"/) || raw2.match(/"lineText"\s*:\s*"((?:[^"\\]|\\.)*)/);
+        safe.lineText = ltMatch ? ltMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "";
+        if (safe.symbolName) {
+          log(`\x1b[33m[${name}] salvaged symbolName="${safe.symbolName.slice(0,40)}" navigationType=${safe.navigationType} filepath=${safe.filepath}\x1b[0m`);
+          return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
+        }
+      } catch {}
+    }
+    if (/^read_file$/i.test(name)) {
+      try {
+        const safe = {};
+        const fpMatch = raw2.match(/"(?:filePath|filepath|filename|path)"\s*:\s*"((?:[^"\\]|\\.)*)"/) || raw2.match(/"(?:filePath|filepath|filename|path)"\s*:\s*"((?:[^"\\]|\\.)*)/);
+        safe.filePath = fpMatch ? fpMatch[1].replace(/\\+/g, "/").replace(/\/{2,}/g, "/") : "";
+        const slMatch = raw2.match(/"startLine"\s*:\s*(\d+)/);
+        safe.startLine = slMatch ? parseInt(slMatch[1], 10) : 1;
+        const elMatch = raw2.match(/"endLine"\s*:\s*(\d+)/);
+        safe.endLine = elMatch ? parseInt(elMatch[1], 10) : 999999;
+        if (safe.filePath) {
+          log(`\x1b[33m[read_file] salvaged filePath=${safe.filePath} startLine=${safe.startLine} endLine=${safe.endLine}\x1b[0m`);
+          return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
+        }
+      } catch {}
+    }
+    if (/^(run_tests|execute_tests)$/i.test(name)) {
+      try {
+        const safe = {};
+        let ft = []; let fv = [];
+        const ftArr = raw2.match(/"filterTypes"\s*:\s*\[(.*?)(?:\]|$)/s);
+        if (ftArr) {
+          const inner = ftArr[1];
+          const sRe = /"((?:[^"\\]|\\.)*)"/g;
+          let sm;
+          while ((sm = sRe.exec(inner))) ft.push(sm[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\"));
+        }
+        if (!ft.length) {
+          const single = raw2.match(/"filterTypes"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+          if (single) ft = [single[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\")];
+        }
+        const fvArr = raw2.match(/"filterValues"\s*:\s*\[(.*?)(?:\]|$)/s);
+        if (fvArr) {
+          const inner = fvArr[1];
+          const sRe = /"((?:[^"\\]|\\.)*)"/g;
+          let sm;
+          while ((sm = sRe.exec(inner))) fv.push(sm[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\"));
+        }
+        if (!fv.length) {
+          const single = raw2.match(/"filterValues"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+          if (single) fv = [single[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\")];
+        }
+        safe.filterTypes = ft;
+        safe.filterValues = fv;
+        if (ft.length || fv.length) {
+          log(`\x1b[33m[${name}] salvaged filterTypes=[${ft.join(",")}] filterValues=[${fv.join(",")}]\x1b[0m`);
+          return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
+        }
+      } catch {}
+    }
+    if (/^lookup_vs$/i.test(name)) {
+      try {
+        const safe = {};
+        let terms = [];
+        const tArr = raw2.match(/"terms"\s*:\s*\[(.*?)(?:\]|$)/s);
+        if (tArr) {
+          const inner = tArr[1];
+          const sRe = /"((?:[^"\\]|\\.)*)"/g;
+          let sm;
+          while ((sm = sRe.exec(inner))) terms.push(sm[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\"));
+        }
+        if (!terms.length) {
+          const single = raw2.match(/"terms"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+          if (single) terms = [single[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\")];
+        }
+        if (!terms.length) {
+          const tailMatch = raw2.match(/"terms"\s*:\s*(.*?)\s*\}/);
+          if (tailMatch) {
+            let raw = tailMatch[1].trim().replace(/^"/, "").replace(/"?$/,"").replace(/"/g, "").trim();
+            if (raw) terms = [raw];
+          }
+        }
+        if (terms.length) {
+          safe.terms = terms;
+          log(`\x1b[33m[lookup_vs] salvaged terms=[${terms.map(t => t.slice(0,40)).join(",")}]\x1b[0m`);
+          return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
+        }
+      } catch {}
+    }
+    if (/^(run_in_terminal|send_to_terminal)$/i.test(name)) {
+      try {
+        const safe = {};
+        const cmdMatch = raw2.match(/"command"\s*:\s*"((?:[^"\\]|\\.)*)"/) || raw2.match(/"command"\s*:\s*"((?:[^"\\]|\\.)*)/);
+        safe.command = cmdMatch ? cmdMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "";
+        const idMatch = raw2.match(/"id"\s*:\s*"((?:[^"\\]|\\.)*)"/) || raw2.match(/"id"\s*:\s*"((?:[^"\\]|\\.)*)/);
+        if (idMatch) safe.id = idMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+        const expMatch = raw2.match(/"explanation"\s*:\s*"((?:[^"\\]|\\.)*)"/) || raw2.match(/"explanation"\s*:\s*"((?:[^"\\]|\\.)*)/);
+        if (expMatch) safe.explanation = expMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+        if (safe.command) {
+          log(`\x1b[33m[${name}] salvaged command="${safe.command.slice(0,60)}${safe.command.length>60?"...":""}"\x1b[0m`);
+          return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
+        }
+      } catch {}
+    }
     if (/^plan$/i.test(name)) {
       try {
         const pmMatch = raw2.match(/"planMarkdown"\s*:\s*"((?:[^"\\]|\\.)*)/);

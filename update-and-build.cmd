@@ -9,7 +9,7 @@ echo ================================================
 echo.
 
 REM Kill running proxy (by window title + by port)
-taskkill /fi "WINDOWTITLE eq gc2oc" /f >nul 2>&1
+powershell -NoProfile -Command "Get-Process | Where-Object { $_.MainWindowTitle -like 'gc2oc*' } | Stop-Process -Force" >nul 2>&1
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":11434 " ^| findstr "LISTENING" 2^>nul') do (
     taskkill /pid %%a /f >nul 2>&1
 )

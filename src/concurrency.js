@@ -22,7 +22,7 @@ function getConfig() {
     retryBaseDelayMs: Math.max(50, parseInt(Bun.env.RETRY_BASE_DELAY_MS || "100", 10)),
     thinkingTimeoutMs: Math.max(10000, parseInt(Bun.env.THINKING_TIMEOUT_MS || "60000", 10)),
     requestTimeoutMs: Math.max(10000, parseInt(Bun.env.REQUEST_TIMEOUT_MS || "120000", 10)),
-    maxRequestBodyBytes: Math.max(262144, parseInt(Bun.env.MAX_REQUEST_BODY_BYTES || "10485760", 10)),
+    maxRequestBodyBytes: Math.max(262144, parseInt(Bun.env.MAX_REQUEST_BODY_BYTES || "67108864", 10)),
     truncateToolOutput: Bun.env.TRUNCATE_TOOL_OUTPUT !== "false",
     maxToolOutputChars: Math.max(1000, parseInt(Bun.env.MAX_TOOL_OUTPUT_CHARS || "12000", 10)),
     toolOutputHeadChars: Math.max(0, parseInt(Bun.env.TOOL_OUTPUT_HEAD_CHARS || "6000", 10)),

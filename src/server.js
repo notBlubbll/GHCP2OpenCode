@@ -65,9 +65,40 @@ const _isServiceMode = process.argv.includes("--service") || process.env.GC2OC_S
 const VERSION_API_URL = "https://api.github.com/repos/notBlubbll/gc2oc/contents/.version";
 const VERSION_FILE = ".version";
 
+// TPS (tokens per second) tracker — rolling window for console title display
+// Set SHOW_TPS=false to disable
+const _tpsEnabled = !process.env.SHOW_TPS || process.env.SHOW_TPS.toLowerCase() !== "false";
+let _tpsWindow = [];
+let _baseTitle = "gc2oc";
+let _lastTpsUpdate = 0;
+
+function _updateConsoleTitle() {
+  let suffix = "";
+  if (_tpsEnabled && _tpsWindow.length > 0) {
+    const avg = _tpsWindow.reduce((a, b) => a + b, 0) / _tpsWindow.length;
+    suffix = ` [${avg.toFixed(1)} t/s]`;
+  }
+  const full = _baseTitle + suffix;
+  try { process.title = full; } catch {}
+  try { process.stdout.write(`\x1b]2;${full}\x1b\x07`); } catch {}
+}
+
 function setConsoleTitle(title) {
-  try { process.stdout.write(`\x1b]2;${title}\x1b\x07`); } catch {}
-  try { process.title = title; } catch {}
+  _baseTitle = title;
+  _updateConsoleTitle();
+}
+
+function _recordTps(tokens, durationMs) {
+  if (!_tpsEnabled) return;
+  if (!tokens || durationMs <= 10) return;
+  const tps = (tokens / durationMs) * 1000;
+  _tpsWindow.push(tps);
+  if (_tpsWindow.length > 5) _tpsWindow.shift();
+  const now = Date.now();
+  if (now - _lastTpsUpdate > 2000) {
+    _lastTpsUpdate = now;
+    _updateConsoleTitle();
+  }
 }
 
 async function showToast(title, body) {
@@ -157,8 +188,8 @@ const app = new Hono();
 // CORS — VS Code Copilot sends requests from file:// / vscode-file:// origins
 app.use(cors({ origin: "*", allowMethods: ["GET", "POST", "DELETE", "OPTIONS"], allowHeaders: ["Content-Type", "Authorization"] }));
 
-// Response compression (gzip / deflate / brotli) — reduces wire bytes 70-90%
-app.use(compress());
+// Response compression disabled — local proxy doesn't benefit from it
+// app.use(compress());
 
 // Body parser — works on Bun + raw Node.js HTTP (body pre-read)
 async function getBody(c) {
@@ -206,53 +237,44 @@ function _stripAllToolCalls(messages) {
   });
 }
 
-// Pre-flight: for any assistant whose tool_call_ids don't ALL have matching tool results,
-// inject fake tool result messages to complete the group. This satisfies both DeepSeek
-// validation (tool_calls must have matching results) and VS's agent loop (VS expects
-// its tool calls to be resolved before continuing).
+// Pre-flight: strip orphaned tool_calls from assistant messages that have no
+// matching tool results. This prevents DeepSeek validation errors (tool_calls
+// must have matching results) without injecting fake results that confuse the model.
 function _stripOrphanedToolCalls(messages) {
   if (!messages?.length) return { messages, stripped: 0 };
-  let fixed = 0;
-  const result = [...messages];
-
-  for (let i = 0; i < result.length; i++) {
-    const m = result[i];
-    if (m.role !== "assistant" || !m.tool_calls?.length) continue;
+  let stripped = 0;
+  const result = messages.map(m => {
+    if (m.role !== "assistant" || !m.tool_calls?.length) return m;
 
     const callIds = m.tool_calls.map(tc => tc.id);
     const matched = new Set();
-    let lastToolIdx = i; // position of the last tool result for this assistant
-    for (let j = i + 1; j < result.length; j++) {
-      const t = result[j];
+    // Scan forward from this assistant for matching tool results
+    const asstIdx = messages.indexOf(m);
+    for (let j = asstIdx + 1; j < messages.length; j++) {
+      const t = messages[j];
       if (t.role === "tool" && t.tool_call_id && callIds.some(cid => cid === t.tool_call_id)) {
         matched.add(t.tool_call_id);
-        lastToolIdx = j;
       }
     }
 
-    if (matched.size < callIds.length) {
-      const missing = callIds.filter(id => !matched.has(id));
-      const names = m.tool_calls.filter(tc => missing.includes(tc.id)).map(tc => tc.function?.name || "?");
-      log(`  [tool] injecting ${missing.length} fake tool results: ${names.join(", ")} (${missing.length}/${callIds.length} missing)`);
-
-      // Inject fake tool results after the last existing result (or after the assistant itself)
-      let insertIdx = lastToolIdx > i ? lastToolIdx + 1 : i + 1;
-      for (const mId of missing) {
-        const tc = m.tool_calls.find(tc => tc.id === mId);
-        const fnName = tc?.function?.name || "unknown";
-        result.splice(insertIdx, 0, {
-          role: "tool",
-          tool_call_id: mId,
-          content: `[gc2oc] fake result for ${fnName} (original tool result missing from VS)`,
-        });
-        insertIdx++;
-      }
-      fixed++;
+    if (matched.size === 0) {
+      // All tool calls are orphaned — strip them entirely
+      stripped++;
+      const { tool_calls, ...rest } = m;
+      return { ...rest, content: m.content || "" };
+    } else if (matched.size < callIds.length) {
+      // Some tool calls have results, some don't — keep only the matched ones
+      stripped++;
+      const names = m.tool_calls.filter(tc => !matched.has(tc.id)).map(tc => tc.function?.name || "?");
+      log(`  [tool] stripping ${callIds.length - matched.size} orphaned tool calls: ${names.join(", ")}`);
+      return { ...m, tool_calls: m.tool_calls.filter(tc => matched.has(tc.id)) };
     }
-  }
 
-  if (fixed) log(`  [tool] fixed ${fixed} orphaned assistant group${fixed !== 1 ? "s" : ""} total`);
-  return { messages: result, stripped: fixed };
+    return m;
+  });
+
+  if (stripped) log(`  [tool] stripped orphaned tool calls from ${stripped} assistant message${stripped !== 1 ? "s" : ""}`);
+  return { messages: result, stripped };
 }
 
 const oaiResp = (content, tool_calls, finish_reason, model, usage) => {
@@ -354,6 +376,7 @@ function processThinkTags(text) {
 // ── Reasoning field aliasing ──
 function addReasoningAliases(delta, reasoningText) {
   if (!reasoningText) return delta;
+  if (_displayReasoning) return delta; // reasoning already folded into content, don't double-expose
   delta.reasoning = reasoningText;
   delta.reasoning_content = reasoningText;
   delta.reasoning_text = reasoningText;
@@ -363,9 +386,15 @@ function addReasoningAliases(delta, reasoningText) {
 
 async function _simStream(w, base, hasTools, toolCalls, text, reasoningContent) {
   if (reasoningContent) {
-    let dr = { content: "" };
-    addReasoningAliases(dr, reasoningContent);
-    await w({ ...base, choices: [{ index: 0, delta: dr, finish_reason: null }] });
+    // When display_reasoning is on, fold reasoning into content as first delta
+    if (_displayReasoning) {
+      const folded = _foldReasoningIntoContent(reasoningContent, "");
+      await w({ ...base, choices: [{ index: 0, delta: { content: folded }, finish_reason: null }] });
+    } else {
+      let dr = { content: "" };
+      addReasoningAliases(dr, reasoningContent);
+      await w({ ...base, choices: [{ index: 0, delta: dr, finish_reason: null }] });
+    }
   }
   if (hasTools) {
     for (let i = 0; i < toolCalls.length; i++) {
@@ -394,6 +423,28 @@ async function _simStream(w, base, hasTools, toolCalls, text, reasoningContent) 
 // Also keyed by workspace root for cross-session continuity (new session in same workspace
 // can read reasoning from a prior session — TaskSync-inspired conversation continuity)
 const _crossReqReasoningCache = new Map(); // convId:contentHash → reasoningContent
+const _reasoningCacheMaxEntries = 5000; // max entries before LRU eviction
+
+// ── Thinking display: mirror reasoning into Cursor/VS-visible markdown blocks ──
+const _displayReasoning = (process.env.DISPLAY_REASONING || "false").toLowerCase() === "true";
+const _collapsibleReasoning = (process.env.COLLAPSIBLE_REASONING || "true").toLowerCase() !== "false";
+const _THINKING_BLOCK_START = _collapsibleReasoning ? "<details>\n<summary>Thinking</summary>\n\n" : "<think>\n";
+const _THINKING_BLOCK_END = _collapsibleReasoning ? "\n</details>\n\n" : "\n</think>\n\n";
+
+function _foldReasoningIntoContent(reasoningText, existingContent) {
+  if (!reasoningText) return existingContent || "";
+  return _THINKING_BLOCK_START + reasoningText + _THINKING_BLOCK_END + (existingContent || "");
+}
+
+// Strip previously-displayed thinking blocks from assistant content (echoed back by VS/Cursor)
+const _THINKING_STRIP_RE = new RegExp(
+  `<details\\b[^>]*>\\s*<summary\\b[^>]*>\\s*Thinking\\s*</summary>[\\s\\S]*?</details>\\s*|<think>\\s*[\\s\\S]*?\\s*</think>\\s*`,
+  "gi"
+);
+function _stripDisplayedThinking(content) {
+  if (typeof content !== "string") return content;
+  return content.replace(_THINKING_STRIP_RE, "").trimStart();
+}
 
 // Session tracking — detect and number distinct conversation contexts
 const _sessionRegistry = new Map(); // convId → { id, clientTag, createdAt, workspaceRoot }
@@ -412,6 +463,68 @@ function _convId(messages, model, workspaceRoot) {
   let h = 5381;
   for (let i = 0; i < anchor.length; i++) h = ((h << 5) + h + anchor.charCodeAt(i)) | 0;
   return (h >>> 0).toString(36);
+}
+
+// ── Reasoning cache helpers (multi-tier key system, inspired by yxlao/deepseek-cursor-proxy) ──
+function _sha256(data) {
+  // Simple yet effective hash for cache key generation (not cryptographic)
+  let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+  for (let i = 0; i < data.length; i++) {
+    const ch = data.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  const combined = (h1 >>> 0).toString(16) + (h2 >>> 0).toString(16);
+  return combined;
+}
+
+function _normalizeToolCallForSig(tc) {
+  if (!tc || typeof tc !== "object") return null;
+  const fn = tc.function || {};
+  const args = typeof fn.arguments === "string" ? fn.arguments : JSON.stringify(fn.arguments || {});
+  return { type: tc.type || "function", function: { name: fn.name || "", arguments: args } };
+}
+
+function _toolCallSignature(tc) {
+  const n = _normalizeToolCallForSig(tc);
+  if (!n) return "";
+  return _sha256(JSON.stringify(n));
+}
+
+function _toolCallIds(msg) {
+  const ids = [];
+  for (const tc of msg?.tool_calls || []) {
+    if (tc && tc.id) ids.push(String(tc.id));
+  }
+  return ids;
+}
+
+function _toolCallNames(msg) {
+  const names = [];
+  for (const tc of msg?.tool_calls || []) {
+    const n = tc?.function?.name || tc?.name;
+    if (n) names.push(String(n));
+  }
+  return names;
+}
+
+function _messageSignature(msg) {
+  const toolCalls = (msg?.tool_calls || []).map(_normalizeToolCallForSig).filter(Boolean);
+  const payload = {
+    content: typeof msg?.content === "string" ? msg.content : (msg?.content != null ? JSON.stringify(msg.content) : ""),
+    tool_calls: toolCalls,
+  };
+  return _sha256(JSON.stringify(payload));
+}
+
+function _assistantNeedsReasoning(msg, priorMessages) {
+  if (msg?.tool_calls?.length) return true;
+  for (let i = priorMessages.length - 1; i >= 0; i--) {
+    const role = priorMessages[i]?.role;
+    if (role === "tool") return true;
+    if (role === "user" || role === "system") return false;
+  }
+  return false;
 }
 
 function _msgHash(msg) {
@@ -485,23 +598,107 @@ function createReasoningContext(messages, model, workspaceRoot, clientTag, provi
       if (!reasoning) return;
       fifo.push(reasoning);
       if (fifo.length > 50) fifo.shift();
+      // Multi-tier key system (inspired by yxlao/deepseek-cursor-proxy):
+      // Tier 1: Message signature (content + tool_calls canonicalized)
+      // Tier 2: Tool call IDs (survives argument re-ordering)
+      // Tier 3: Tool call signatures (survives ID changes)
+      // Tier 4: Tool names (recovery of last resort — catches interrupted streams)
+      const sig = _messageSignature(msg);
+      if (sig) {
+        _crossReqReasoningCache.set(prefixedConv(`sig:${sig}`), reasoning);
+        if (prefixedWs) _crossReqReasoningCache.set(prefixedWs(`sig:${sig}`), reasoning);
+        _crossReqReasoningCache.set(`g:${mdl}:sig:${sig}`, reasoning);
+      }
+      const ids = _toolCallIds(msg);
+      for (const id of ids) {
+        _crossReqReasoningCache.set(prefixedConv(`tc:${id}`), reasoning);
+        if (prefixedWs) _crossReqReasoningCache.set(prefixedWs(`tc:${id}`), reasoning);
+      }
+      const tcs = msg.tool_calls || [];
+      for (const tc of tcs) {
+        const tcsig = _toolCallSignature(tc);
+        if (tcsig) {
+          _crossReqReasoningCache.set(prefixedConv(`tcs:${tcsig}`), reasoning);
+          if (prefixedWs) _crossReqReasoningCache.set(prefixedWs(`tcs:${tcsig}`), reasoning);
+        }
+      }
+      const names = _toolCallNames(msg);
+      for (const name of names) {
+        _crossReqReasoningCache.set(prefixedConv(`tn:${name}`), reasoning);
+        if (prefixedWs) _crossReqReasoningCache.set(prefixedWs(`tn:${name}`), reasoning);
+      }
+      // Legacy keys for backward compatibility
       const h = _msgHash(msg);
       if (h) {
         _crossReqReasoningCache.set(prefixedConv(h), reasoning);
-        // Also store workspace-scoped — enables cross-session reasoning lookup
         if (prefixedWs) _crossReqReasoningCache.set(prefixedWs(h), reasoning);
+        _crossReqReasoningCache.set(`g:${mdl}:${h}`, reasoning);
       }
       _crossReqReasoningCache.set(prefixedConv(`mdl:${mdl}`), reasoning);
+      _crossReqReasoningCache.set(`g:${mdl}:last`, reasoning);
+      // Smart memory eviction: when cache grows beyond limit, evict oldest entries
+      if (_crossReqReasoningCache.size > _reasoningCacheMaxEntries) {
+        const keys = _crossReqReasoningCache.keys();
+        let toDelete = _crossReqReasoningCache.size - _reasoningCacheMaxEntries;
+        // Skip permanent keys (last-reasoning fallbacks, per-model keys)
+        const permanent = new Set();
+        for (const k of _crossReqReasoningCache.keys()) {
+          if (k.startsWith("g:") && k.endsWith(":last")) permanent.add(k);
+          if (k.includes(":mdl:")) permanent.add(k);
+        }
+        for (const k of keys) {
+          if (toDelete <= 0) break;
+          if (permanent.has(k)) continue;
+          _crossReqReasoningCache.delete(k);
+          toDelete--;
+        }
+      }
     },
     get(msg, mdl) {
+      // Multi-tier lookup order:
+      // 1. Message signature (most precise)
+      // 2. Tool call IDs (survives argument re-ordering)
+      // 3. Tool call signatures (survives ID changes)
+      // 4. Tool names (recovery of last resort)
+      // 5. Legacy content hash
+      // 6. FIFO fallback
+      // 7. Per-model last-reasoning
+
+      const sig = _messageSignature(msg);
+      if (sig) {
+        if (_crossReqReasoningCache.has(prefixedConv(`sig:${sig}`))) return _crossReqReasoningCache.get(prefixedConv(`sig:${sig}`));
+        if (prefixedWs && _crossReqReasoningCache.has(prefixedWs(`sig:${sig}`))) return _crossReqReasoningCache.get(prefixedWs(`sig:${sig}`));
+        if (_crossReqReasoningCache.has(`g:${mdl}:sig:${sig}`)) return _crossReqReasoningCache.get(`g:${mdl}:sig:${sig}`);
+      }
+      const ids = _toolCallIds(msg);
+      for (const id of ids) {
+        if (_crossReqReasoningCache.has(prefixedConv(`tc:${id}`))) return _crossReqReasoningCache.get(prefixedConv(`tc:${id}`));
+        if (prefixedWs && _crossReqReasoningCache.has(prefixedWs(`tc:${id}`))) return _crossReqReasoningCache.get(prefixedWs(`tc:${id}`));
+      }
+      const tcs = msg.tool_calls || [];
+      for (const tc of tcs) {
+        const tcsig = _toolCallSignature(tc);
+        if (tcsig) {
+          if (_crossReqReasoningCache.has(prefixedConv(`tcs:${tcsig}`))) return _crossReqReasoningCache.get(prefixedConv(`tcs:${tcsig}`));
+          if (prefixedWs && _crossReqReasoningCache.has(prefixedWs(`tcs:${tcsig}`))) return _crossReqReasoningCache.get(prefixedWs(`tcs:${tcsig}`));
+        }
+      }
+      const names = _toolCallNames(msg);
+      for (const name of names) {
+        if (_crossReqReasoningCache.has(prefixedConv(`tn:${name}`))) return _crossReqReasoningCache.get(prefixedConv(`tn:${name}`));
+        if (prefixedWs && _crossReqReasoningCache.has(prefixedWs(`tn:${name}`))) return _crossReqReasoningCache.get(prefixedWs(`tn:${name}`));
+      }
+      // Legacy lookup
       const h = _msgHash(msg);
       if (h) {
-        // Try conversation-scoped first (exact match), then workspace-scoped (cross-session)
         if (_crossReqReasoningCache.has(prefixedConv(h))) return _crossReqReasoningCache.get(prefixedConv(h));
         if (prefixedWs && _crossReqReasoningCache.has(prefixedWs(h))) return _crossReqReasoningCache.get(prefixedWs(h));
+        if (_crossReqReasoningCache.has(`g:${mdl}:${h}`)) return _crossReqReasoningCache.get(`g:${mdl}:${h}`);
       }
       if (cursor < fifo.length) return fifo[cursor++];
-      return _crossReqReasoningCache.get(prefixedConv(`mdl:${mdl}`));
+      const perMdl = _crossReqReasoningCache.get(prefixedConv(`mdl:${mdl}`));
+      if (perMdl) return perMdl;
+      return _crossReqReasoningCache.get(`g:${mdl}:last`);
     },
     crossCacheSize() { return _crossReqReasoningCache.size; },
     isRapid,
@@ -939,9 +1136,8 @@ function normalizeToolCall(tc) {
     if (name) log(`\x1b[35m[normalize] ${name} RAW: ${raw} → ${fixed}\x1b[0m`);
     return { ...tc, function: { ...tc.function, arguments: fixed } };
   } catch (e) {
-    log(`\x1b[31m[normalize-ERR] ${name}: ${e.message}\x1b[0m`);
     const raw2 = tc.function?.arguments;
-    if (!raw2) return tc;
+    if (!raw2) return null;
     // DeepSeek often truncates create_file content mid-string — salvage what we can
     if (/^create_file$/i.test(name)) {
       try {
@@ -1039,7 +1235,7 @@ function normalizeToolCall(tc) {
       try {
         const safe = {};
         const qMatch = raw2.match(/"query"\s*:\s*"((?:[^"\\]|\\.)*)"/) || raw2.match(/"query"\s*:\s*([^,}\s]+)/);
-        safe.query = qMatch ? qMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "";
+        safe.query = qMatch ? qMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\").replace(/^"/, "") : "";
         safe.isRegexp = /"isRegexp"\s*:\s*true/i.test(raw2);
         const ipMatch = raw2.match(/"includePattern"\s*:\s*"((?:[^"\\]|\\.)*)"/);
         if (ipMatch) {
@@ -1054,7 +1250,7 @@ function normalizeToolCall(tc) {
         }
         const mrMatch = raw2.match(/"maxResults"\s*:\s*(\d+)/);
         safe.maxResults = mrMatch ? parseInt(mrMatch[1], 10) : null;
-        if (safe.query) {
+        if (safe.query || safe.includePattern) {
           log(`\x1b[33m[${name}] salvaged query="${safe.query}" isRegexp=${safe.isRegexp} includePattern=${safe.includePattern} maxResults=${safe.maxResults}\x1b[0m`);
           return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
         }
@@ -1244,7 +1440,8 @@ function normalizeToolCall(tc) {
       } catch {}
     }
   }
-  return null; // salvage failed — drop broken tool call
+  log(`\x1b[31m[drop] ${name}: JSON parse failed, salvage unsuccessful — discarding\x1b[0m`);
+  return null;
 }
 
 function extractToolCalls(text, workspaceRoot = "", messages = []) {
@@ -2098,17 +2295,18 @@ app.post("/v1/chat/completions", async c => {
             const msg = { role: "assistant", content: null, tool_calls: normalizedCalls };
             if (m.reasoning_content) {
               msg.reasoning_content = m.reasoning_content;
-            } else {
+            } else if (_assistantNeedsReasoning(msg, userMsgs)) {
               const rc = reasoningCtx.get(m, goModel);
               if (rc) msg.reasoning_content = rc;
             }
             userMsgs.push(msg);
           } else if (hasContent) {
-            const msg = { role: "assistant", content: m.content };
+            const strippedContent = _displayReasoning ? _stripDisplayedThinking(m.content) : m.content;
+            const msg = { role: "assistant", content: strippedContent };
             if (m.reasoning_content) {
               msg.reasoning_content = m.reasoning_content;
               reasoningCtx.cache(m, goModel, m.reasoning_content);
-            } else {
+            } else if (_assistantNeedsReasoning(msg, userMsgs)) {
               const rc = reasoningCtx.get(m, goModel);
               if (rc) msg.reasoning_content = rc;
             }
@@ -2183,7 +2381,7 @@ app.post("/v1/chat/completions", async c => {
           }
         }
         if (toolLoopBroken) continue;
-        if (/error|fail|invalid|timeout/i.test(tc)) {
+        if (/^(Error|Failed|Invalid|Timeout|\[Error\]|\[Fail\]|command not found|is not recognized|no such file)/i.test(tc.trim())) {
           toolFailStreak++;
           if (toolFailStreak > 3) { toolLoopBroken = true; log("  breaking tool retry loop (>3 consecutive errors)"); continue; }
         } else {
@@ -2201,6 +2399,8 @@ app.post("/v1/chat/completions", async c => {
     // to call task_complete, short-circuit with stop to break the loop.
     // Using stop (not task_complete auto-injection) because VS Insiders
     // rejects auto-injected tool calls and keeps retrying.
+    // HOWEVER: if the LLM is still producing useful tool calls, don't
+    // terminate — VS nags are often premature.
     let vsTaskCompleteNags = 0;
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role !== "user") continue;
@@ -2211,16 +2411,28 @@ app.post("/v1/chat/completions", async c => {
         break;
       }
     }
-    if (vsTaskCompleteNags >= 3) {
+    // Check if the LLM is still actively working (last assistant has tool_calls)
+    let lastAssistantHasTools = false;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "assistant") {
+        lastAssistantHasTools = !!(messages[i].tool_calls?.length);
+        break;
+      }
+    }
+    if (vsTaskCompleteNags >= 3 && !lastAssistantHasTools) {
       reasoningCtx.sessionEntry.loopHits = (reasoningCtx.sessionEntry.loopHits || 0) + 1;
       reasoningCtx.seslog(`\x1b[33m[LOOP-BREAK] VS has nagged ${vsTaskCompleteNags} times — filtering nags & forcing task_complete (loop hits: ${reasoningCtx.sessionEntry.loopHits})\x1b[0m`);
       // Filter out VS nag messages so the model isn't confused by them
       taskCompleteOnly = true;
       filterNags = true;
+    } else if (vsTaskCompleteNags >= 3 && lastAssistantHasTools) {
+      reasoningCtx.seslog(`\x1b[35m[nags] ignoring ${vsTaskCompleteNags} VS nags — LLM is still producing tool calls\x1b[0m`);
+      filterNags = true; // still filter nags so the model isn't confused
+      // Reset loopHits since we're not escalating
+      if (reasoningCtx.sessionEntry.loopHits > 0) reasoningCtx.sessionEntry.loopHits = 0;
     }
-    if (vsTaskCompleteNags >= 12) {
-      reasoningCtx.seslog(`\x1b[31m[LOOP-BREAK] VS has nagged ${vsTaskCompleteNags} times — returning stop as last resort\x1b[0m`);
-      reasoningCtx.seslog(`\x1b[31m[LOOP-BREAK] VS has nagged ${vsTaskCompleteNags} times — returning stop as last resort\x1b[0m`);
+    if (reasoningCtx.sessionEntry.loopHits >= 4) {
+      reasoningCtx.seslog(`\x1b[31m[LOOP-BREAK] VS has nagged ${reasoningCtx.sessionEntry.loopHits} rounds (${reasoningCtx.sessionEntry.loopHits * 3}+ nags) — returning stop as last resort\x1b[0m`);
       if (clientWantsStream) {
         return stream(c, async (s) => {
           const w = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
@@ -2232,8 +2444,9 @@ app.post("/v1/chat/completions", async c => {
       }
       return c.json(oaiResp("", undefined, "stop", model));
     }
-    // No nag loop detected — reset loop counter for this session
-    if (reasoningCtx.sessionEntry.loopHits > 0) reasoningCtx.sessionEntry.loopHits = 0;
+    // Only reset loop counter when no nags detected in this request.
+    // When nags >= 3, loopHits was incremented above — keep it to accumulate across requests.
+    if (vsTaskCompleteNags < 3 && reasoningCtx.sessionEntry.loopHits > 0) reasoningCtx.sessionEntry.loopHits = 0;
 
     // Identity override — MUST be first system instruction to override VS built-in
     systemMsg = compactIdentity(goModel, thinkingTag) + (systemMsg ? "\n\n" : "") + systemMsg;
@@ -2274,6 +2487,20 @@ app.post("/v1/chat/completions", async c => {
           }
         }
         if (userMsgs.length < before) reasoningCtx.seslog(`\x1b[33m[nags] filtered ${before - userMsgs.length} nag messages\x1b[0m`);
+      }
+    }
+    // Replace bare "continue" from VS autopilot — the LLM already has full context,
+    // so stripping it makes the model ask "what should I do?". Replace with a
+    // contextual prompt to proceed with the current task.
+    {
+      const lastUM = userMsgs[userMsgs.length - 1];
+      if (lastUM && lastUM.role === "user") {
+        const t = typeof lastUM.content === "string" ? lastUM.content.trim() : "";
+        const tl = t.toLowerCase();
+        if (tl === "continue" || tl === "proceed" || tl === "go on" || tl === "go ahead") {
+          reasoningCtx.seslog(`\x1b[35m[autopilot] replacing bare "${t}" → "Continue with your current task using the tools available."\x1b[0m`);
+          userMsgs[userMsgs.length - 1] = { role: "user", content: "Continue with your current task using the tools available." };
+        }
       }
     }
     if (systemMsg) apiMessages.push({ role: "system", content: systemMsg });
@@ -2394,13 +2621,18 @@ app.post("/v1/chat/completions", async c => {
         const resp = oaiResp(hasTools ? null : text, hasTools ? toolCalls : undefined, hasTools ? "tool_calls" : "stop", model);
         if (reasoningContent) {
           const choice = resp.choices[0];
-          addReasoningAliases(choice.message, reasoningContent);
+          if (_displayReasoning) {
+            choice.message.content = _foldReasoningIntoContent(reasoningContent, choice.message.content || "");
+          } else {
+            addReasoningAliases(choice.message, reasoningContent);
+          }
         }
         return c.json(resp);
       }
     }
-    // Cache bypassed or not cached — going to upstream, reset loop counter
-    if (reasoningCtx.sessionEntry.loopHits > 0) reasoningCtx.sessionEntry.loopHits = 0;
+    // Cache bypassed or not cached — going to upstream.
+    // Keep loop counter active when VS nags are ongoing so it accumulates for the 12-nag stop.
+    if (!taskCompleteOnly && reasoningCtx.sessionEntry.loopHits > 0) reasoningCtx.sessionEntry.loopHits = 0;
 
     // ── Stream mode: pipe directly from upstream async generator ──
     if (streamMode) {
@@ -2418,6 +2650,7 @@ app.post("/v1/chat/completions", async c => {
         let tokenCount = 0;
         let hasTools = false;
         let clientGone = false;
+        let _reasoningOpen = false;
 
         try {
           for await (const chunk of chatCompletion(ollamaReq)) {
@@ -2429,22 +2662,42 @@ app.post("/v1/chat/completions", async c => {
             // Reasoning delta (DeepSeek thinking mode)
             if (msg.reasoning_content || msg.reasoning) {
               const rc = msg.reasoning_content || msg.reasoning;
-              let dr = { content: "" };
-              addReasoningAliases(dr, rc);
-              try { await w({ ...base, choices: [{ index: 0, delta: dr, finish_reason: null }] }); }
-              catch { clientGone = true; break; }
+              if (_displayReasoning) {
+                // Fold reasoning into Cursor-visible content as collapsible markdown blocks
+                const content = _reasoningOpen ? rc : (_THINKING_BLOCK_START + rc);
+                _reasoningOpen = true;
+                try { await w({ ...base, choices: [{ index: 0, delta: { content }, finish_reason: null }] }); }
+                catch { clientGone = true; break; }
+              } else {
+                let dr = { content: "" };
+                addReasoningAliases(dr, rc);
+                try { await w({ ...base, choices: [{ index: 0, delta: dr, finish_reason: null }] }); }
+                catch { clientGone = true; break; }
+              }
               tokenCount++;
             }
 
             // Content delta
             if (msg.content != null) {
-              try { await w({ ...base, choices: [{ index: 0, delta: { content: msg.content }, finish_reason: null }] }); }
+              let contentToSend = msg.content;
+              // Close open thinking block when real content arrives
+              if (_displayReasoning && _reasoningOpen) {
+                contentToSend = _THINKING_BLOCK_END + contentToSend;
+                _reasoningOpen = false;
+              }
+              try { await w({ ...base, choices: [{ index: 0, delta: { content: contentToSend }, finish_reason: null }] }); }
               catch { clientGone = true; break; }
               tokenCount++;
             }
 
             // Tool call deltas (pass through directly — upstream sends incremental OpenAI format)
             if (msg.tool_calls?.length) {
+              // Close open thinking block when tool calls start
+              if (_displayReasoning && _reasoningOpen) {
+                try { await w({ ...base, choices: [{ index: 0, delta: { content: _THINKING_BLOCK_END }, finish_reason: null }] }); }
+                catch { clientGone = true; break; }
+                _reasoningOpen = false;
+              }
               hasTools = true;
               try { await w({ ...base, choices: [{ index: 0, delta: { tool_calls: msg.tool_calls }, finish_reason: null }] }); }
               catch { clientGone = true; break; }
@@ -2463,6 +2716,11 @@ app.post("/v1/chat/completions", async c => {
           return;
         }
 
+        // Close open thinking block before finishing the stream
+        if (_displayReasoning && _reasoningOpen) {
+          await w({ ...base, choices: [{ index: 0, delta: { content: _THINKING_BLOCK_END }, finish_reason: null }] });
+          _reasoningOpen = false;
+        }
         const finishReason = hasTools ? "tool_calls" : "stop";
         await w({ ...base, choices: [{ index: 0, delta: {}, finish_reason: finishReason }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
         await s.write("data: [DONE]\n\n");
@@ -2518,6 +2776,7 @@ app.post("/v1/chat/completions", async c => {
         }
 
         reasoningCtx.seslog(`stream done (${tokenCount} chunk${tokenCount !== 1 ? "s" : ""})`);
+        _recordTps(tokenCount, Date.now() - startTime);
         } finally {
           release();
         }
@@ -2551,7 +2810,7 @@ app.post("/v1/chat/completions", async c => {
       if (e instanceof APIError && e.status === 400 && /reasoning_content.*must be passed back/i.test(e.message)) {
         err(`  [reasoning] stripping thinking mode & retrying (reasoning_content missing in history)`);
         const noThinkingReq = { ...nonStreamReq, stream: false };
-        delete noThinkingReq.chat_template_kwargs;
+        noThinkingReq.chat_template_kwargs = { thinking: false };
         delete noThinkingReq.thinking_token_budget;
         try {
           chunks = await cm.runRequest(goModel, async () => {
@@ -2562,8 +2821,32 @@ app.post("/v1/chat/completions", async c => {
             return result;
           }, true);
         } catch (retryErr) {
-          err(`  [reasoning] retry without thinking also failed: ${retryErr.message}`);
-          throw retryErr;
+          if (retryErr instanceof APIError && retryErr.status === 400 && /reasoning_content.*must be passed back/i.test(retryErr.message)) {
+            err(`  [reasoning] last-resort: stripping all assistant/tool history & retrying`);
+            // Drop all assistant and tool messages — keep only system+user so there's no
+            // historical assistant that DeepSeek would demand reasoning_content for.
+            const bareMessages = nonStreamReq.messages.filter(m =>
+              m.role === "system" || m.role === "user"
+            );
+            const bareReq = { ...nonStreamReq, messages: bareMessages, stream: false };
+            bareReq.chat_template_kwargs = { thinking: false };
+            delete bareReq.thinking_token_budget;
+            try {
+              chunks = await cm.runRequest(goModel, async () => {
+                const result = [];
+                for await (const chunk of chatCompletion(bareReq)) {
+                  result.push(chunk);
+                }
+                return result;
+              }, true);
+            } catch (lastErr) {
+              err(`  [reasoning] last-resort also failed: ${lastErr.message}`);
+              throw lastErr;
+            }
+          } else {
+            err(`  [reasoning] retry without thinking also failed: ${retryErr.message}`);
+            throw retryErr;
+          }
         }
       } else if (e instanceof APIError && e.status === 400 && /tool|tool_call/i.test(e.message)) {
         _tool400Streak++;
@@ -2615,7 +2898,15 @@ app.post("/v1/chat/completions", async c => {
     let reasoningContent = apiReasoning || thinkResult.reasoning;
 
     let allToolCalls = [];
-    if (nativeCalls?.length) {
+
+    // When VS is nagging, force task_complete regardless of what the model returned.
+    // This MUST be first — before nativeCalls and extractToolCalls — to prevent
+    // any tool call extraction from overriding the forced completion.
+    if (taskCompleteOnly) {
+      reasoningCtx.seslog(`\x1b[33m[FORCE-COMPLETE] taskCompleteOnly — forcing task_complete\x1b[0m`);
+      allToolCalls = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
+      cleanText = "";
+    } else if (nativeCalls?.length) {
       allToolCalls = nativeCalls.map(normalizeToolCall).filter(Boolean);
       cleanText = "";
     } else if (vsTools?.length) {
@@ -2639,13 +2930,6 @@ app.post("/v1/chat/completions", async c => {
       allToolCalls = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
       cleanText = "";
     }
-    // Force-inject task_complete when the model refuses to call it despite
-    // having only task_complete available (VS nagging scenario).
-    if (!allToolCalls.length && taskCompleteOnly) {
-      reasoningCtx.seslog(`\x1b[33m[FORCE-COMPLETE] model ignored task_complete-only tools — injecting task_complete\x1b[0m`);
-      allToolCalls = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
-      cleanText = "";
-    }
 
     const hasTools = allToolCalls.length > 0;
 
@@ -2659,12 +2943,27 @@ app.post("/v1/chat/completions", async c => {
 
     if (ck) cacheStore(ck, { text: cleanText, toolCalls: allToolCalls, hasTools, reasoningContent });
 
+    _recordTps(usage?.completion_tokens || Math.round((cleanText || fullText || "").length / 4), Date.now() - startTime);
+
+    // DeepSeek thinking mode: when the model puts everything in <think> tags,
+    // cleanText is empty but reasoning exists. Fall back to a summary so VS
+    // doesn't get an empty response and loop forever.
+    if (!hasTools && !cleanText && reasoningContent) {
+      const summaryLine = reasoningContent.split("\n")[0].slice(0, 200);
+      cleanText = summaryLine || "(thinking)";
+      reasoningCtx.seslog(`\x1b[36m[think-fallback] empty text, using reasoning summary\x1b[0m`);
+    }
+
     const resp = oaiResp(hasTools ? null : cleanText, hasTools ? allToolCalls : undefined, hasTools ? "tool_calls" : "stop", model, usage);
     if (hasTools) reasoningCtx.seslog(`\x1b[35m[TOOLS-TO-VS] ${allToolCalls.map(tc => `${tc.function.name}(${tc.function.arguments})`).join(" | ")}\x1b[0m`);
-    else reasoningCtx.seslog(`\x1b[35m[TEXT-TO-VS] ${cleanText.replace(/\n/g,"\\n")}\x1b[0m`);
+    else reasoningCtx.seslog(`\x1b[35m[TEXT-TO-VS] ${(cleanText || "").slice(0, 200).replace(/\n/g,"\\n")}\x1b[0m`);
     if (reasoningContent) {
       const choice = resp.choices[0];
-      addReasoningAliases(choice.message, reasoningContent);
+      if (_displayReasoning) {
+        choice.message.content = _foldReasoningIntoContent(reasoningContent, choice.message.content || "");
+      } else {
+        addReasoningAliases(choice.message, reasoningContent);
+      }
     }
 
     // Simulate SSE streaming for clients that requested it (e.g. VS 2026)
@@ -2884,6 +3183,9 @@ app.post("/api/chat", async c => {
       const apiThinking = parseThinkingMode(body.model).thinking;
   const vsTools = body.tools;
   _dumpToolSchemas(vsTools);
+  const provider = isM365Model(model) ? "m365" : isPollModel(model) ? "poll" : isFreeTierModel(model) ? "zen" : "go";
+  const reasoningCtx = createReasoningContext(messages, model, getWorkspaceRoot(messages), clientTag, provider, apiThinking);
+  reasoningCtx.reset();
 
       // Build messages with tool info in system prompt
       let systemMsg = "";
@@ -2898,8 +3200,27 @@ app.post("/api/chat", async c => {
             Array.isArray(m.content) ? m.content.some(p => (p?.text || p?.content || "")?.trim?.()?.length > 0) :
             true
           );
-          if (hasTools) userMsgs.push({ role: "assistant", content: null, tool_calls: m.tool_calls });
-          else if (hasContent) userMsgs.push({ role: "assistant", content: m.content });
+          if (hasTools) {
+            const msg = { role: "assistant", content: null, tool_calls: m.tool_calls };
+            if (m.reasoning_content) {
+              msg.reasoning_content = m.reasoning_content;
+            } else if (_assistantNeedsReasoning(msg, userMsgs)) {
+              const rc = reasoningCtx.get(m, model);
+              if (rc) msg.reasoning_content = rc;
+            }
+            userMsgs.push(msg);
+          } else if (hasContent) {
+            const strippedContent = _displayReasoning ? _stripDisplayedThinking(m.content) : m.content;
+            const msg = { role: "assistant", content: strippedContent };
+            if (m.reasoning_content) {
+              msg.reasoning_content = m.reasoning_content;
+              reasoningCtx.cache(m, model, m.reasoning_content);
+            } else if (_assistantNeedsReasoning(msg, userMsgs)) {
+              const rc = reasoningCtx.get(m, model);
+              if (rc) msg.reasoning_content = rc;
+            }
+            userMsgs.push(msg);
+          }
         }
         else if (role === "tool") {
           if (clientTag === "lp") {
@@ -2917,6 +3238,21 @@ app.post("/api/chat", async c => {
 
       if (vsTools?.length) {
         systemMsg += (systemMsg ? "\n\n" : "") + compactOllamaToolInstructions(vsTools);
+      }
+
+      // Replace bare "continue" from VS autopilot with a contextual prompt
+      // so the LLM knows to proceed with the current task instead of asking
+      // "what should I do?" (which creates a stall loop).
+      {
+        const lastUM = userMsgs[userMsgs.length - 1];
+        if (lastUM && lastUM.role === "user") {
+          const t = typeof lastUM.content === "string" ? lastUM.content.trim() : "";
+          const tl = t.toLowerCase();
+          if (tl === "continue" || tl === "proceed" || tl === "go on" || tl === "go ahead") {
+            reasoningCtx.seslog(`\x1b[35m[autopilot] replacing bare "${t}" → "Continue with your current task using the tools available."\x1b[0m`);
+            userMsgs[userMsgs.length - 1] = { role: "user", content: "Continue with your current task using the tools available." };
+          }
+        }
       }
 
       const apiMessages = systemMsg ? [{ role: "system", content: systemMsg }, ...userMsgs] : userMsgs;
@@ -2947,8 +3283,21 @@ app.post("/api/chat", async c => {
 
       const fullText = chunks.map(c => c.message?.content || "").join("");
       let chatUsage = null;
-      for (const c of chunks) { if (c.usage) chatUsage = c.usage; }
+      let apiReasoning = null;
+      for (const c of chunks) { if (c.usage) chatUsage = c.usage; if (c.message?.reasoning_content) apiReasoning = c.message.reasoning_content; }
       let { content: cleanText, toolCalls: rawCalls } = vsTools?.length ? extractToolCalls(fullText, getWorkspaceRoot(messages)) : { content: fullText, toolCalls: [] };
+      const thinkResult = processThinkTags(cleanText);
+      cleanText = thinkResult.content;
+      const reasoningContent = apiReasoning || thinkResult.reasoning;
+      // Cache reasoning for next turn via conversation-scoped cross-request cache
+      if (reasoningContent) {
+        const virtualMsg = rawCalls.length
+          ? { tool_calls: rawCalls.map(tc => ({ function: { name: tc.function.name, arguments: tc.function.arguments } })) }
+          : { content: fullText };
+        reasoningCtx.cache(virtualMsg, model, reasoningContent);
+      }
+      // Session keepalive
+      trackSession(reasoningCtx.sessionId, model, compressedMessages, clientTag);
       // Loop-break: if AI text is telling itself to call task_complete, auto-inject it
       if (!rawCalls.length && cleanText && /\b(?:task_complete|mark(?:ed)?\s+(?:the\s+)?task\s+as\s+complete|If\s+you\s+believe\s+the\s+task\s+is\s+done)\b/i.test(cleanText)) {
           log(`\x1b[33m[LOOP-BREAK] auto-calling task_complete\x1b[0m`);
@@ -2964,9 +3313,12 @@ app.post("/api/chat", async c => {
       const duration = Date.now() - startTime;
 
       if (body.stream === false) {
+        const displayContent = (_displayReasoning && reasoningContent)
+          ? _foldReasoningIntoContent(reasoningContent, cleanText)
+          : cleanText;
         await s.write(JSON.stringify({
           model: body.model, created_at: createdAt,
-          message: { role: "assistant", content: cleanText, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) },
+          message: { role: "assistant", content: displayContent, ...(!_displayReasoning && reasoningContent ? { reasoning_content: reasoningContent } : {}), ...(toolCalls.length ? { tool_calls: toolCalls } : {}) },
           done: true, done_reason: "stop",
           total_duration: duration * 1e6, load_duration: 0, prompt_eval_count: chatUsage?.prompt_tokens || 0, prompt_eval_duration: 0, eval_count: chatUsage?.completion_tokens || 0, eval_duration: 0,
         }) + "\n");
@@ -2976,16 +3328,29 @@ app.post("/api/chat", async c => {
       // Streaming NDJSON
       let tokenCount = 0;
       if (toolCalls.length) {
-        await s.write(JSON.stringify({ model: body.model, created_at: createdAt, message: { role: "assistant", content: "", tool_calls: toolCalls }, done: false }) + "\n");
+        const tcMsg = { role: "assistant", content: "", tool_calls: toolCalls };
+        if (reasoningContent) {
+          if (_displayReasoning) tcMsg.content = _foldReasoningIntoContent(reasoningContent, "");
+          else tcMsg.reasoning_content = reasoningContent;
+        }
+        await s.write(JSON.stringify({ model: body.model, created_at: createdAt, message: tcMsg, done: false }) + "\n");
       } else {
         const words = (cleanText || "").match(/.{1,20}/g) || [cleanText || ""];
+        let firstWord = true;
         for (const w of words) {
           if (!w) continue;
-          await s.write(JSON.stringify({ model: body.model, created_at: createdAt, message: { role: "assistant", content: w }, done: false }) + "\n");
+          const msg = { role: "assistant", content: w };
+          if (firstWord && reasoningContent) {
+            if (_displayReasoning) msg.content = _foldReasoningIntoContent(reasoningContent, w);
+            else msg.reasoning_content = reasoningContent;
+            firstWord = false;
+          }
+          await s.write(JSON.stringify({ model: body.model, created_at: createdAt, message: msg, done: false }) + "\n");
           tokenCount++;
         }
       }
       log(`stream done (${tokenCount} chunk${tokenCount !== 1 ? "s" : ""})`);
+      _recordTps(tokenCount, Date.now() - startTime);
       await s.write(JSON.stringify({ model: body.model, created_at: createdAt, message: { role: "assistant", content: "" }, done: true, done_reason: toolCalls.length ? "tool_calls" : "stop", total_duration: duration * 1e6, load_duration: 0, prompt_eval_count: chatUsage?.prompt_tokens || 0, prompt_eval_duration: 0, eval_count: chatUsage?.completion_tokens || 0, eval_duration: 0 }) + "\n");
 
     } catch (e) {
@@ -3021,6 +3386,7 @@ app.post("/api/generate", async c => {
         cm.releaseModel(genModel);
       }
       log(`stream done (${tokenCount} chunk${tokenCount !== 1 ? "s" : ""})`);
+      _recordTps(tokenCount, Date.now() - startTime);
       const duration = Date.now() - startTime;
       await s.write(JSON.stringify({ model: body.model, created_at: new Date().toISOString(), response: body.stream === false ? full : "", done: true, done_reason: "stop", context: null, total_duration: duration * 1e6, load_duration: 0, prompt_eval_count: 0, prompt_eval_duration: 0, eval_count: 0, eval_duration: 0 }) + "\n");
     } catch (e) {
@@ -3153,7 +3519,7 @@ const host = config.host;
 async function _runServer() {
   // Start HTTP server
   if (typeof Bun !== 'undefined' && typeof Bun.serve === 'function') {
-  serverRef = Bun.serve({ port, hostname: host, fetch: app.fetch, idleTimeout: 120, reusePort: true, backlog: 1024, maxRequestBodySize: Math.max(262144, parseInt(Bun.env.MAX_REQUEST_BODY_BYTES || "10485760", 10)) });
+  serverRef = Bun.serve({ port, hostname: host, fetch: app.fetch, idleTimeout: 120 });
   log(`Listening on http://${host}:${serverRef.port}`);
 } else if (typeof process !== 'undefined' && process.versions?.node) {
   const http = await import("http");
@@ -3208,7 +3574,7 @@ async function _runServer() {
 // Load models & show banner in background
 let models = await initModels();
 
-process.stdout.write("\x1b]2;gc2oc\x07");
+setConsoleTitle("gc2oc");
 
 await checkVersion();
 

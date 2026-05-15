@@ -174,6 +174,8 @@ This means a key rate-limited from a previous session will never be pinged on re
 | `SESSION_KEEPALIVE_INTERVAL_MS` | `120000` | Keepalive ping interval (ms) |
 | `SESSION_KEEPALIVE_IDLE_TIMEOUT_MS` | `600000` | Stop keepalive after idle (ms) |
 | `SESSION_KEEPALIVE_MAX_LIFETIME_MS` | `86400000` | Cycle upstream cache after (ms, 24h) |
+| `DISPLAY_REASONING` | `false` | Mirror DeepSeek thinking tokens into Cursor/VS-visible markdown blocks |
+| `COLLAPSIBLE_REASONING` | `true` | Use collapsible `<details>` blocks when `DISPLAY_REASONING=true` |
 
 ---
 
@@ -263,6 +265,20 @@ The status line shows green when up to date (match) and red when outdated (misma
 
 ---
 
+## TPS Tracker
+
+The proxy tracks tokens-per-second throughput and displays a rolling average in the console title.
+
+| State | Title |
+|-------|-------|
+| No activity | `gc2oc` |
+| After requests | `gc2oc [42.5 t/s]` |
+| Outdated + TPS | `gc2oc (outdated, check github for new version) [42.5 t/s]` |
+
+Set `SHOW_TPS=false` in `.env` to disable.
+
+---
+
 ## Self-Updater
 
 No git required. `update.cmd` downloads the latest `main.zip` from GitHub and applies only changed files — your config and caches are preserved.
@@ -317,6 +333,40 @@ LRU with TTL. Responses keyed by hash of model + temperature + tool count + **se
 ### Reasonings cache (in-memory, session-scoped)
 
 Per-session reasoning text from `<think>` tags is cached and re-attached when a cached prompt-response pair is replayed. Ensures DeepSeek-style reasoning isn't lost on cache hits. **Session-scoped** — different conversations never share reasoning data, even if they produce the same text.
+
+#### Multi-tier reasoning key system (inspired by [yxlao/deepseek-cursor-proxy](https://github.com/yxlao/deepseek-cursor-proxy))
+
+Reasoning is stored under multiple lookup keys to maximize cache hit rates across tool-call conversations:
+
+| Key type | Description | Survives |
+|----------|-------------|----------|
+| Message signature | SHA256 of content + canonicalized tool calls | Exact match |
+| Tool call ID | Per-call `id` field | Argument re-ordering |
+| Tool call signature | SHA256 of tool name + normalized args | ID reassignment |
+| Tool name | Plain function name | Interrupted streams, missing IDs |
+| Legacy content hash | Simplified content-based hash | Backward compatibility |
+
+**Lookup priority**: Message signature → Tool call IDs → Tool call signatures → Tool names → Legacy content hash → FIFO → Global last-reasoning fallback.
+
+**Smart memory management**: LRU eviction at 5000 entries, preserving permanent fallback keys (`g:*:last`, `*:mdl:*`). No disk persistence — everything stays in memory for speed.
+
+#### Thinking display
+
+When `DISPLAY_REASONING=true`, DeepSeek reasoning tokens are mirrored into Cursor/VS Code-visible content as Markdown blocks:
+
+- **Collapsible** (`COLLAPSIBLE_REASONING=true`, default): `<details><summary>Thinking</summary>...</details>`
+- **Plain** (`COLLAPSIBLE_REASONING=false`): `<think>...</think>`
+
+Echoed thinking blocks in incoming assistant content are automatically stripped before forwarding to upstream APIs. This prevents "reasoning doubling" when VS/Cursor echoes back the proxy-injected display blocks.
+
+#### Reasoning recovery (400 error handling)
+
+When the upstream DeepSeek API returns `reasoning_content must be passed back`, the proxy:
+
+1. **Tier 1** — Retries with `thinking: false` disabled (preserves full history)
+2. **Tier 2** — Strips all assistant/tool messages, keeping only system + user
+
+This matches the recovery strategy in [yxlao/deepseek-cursor-proxy](https://github.com/yxlao/deepseek-cursor-proxy), which pioneered this approach for Cursor compatibility.
 
 ### Free model validation
 
@@ -547,4 +597,4 @@ start.cmd              # auto-detects Bun vs Node
 
 See **[credits.md](credits.md)** for the full list of open-source projects that inspired patterns and features in gc2oc.
 
-Key inspirations include [copilot-proxy](https://github.com/chew-z/copilot-proxy), [Qwen-Copilot-Proxy](https://github.com/edwardgj/Qwen-Copilot-Proxy), [Proxllama](https://github.com/Michediana/Proxllama), [vLLM-proxy-for-VS-Code](https://github.com/nbuckley/vLLM-proxy-for-VS-Code), [antigravity-copilot](https://github.com/punal100/antigravity-copilot), [OmniRoute](https://github.com/diegosouzapw/OmniRoute), [OpenCode Zen Provider](https://github.com/wienans/vsc-opencode-zen-chat-provider), and many more.
+Key inspirations include [copilot-proxy](https://github.com/chew-z/copilot-proxy), [Qwen-Copilot-Proxy](https://github.com/edwardgj/Qwen-Copilot-Proxy), [Proxllama](https://github.com/Michediana/Proxllama), [vLLM-proxy-for-VS-Code](https://github.com/nbuckley/vLLM-proxy-for-VS-Code), [antigravity-copilot](https://github.com/punal100/antigravity-copilot), [OmniRoute](https://github.com/diegosouzapw/OmniRoute), [OpenCode Zen Provider](https://github.com/wienans/vsc-opencode-zen-chat-provider), [yxlao/deepseek-cursor-proxy](https://github.com/yxlao/deepseek-cursor-proxy), and many more.

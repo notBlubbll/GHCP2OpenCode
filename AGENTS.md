@@ -412,6 +412,41 @@ A 40-minute agentic session with warming can cost **8x less** than a 5-minute se
 
 ---
 
+## TPS Tracker (Console Title)
+
+Tracks tokens-per-second throughput from upstream streaming responses and displays a rolling average in the console window title.
+
+### How it works
+
+1. After each streaming or non-streaming response completes, the elapsed time and token/chunk count are recorded
+2. A rolling window (5 measurements) smooths the TPS value
+3. The console title is updated (throttled to every 2s) with the format: `gc2oc [42.5 t/s]`
+4. The version check title (`gc2oc (outdated, ...)`) is preserved — TPS is appended after it
+
+### Title format
+
+| State | Title |
+|-------|-------|
+| No activity yet | `gc2oc` |
+| After requests | `gc2oc [42.5 t/s]` |
+| Outdated + requests | `gc2oc (outdated, check github for new version) [42.5 t/s]` |
+| Disabled | `gc2oc` |
+
+### Configuration
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `SHOW_TPS` | `true` | Show TPS in console title. Set to `false` to disable. |
+
+### Implementation
+
+- `_recordTps(tokens, durationMs)` — called after each streaming/non-streaming response in `src/server.js`
+- `_updateConsoleTitle()` — builds title from `_baseTitle` + `[X.X t/s]`, sets via `process.title` (primary) and ANSI escape (fallback)
+- `setConsoleTitle(title)` — stores base title, triggers `_updateConsoleTitle()` so TPS suffix is always appended
+- Hooks: `/v1/chat/completions` (streaming + non-streaming paths), `/api/chat`, `/api/generate`
+
+---
+
 ## Caching Architecture
 
 ### Disk caches (`.cache/` dir)
@@ -518,4 +553,42 @@ The per-request FIFO (`_assistantReasonings` / cursor) is created fresh in `crea
 ### Prompt-response cache scoping
 
 `cacheKey(req, sessionId)` in `src/cache.js` includes the session discriminator (`convId`) in the cache key. Two different sessions with identical full message histories (vanishingly unlikely) are still isolated.
+
+---
+
+## Anti-Loop Guards
+
+VS Copilot's agent mode can trigger infinite loops when the LLM's response doesn't satisfy VS's expectations. The following guards prevent common loop patterns:
+
+### Bun.serve `maxRequestBodySize` — DO NOT USE
+
+`Bun.serve({ maxRequestBodySize: N })` on Bun 1.3.13 (Windows) closes the TCP connection prematurely when a body exceeds the limit, instead of reading it and returning 413. VS's .NET `HttpClient` interprets the RST as `SocketError` → `"An established connection was aborted by the software in your host machine"` → retries 4x and fails. **Use the default (no `maxRequestBodySize`) and rely on the application-level `checkRequestBodySize()` guard instead.**
+
+### Compression — disabled on localhost
+
+`app.use(compress())` from Hono buffers SSE streaming responses. On localhost there is no bandwidth savings, and the buffering can cause .NET's `HttpClient` to timeout on stream reads.
+
+### Tool retry loop false positives (`server.js:2217`)
+
+The tool-failure detector uses a regex to check if tool results contain error words. **Must only match at the START** of content (`/^Error|^Failed|...`), NOT anywhere (`/error|fail|...`). grep/file results often contain code with words like `error`, `fail`, `timeout` in variable names/comments — matching anywhere falsely flags successful tool executions as failures. After 3 false positives, `toolLoopBroken = true` drops all subsequent tool calls/results, creating an infinite regeneration loop.
+
+### Orphaned tool calls — strip, don't inject
+
+`_stripOrphanedToolCalls()` MUST strip orphaned `tool_calls` from assistant messages rather than injecting fake tool results. Injecting `"[gc2oc] fake result for grep_search (original tool result missing from VS)"` confuses the LLM (wastes API calls) and breaks VS's agent loop. Stripping keeps the conversation clean without fake data.
+
+### DeepSeek think-fallback (`server.js:2722`)
+
+DeepSeek models with thinking mode (e.g. `deepseek-v4-flash`) may put all output inside `<think>` tags, leaving `cleanText` empty after `processThinkTags()`. Sending empty text to VS causes VS to nag/loop. **Fallback: use the first line of reasoning content as `cleanText`** (`[think-fallback]`).
+
+### VS autopilot "continue" replacement (`server.js:2310`, `3024`)
+
+VS agent mode sends bare `"continue"` as a user message when the user clicks continue. Stripping it leaves the LLM with no instruction → "what should I do?". **Replace it** with `"Continue with your current task using the tools available."` so the LLM proceeds with the task.
+
+### VS nag loop with active tools (`server.js:2398`)
+
+VS nags with `"You have not yet marked the task as complete"` even when the LLM is actively producing useful tool calls. The nag detector (`vsTaskCompleteNags >= 3`) should only escalate to `taskCompleteOnly` when the **last assistant message has NO tool_calls**. If the LLM is still working (has tool calls), only filter the nag messages but let the LLM continue. This prevents premature termination of productive sessions.
+
+### `maxRequestBodyBytes` default: 32MB
+
+VS sends large workspace context blocks (often 16MB+). The default `maxRequestBodyBytes` in `concurrency.js` is raised from 10MB to 32MB (`33554432`) to avoid false 413 rejections.
 

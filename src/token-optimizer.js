@@ -113,7 +113,7 @@ export function compactIdentity(model, thinking) {
 }
 
 export function compactToolInstructions() {
-  return "Use tools for the task. Reply with tool calls, not descriptions.";
+  return "Use tools for the task. Reply with tool calls, not descriptions. When the task is fully complete, call task_complete to signal completion.";
 }
 
 export function compactOllamaToolInstructions(tools) {

@@ -976,7 +976,7 @@ function normalizeToolCall(tc) {
     if (/^replace_string_in_file$/i.test(name)) {
       try {
         const safe = {};
-        const fpMatch = raw2.match(/"filePath"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+        const fpMatch = raw2.match(/"(?:filePath|filename|path)"\s*:\s*"((?:[^"\\]|\\.)*)/) || raw2.match(/"(?:filePath|filename|path)"\s*:\s*"((?:[^"\\]|\\.)*)"/);
         safe.filePath = fpMatch ? fpMatch[1].replace(/\\+/g, "/").replace(/\/{2,}/g, "/") : "";
         const osMatch = raw2.match(/"oldString"\s*:\s*"((?:[^"\\]|\\.)*)/);
         safe.oldString = osMatch ? osMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "";
@@ -990,7 +990,7 @@ function normalizeToolCall(tc) {
     }
     if (/^multi_replace_string_in_file$/i.test(name)) {
       try {
-        const fpMatch = raw2.match(/"filePath"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+        const fpMatch = raw2.match(/"(?:filePath|filename|path)"\s*:\s*"((?:[^"\\]|\\.)*)/) || raw2.match(/"(?:filePath|filename|path)"\s*:\s*"((?:[^"\\]|\\.)*)"/);
         const osMatch = raw2.match(/"oldString"\s*:\s*"((?:[^"\\]|\\.)*)/);
         const nsMatch = raw2.match(/"newString"\s*:\s*"((?:[^"\\]|\\.)*)/);
         if (fpMatch) {
@@ -1160,7 +1160,7 @@ function extractToolCalls(text, workspaceRoot = "", messages = []) {
   }
 
   // 2c. Inline JSON tool calls: {"name":"create_file","arguments":{...}} (standalone, no code fence)
-  const inlineJsonRe = /\{\s*"name"\s*:\s*"(create_file|replace_string_in_file|multi_replace_string_in_file|remove_file|get_file|read_file|grep_search|file_search|find_symbol|search_symbol|run_command_in_terminal|execute_command|replace_in_file)"\s*,\s*"arguments"\s*:\s*\{[\s\S]*?\}\s*\}/gi;
+  const inlineJsonRe = /\{\s*"name"\s*:\s*"(create_file|replace_string_in_file|multi_replace_string_in_file|remove_file|get_file|read_file|grep_search|file_search|find_symbol|search_symbol|run_command_in_terminal|execute_command|replace_in_file|task_complete|start_modernization)"\s*,\s*"arguments"\s*:\s*\{[\s\S]*?\}\s*\}/gi;
   let ij;
   while ((ij = inlineJsonRe.exec(text)) !== null) {
     try {
@@ -1859,6 +1859,7 @@ app.post("/v1/chat/completions", async c => {
 
     let toolFailStreak = 0;
     let toolLoopBroken = false;
+    let taskCompleteOnly = false;
     const provider = isM365Model(goModel) ? "m365" : isPollModel(goModel) ? "poll" : isFreeTierModel(goModel) ? "zen" : "go";
     const reasoningCtx = createReasoningContext(messages, goModel, getWorkspaceRoot(messages), clientTag, provider, thinkingTag);
     reasoningCtx.reset();
@@ -2001,13 +2002,14 @@ app.post("/v1/chat/completions", async c => {
         break;
       }
     }
-    if (vsTaskCompleteNags >= 2) {
+    if (vsTaskCompleteNags >= 3) {
       reasoningCtx.sessionEntry.loopHits = (reasoningCtx.sessionEntry.loopHits || 0) + 1;
-      if (reasoningCtx.sessionEntry.loopHits >= 5) {
-        reasoningCtx.seslog(`\x1b[31m[LOOP-BREAK] session ${reasoningCtx.sessionId} has ${reasoningCtx.sessionEntry.loopHits} loop hits — returning error\x1b[0m`);
-        return c.json({ error: { message: "Session loop detected. Please start a new chat.", type: "loop_detected", code: "session_loop" } }, 429);
-      }
-      reasoningCtx.seslog(`\x1b[33m[LOOP-BREAK] VS has nagged ${vsTaskCompleteNags} times — returning stop\x1b[0m`);
+      reasoningCtx.seslog(`\x1b[33m[LOOP-BREAK] VS has nagged ${vsTaskCompleteNags} times — forcing task_complete-only tools (loop hits: ${reasoningCtx.sessionEntry.loopHits})\x1b[0m`);
+      // Filter tools to only task_complete — forces the model to signal completion
+      taskCompleteOnly = true;
+    }
+    if (vsTaskCompleteNags >= 12) {
+      reasoningCtx.seslog(`\x1b[31m[LOOP-BREAK] VS has nagged ${vsTaskCompleteNags} times — returning stop as last resort\x1b[0m`);
       if (clientWantsStream) {
         return stream(c, async (s) => {
           const w = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
@@ -2019,6 +2021,8 @@ app.post("/v1/chat/completions", async c => {
       }
       return c.json(oaiResp("", undefined, "stop", model));
     }
+    // No nag loop detected — reset loop counter for this session
+    if (reasoningCtx.sessionEntry.loopHits > 0) reasoningCtx.sessionEntry.loopHits = 0;
 
     // Identity override — MUST be first system instruction to override VS built-in
     systemMsg = compactIdentity(goModel, thinkingTag) + (systemMsg ? "\n\n" : "") + systemMsg;
@@ -2047,6 +2051,9 @@ app.post("/v1/chat/completions", async c => {
 
     // Forward to Go API with native tool support
     const apiMessages = [];
+    if (taskCompleteOnly) {
+      systemMsg = "TASK COMPLETE: Your only available tool is task_complete. Call it NOW to signal completion. No other actions are possible.\n\n" + systemMsg;
+    }
     if (systemMsg) apiMessages.push({ role: "system", content: systemMsg });
     apiMessages.push(...userMsgs);
 
@@ -2064,7 +2071,13 @@ app.post("/v1/chat/completions", async c => {
     }
     const compressedMessages = compressMessages(validatedMessages, compLevel, true);
 
-    const ollamaReq = { model: goModel, messages: compressedMessages, stream: streamMode, tools: vsTools || undefined, clientTag, sessionId: reasoningCtx.sessionId };
+    let upstreamTools = vsTools || undefined;
+    if (taskCompleteOnly && vsTools?.length) {
+      const tcTool = vsTools.find(t => t.function?.name === "task_complete");
+      upstreamTools = tcTool ? [tcTool] : [{ type: "function", function: { name: "task_complete", description: "Signal task completion", parameters: { type: "object", properties: {}, required: [] } } }];
+      reasoningCtx.seslog(`\x1b[33m[tools] restricting to task_complete only\x1b[0m`);
+    }
+    const ollamaReq = { model: goModel, messages: compressedMessages, stream: streamMode, tools: upstreamTools, clientTag, sessionId: reasoningCtx.sessionId };
     if (body.chat_template_kwargs != null) ollamaReq.chat_template_kwargs = body.chat_template_kwargs;
     if (body.thinking_token_budget != null) ollamaReq.thinking_token_budget = body.thinking_token_budget;
 
@@ -2164,6 +2177,8 @@ app.post("/v1/chat/completions", async c => {
         return c.json(resp);
       }
     }
+    // Cache bypassed or not cached — going to upstream, reset loop counter
+    if (reasoningCtx.sessionEntry.loopHits > 0) reasoningCtx.sessionEntry.loopHits = 0;
 
     // ── Stream mode: pipe directly from upstream async generator ──
     if (streamMode) {
@@ -2399,6 +2414,13 @@ app.post("/v1/chat/completions", async c => {
     // instead of actually calling it, auto-inject the call.
     if (!allToolCalls.length && cleanText && /\b(?:task_complete|mark(?:ed)?\s+(?:the\s+)?task\s+as\s+complete|If\s+you\s+believe\s+the\s+task\s+is\s+done)\b/i.test(cleanText)) {
       reasoningCtx.seslog(`\x1b[33m[LOOP-BREAK] auto-calling task_complete to prevent infinite loop\x1b[0m`);
+      allToolCalls = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
+      cleanText = "";
+    }
+    // Force-inject task_complete when the model refuses to call it despite
+    // having only task_complete available (VS nagging scenario).
+    if (!allToolCalls.length && taskCompleteOnly) {
+      reasoningCtx.seslog(`\x1b[33m[FORCE-COMPLETE] model ignored task_complete-only tools — injecting task_complete\x1b[0m`);
       allToolCalls = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
       cleanText = "";
     }

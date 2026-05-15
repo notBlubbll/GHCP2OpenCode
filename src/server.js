@@ -441,7 +441,7 @@ function createReasoningContext(messages, model, workspaceRoot, clientTag, provi
   let sessionEntry = _sessionRegistry.get(conv);
   if (!sessionEntry) {
     _sessionCounter++;
-    sessionEntry = { id: _sessionCounter, clientTag, createdAt: new Date().toISOString(), workspaceRoot };
+    sessionEntry = { id: _sessionCounter, clientTag, createdAt: new Date().toISOString(), workspaceRoot, loopHits: 0, lastRequestTime: 0, cacheHitStreak: 0 };
     _sessionRegistry.set(conv, sessionEntry);
 
     if (isContinuation) {
@@ -459,6 +459,12 @@ function createReasoningContext(messages, model, workspaceRoot, clientTag, provi
   const sessionId = sessionEntry.id;
   const tagPrefix = `\x1b[35m${clientTag}\x1b[0m`;
   const sessionPrefix = `${tagPrefix}[\x1b[36m${sessionId}\x1b[0m]`;
+
+  // Rapid-request loop detection: if requests come within 1500ms, count as rapid
+  const now = Date.now();
+  const rapidGap = now - (sessionEntry.lastRequestTime || 0);
+  sessionEntry.lastRequestTime = now;
+  const isRapid = rapidGap > 0 && rapidGap < 1500;
 
   const prefixedConv = (key) => `c:${conv}:${key}`;
   // Workspace-scoped cache key — allows reasoning lookup across sessions in same workspace
@@ -498,6 +504,8 @@ function createReasoningContext(messages, model, workspaceRoot, clientTag, provi
       return _crossReqReasoningCache.get(prefixedConv(`mdl:${mdl}`));
     },
     crossCacheSize() { return _crossReqReasoningCache.size; },
+    isRapid,
+    sessionEntry,
   };
 }
 
@@ -589,10 +597,34 @@ function _dumpToolSchemas(tools) {
 }
 
 function normalizeToolCall(tc) {
-  const name = tc.function?.name || "";
+   const name = tc.function?.name || "";
   try {
     const raw = tc.function.arguments || "{}";
-    const args = JSON.parse(raw);
+    // Pre-sanitize: fix common AI malformed JSON (unquoted identifiers in arrays/values)
+    let json = raw;
+    // "queries": foo → "queries":["foo"]
+    json = json.replace(/"queries"\s*:\s*([^\[",}\s][^,}]*)/, (_, v) => {
+      const t = v.trim();
+      if (/^(?:null|true|false|-?\d)/.test(t)) return `"queries":${t}`;
+      return `"queries":["${t}"]`;
+    });
+    // "includePattern": *.cs → "includePattern":"*.cs"
+    json = json.replace(/"includePattern"\s*:\s*([^",}\s]+)(?=\s*[,}]|$)/, (_, v) => {
+      if (/^(?:null|true|false|-?\d)/.test(v)) return `"includePattern":${v}`;
+      return `"includePattern":"${v}"`;
+    });
+    // "query": frontpage → "query":"frontpage" (any bare-identifier string field)
+    json = json.replace(/"query"\s*:\s*([^",}\s]+)(?=\s*[,}]|$)/g, (_, v) => {
+      if (/^(?:null|true|false|-?\d)/.test(v)) return `"query":${v}`;
+      return `"query":"${v}"`;
+    });
+    // Multi-word unquoted string values: "summary": List ntl files → "summary":"List ntl files"
+    json = json.replace(/"(summary|description|details|agentName|memory|reason|prompt)\s*"\s*:\s*([^,}]+?)(?=\s*,\s*"|\s*}$|$)/g, (_, field, val) => {
+      const t = val.trim();
+      if (!t || /^(?:null|true|false|-?\d)/.test(t)) return `"${field}":${val}`;
+      return `"${field}":"${t}"`;
+    });
+    const args = JSON.parse(json);
     const safe = {};
 
     // ── Confirmed VS schemas (VS Insiders 18.7) ──
@@ -985,10 +1017,24 @@ function normalizeToolCall(tc) {
         }
       } catch {}
     }
+    if (/^(run_command_in_terminal|execute_command)$/i.test(name)) {
+      try {
+        const safe = {};
+        const cmdMatch = raw2.match(/"command"\s*:\s*"((?:[^"\\]|\\.)*)"/) || raw2.match(/"command"\s*:\s*([^,}]+?)(?=\s*,\s*"|\s*}$|$)/);
+        safe.command = cmdMatch ? cmdMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\").trim() : "";
+        const sumMatch = raw2.match(/"summary"\s*:\s*"((?:[^"\\]|\\.)*)"/) || raw2.match(/"summary"\s*:\s*([^,}]+?)(?=\s*,\s*"|\s*}$|$)/);
+        safe.summary = sumMatch ? sumMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\").trim() : "";
+        safe.background = /"background"\s*:\s*true/i.test(raw2);
+        if (safe.command) {
+          log(`\x1b[33m[${name}] salvaged command="${safe.command.slice(0,60)}${safe.command.length > 60 ? "..." : ""}" summary="${safe.summary.slice(0,40)}${safe.summary.length > 40 ? "..." : ""}" background=${safe.background}\x1b[0m`);
+          return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
+        }
+      } catch {}
+    }
     if (/^(grep_search|search_content|search_file)$/i.test(name)) {
       try {
         const safe = {};
-        const qMatch = raw2.match(/"query"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+        const qMatch = raw2.match(/"query"\s*:\s*"((?:[^"\\]|\\.)*)"/) || raw2.match(/"query"\s*:\s*([^,}\s]+)/);
         safe.query = qMatch ? qMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "";
         safe.isRegexp = /"isRegexp"\s*:\s*true/i.test(raw2);
         const ipMatch = raw2.match(/"includePattern"\s*:\s*"((?:[^"\\]|\\.)*)"/);
@@ -1015,6 +1061,33 @@ function normalizeToolCall(tc) {
             log(`\x1b[33m[plan] salvaged planLen=${planMarkdown.length}\x1b[0m`);
             return { ...tc, function: { ...tc.function, arguments: JSON.stringify({ planMarkdown }) } };
           }
+        }
+      } catch {}
+    }
+    if (/^(file_search|search_files|find_files|glob_search|list_files)$/i.test(name)) {
+      try {
+        const safe = {};
+        const queries = [];
+        const qArr = raw2.match(/"queries"\s*:\s*\[(.*?)(?:\]|$)/s);
+        if (qArr) {
+          const inner = qArr[1];
+          const sqRe = /"((?:[^"\\]|\\.)*)"/g;
+          let sq;
+          while ((sq = sqRe.exec(inner))) queries.push(sq[1]);
+        }
+        if (!queries.length) {
+          const unq = raw2.match(/"queries"\s*:\s*\[?\s*([^"\],]+)/);
+          if (unq) {
+            const vals = unq[1].split(/[\s,]+/).filter(v => v && v !== 'null');
+            for (const v of vals) queries.push(v);
+          }
+        }
+        safe.queries = queries;
+        const mrMatch = raw2.match(/"maxResults"\s*:\s*(\d+)/);
+        safe.maxResults = mrMatch ? parseInt(mrMatch[1], 10) : 20;
+        if (safe.queries.length) {
+          log(`\x1b[33m[${name}] salvaged queries=[${safe.queries.join(",")}] maxResults=${safe.maxResults}\x1b[0m`);
+          return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
         }
       } catch {}
     }
@@ -1914,6 +1987,39 @@ app.post("/v1/chat/completions", async c => {
       }
     }
 
+    // Detect VS task_complete retry loop — if VS keeps nagging the model
+    // to call task_complete, short-circuit with stop to break the loop.
+    // Using stop (not task_complete auto-injection) because VS Insiders
+    // rejects auto-injected tool calls and keeps retrying.
+    let vsTaskCompleteNags = 0;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role !== "user") continue;
+      const content = typeof messages[i].content === "string" ? messages[i].content : "";
+      if (/\byou have not yet marked the task as complete\b/i.test(content)) {
+        vsTaskCompleteNags++;
+      } else {
+        break;
+      }
+    }
+    if (vsTaskCompleteNags >= 2) {
+      reasoningCtx.sessionEntry.loopHits = (reasoningCtx.sessionEntry.loopHits || 0) + 1;
+      if (reasoningCtx.sessionEntry.loopHits >= 5) {
+        reasoningCtx.seslog(`\x1b[31m[LOOP-BREAK] session ${reasoningCtx.sessionId} has ${reasoningCtx.sessionEntry.loopHits} loop hits — returning error\x1b[0m`);
+        return c.json({ error: { message: "Session loop detected. Please start a new chat.", type: "loop_detected", code: "session_loop" } }, 429);
+      }
+      reasoningCtx.seslog(`\x1b[33m[LOOP-BREAK] VS has nagged ${vsTaskCompleteNags} times — returning stop\x1b[0m`);
+      if (clientWantsStream) {
+        return stream(c, async (s) => {
+          const w = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
+          const base = { id: chatId, object: "chat.completion.chunk", created, model, system_fingerprint: systemFp };
+          await w({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+          await w({ ...base, choices: [{ index: 0, delta: { content: "" }, finish_reason: "stop" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
+          await s.write("data: [DONE]\n\n");
+        });
+      }
+      return c.json(oaiResp("", undefined, "stop", model));
+    }
+
     // Identity override — MUST be first system instruction to override VS built-in
     systemMsg = compactIdentity(goModel, thinkingTag) + (systemMsg ? "\n\n" : "") + systemMsg;
 
@@ -1972,33 +2078,91 @@ app.post("/v1/chat/completions", async c => {
       let { text, toolCalls, hasTools, reasoningContent } = cached.value;
       if (toolCalls?.length) reasoningCtx.seslog(`\x1b[35m[cache-hit] returning ${toolCalls.length} cached tool calls: ${toolCalls.map(tc => tc.function?.name).join(", ")}\x1b[0m`);
 
-      // Loop-break on cache hit: if AI text is telling user to call task_complete, auto-inject it
-      if (!toolCalls?.length && text && vsTools?.length) {
-        const hasTaskComplete = vsTools.some(t => t.function?.name === "task_complete");
-        if (hasTaskComplete && /\b(?:task_complete|mark(?:ed)?\s+the\s+task\s+as\s+complete)\b/i.test(text)) {
-          reasoningCtx.seslog(`\x1b[33m[cache] LOOP-BREAK: auto-calling task_complete\x1b[0m`);
-          toolCalls = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
-          hasTools = true;
-          text = "";
+      // Bypass cache if all cached tool calls already have matching results in the current messages.
+      // Prevents infinite loops where the cache keeps returning the same tool calls
+      // even after VS has already fulfilled them.
+      // Checks BOTH the original incoming messages (always have VS's real results)
+      // AND compressedMessages (post-processing) for resilience.
+      let cacheBypassed = false;
+      if (toolCalls?.length) {
+        const cachedIds = new Set(toolCalls.map(tc => tc.id));
+        const cachedNames = new Set(toolCalls.map(tc => tc.function?.name).filter(Boolean));
+        const matched = new Set();
+
+        // Check original incoming messages first (VS's real tool results, never stripped)
+        const checkSource = (source) => {
+          for (const m of source) {
+            if (m.role === "tool" && m.tool_call_id && cachedIds.has(m.tool_call_id)) {
+              matched.add(m.tool_call_id);
+            }
+          }
+        };
+        checkSource(messages);              // original request body
+        if (matched.size < cachedIds.size) checkSource(compressedMessages); // fallback to processed
+
+        // Name-based fallback: if tool_call_id doesn't match but the tool name does
+        // (e.g. get_projects_in_solution result exists under a different call_id)
+        if (matched.size < cachedIds.size) {
+          const unseenNames = [...cachedNames].filter(name => {
+            const unseenId = [...cachedIds].find(id => {
+              const tc = toolCalls.find(t => t.id === id);
+              return tc?.function?.name === name && !matched.has(id);
+            });
+            return unseenId != null;
+          });
+          for (const name of unseenNames) {
+            // Look for any tool result that follows an assistant with this tool name
+            for (let i = 0; i < messages.length; i++) {
+              if (messages[i].role === "assistant" && messages[i].tool_calls?.some(tc => tc.function?.name === name)) {
+                for (let j = i + 1; j < messages.length; j++) {
+                  if (messages[j].role === "tool" && messages[j].tool_call_id) {
+                    const parentCall = messages[i].tool_calls?.find(tc => tc.id === messages[j].tool_call_id);
+                    if (parentCall?.function?.name === name) {
+                      const cachedTc = toolCalls.find(tc => tc.function?.name === name);
+                      if (cachedTc) matched.add(cachedTc.id);
+                      break;
+                    }
+                  }
+                  if (messages[j].role !== "tool") break;
+                }
+              }
+            }
+          }
+        }
+
+        if (matched.size === cachedIds.size) {
+          reasoningCtx.sessionEntry.loopHits = (reasoningCtx.sessionEntry.loopHits || 0) + 1;
+          reasoningCtx.seslog(`\x1b[35m[cache] bypass — all ${cachedIds.size} cached tool calls already fulfilled in messages (loop hits: ${reasoningCtx.sessionEntry.loopHits})\x1b[0m`);
+          cacheBypassed = true;
         }
       }
 
-      if (clientWantsStream) {
-        return stream(c, async (s) => {
-          const w = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
-          const base = { id: chatId, object: "chat.completion.chunk", created, model, system_fingerprint: systemFp };
-          await w({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
-          await _simStream(w, base, hasTools, toolCalls, text, reasoningContent);
-          await s.write("data: [DONE]\n\n");
-        });
-      }
+      if (!cacheBypassed) {
+        // Loop-break on cache hit: if AI text is telling itself to call task_complete, auto-inject it
+        if (!toolCalls?.length && text && /\b(?:task_complete|mark(?:ed)?\s+(?:the\s+)?task\s+as\s+complete|If\s+you\s+believe\s+the\s+task\s+is\s+done)\b/i.test(text)) {
+            reasoningCtx.seslog(`\x1b[33m[cache] LOOP-BREAK: auto-calling task_complete\x1b[0m`);
+            toolCalls = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
+            hasTools = true;
+            text = "";
+        }
 
-      const resp = oaiResp(hasTools ? null : text, hasTools ? toolCalls : undefined, hasTools ? "tool_calls" : "stop", model);
-      if (reasoningContent) {
-        const choice = resp.choices[0];
-        addReasoningAliases(choice.message, reasoningContent);
+        if (clientWantsStream) {
+          return stream(c, async (s) => {
+            const w = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
+            const base = { id: chatId, object: "chat.completion.chunk", created, model, system_fingerprint: systemFp };
+            await w({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+            await _simStream(w, base, hasTools, toolCalls, text, reasoningContent);
+            await s.write("data: [DONE]\n\n");
+          });
+        }
+
+        const resp = oaiResp(hasTools ? null : text, hasTools ? toolCalls : undefined, hasTools ? "tool_calls" : "stop", model);
+        if (reasoningContent) {
+          const choice = resp.choices[0];
+          addReasoningAliases(choice.message, reasoningContent);
+        }
+        return c.json(resp);
       }
-      return c.json(resp);
     }
 
     // ── Stream mode: pipe directly from upstream async generator ──
@@ -2051,6 +2215,9 @@ app.post("/v1/chat/completions", async c => {
             }
           }
         } catch (e) {
+          if (e instanceof APIError && e.status === 400 && /reasoning_content.*must be passed back/i.test(e.message)) {
+            err(`  stream reasoning error: stripping thinking mode for next request`);
+          }
           if (e instanceof APIError && e.status === 400 && /tool|tool_call/i.test(e.message)) {
             err(`  stream tool error: ${_toolNames(ollamaReq.messages)} — ${e.message}`);
           }
@@ -2144,7 +2311,24 @@ app.post("/v1/chat/completions", async c => {
           },
         }, 503);
       }
-      if (e instanceof APIError && e.status === 400 && /tool|tool_call/i.test(e.message)) {
+      if (e instanceof APIError && e.status === 400 && /reasoning_content.*must be passed back/i.test(e.message)) {
+        err(`  [reasoning] stripping thinking mode & retrying (reasoning_content missing in history)`);
+        const noThinkingReq = { ...nonStreamReq, stream: false };
+        delete noThinkingReq.chat_template_kwargs;
+        delete noThinkingReq.thinking_token_budget;
+        try {
+          chunks = await cm.runRequest(goModel, async () => {
+            const result = [];
+            for await (const chunk of chatCompletion(noThinkingReq)) {
+              result.push(chunk);
+            }
+            return result;
+          }, true);
+        } catch (retryErr) {
+          err(`  [reasoning] retry without thinking also failed: ${retryErr.message}`);
+          throw retryErr;
+        }
+      } else if (e instanceof APIError && e.status === 400 && /tool|tool_call/i.test(e.message)) {
         _tool400Streak++;
         const tools = _toolNames(compressedMessages);
         err(`  [400] tool error (#${_tool400Streak}/3): ${tools} — ${e.message}`);
@@ -2211,15 +2395,12 @@ app.post("/v1/chat/completions", async c => {
     }
 
     // Prevent infinite "call task_complete" loop:
-    // When the AI's text response is telling the user to call task_complete
-    // and task_complete is in the available tools, auto-inject the call.
-    if (!allToolCalls.length && cleanText && vsTools?.length) {
-      const hasTaskComplete = vsTools.some(t => t.function?.name === "task_complete");
-      if (hasTaskComplete && /\b(?:task_complete|mark\s+the\s+task\s+as\s+complete)\b/i.test(cleanText)) {
-        reasoningCtx.seslog(`\x1b[33m[LOOP-BREAK] auto-calling task_complete to prevent infinite loop\x1b[0m`);
-        allToolCalls = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
-        cleanText = "";
-      }
+    // When the AI's text-only response is telling itself to call task_complete
+    // instead of actually calling it, auto-inject the call.
+    if (!allToolCalls.length && cleanText && /\b(?:task_complete|mark(?:ed)?\s+(?:the\s+)?task\s+as\s+complete|If\s+you\s+believe\s+the\s+task\s+is\s+done)\b/i.test(cleanText)) {
+      reasoningCtx.seslog(`\x1b[33m[LOOP-BREAK] auto-calling task_complete to prevent infinite loop\x1b[0m`);
+      allToolCalls = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
+      cleanText = "";
     }
 
     const hasTools = allToolCalls.length > 0;
@@ -2523,7 +2704,13 @@ app.post("/api/chat", async c => {
       const fullText = chunks.map(c => c.message?.content || "").join("");
       let chatUsage = null;
       for (const c of chunks) { if (c.usage) chatUsage = c.usage; }
-      const { content: cleanText, toolCalls: rawCalls } = vsTools?.length ? extractToolCalls(fullText, getWorkspaceRoot(messages)) : { content: fullText, toolCalls: [] };
+      let { content: cleanText, toolCalls: rawCalls } = vsTools?.length ? extractToolCalls(fullText, getWorkspaceRoot(messages)) : { content: fullText, toolCalls: [] };
+      // Loop-break: if AI text is telling itself to call task_complete, auto-inject it
+      if (!rawCalls.length && cleanText && /\b(?:task_complete|mark(?:ed)?\s+(?:the\s+)?task\s+as\s+complete|If\s+you\s+believe\s+the\s+task\s+is\s+done)\b/i.test(cleanText)) {
+          log(`\x1b[33m[LOOP-BREAK] auto-calling task_complete\x1b[0m`);
+          rawCalls = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
+          cleanText = "";
+      }
       // Convert OpenAI format to Ollama format (drop id/type, parse args to object)
       const toolCalls = rawCalls.map(tc => ({
         function: { name: tc.function.name, arguments: (() => { try { return JSON.parse(tc.function.arguments); } catch { return {}; } })() },

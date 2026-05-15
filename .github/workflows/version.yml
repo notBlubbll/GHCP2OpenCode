@@ -19,16 +19,31 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if deletions only
+        id: check
+        run: |
+          ADDED=$(git diff --name-only HEAD~1 --diff-filter=ACMRTUXB 2>/dev/null || true)
+          if [ -z "$ADDED" ]; then
+            echo "Only deletions detected, skipping version bump."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Bump version
+        if: steps.check.outputs.skip != 'true'
         run: |
           date +%s000 > .version
           echo "Ticks: $(cat .version)"
 
       - name: Commit version
+        if: steps.check.outputs.skip != 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .version
-          git diff --staged --quiet || git commit -m "bump version [skip ci]"
+          git diff --staged --quiet || git commit -m "bump version to $(cat .version) [skip ci]"
           git push

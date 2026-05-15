@@ -670,7 +670,7 @@ function normalizeToolCall(tc) {
       safe.explanation = String(args.explanation ?? "");
     } else if (/^create_file$/i.test(name)) {
       // required: ["filePath","content"]  properties: filePath,content
-      safe.filePath = String(args.filePath ?? args.path ?? args.filename ?? "").replace(/\\/g, "/");
+      safe.filePath = String(args.filePath ?? args.file_path ?? args.path ?? args.filename ?? "").replace(/\\/g, "/");
       safe.content = String(args.content ?? args.contents ?? args.text ?? args.code ?? "");
       // Preserve any extra fields VS might require beyond the schema
       for (const k of Object.keys(args)) {
@@ -946,10 +946,14 @@ function normalizeToolCall(tc) {
     if (/^create_file$/i.test(name)) {
       try {
         const safe = {};
-        const fpMatch = raw2.match(/"filePath"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+        const fpMatch = raw2.match(/"(?:filePath|file_path|path|filename)"\s*:\s*"((?:[^"\\]|\\.)*)"/)
+                     || raw2.match(/"(?:filePath|file_path|path|filename)"\s*:\s*`([^`]*)`/);
         safe.filePath = fpMatch ? fpMatch[1].replace(/\\+/g, "/").replace(/\/{2,}/g, "/") : "";
-        const ctMatch = raw2.match(/"content"\s*:\s*"((?:[^"\\]|\\.)*)/);
-        safe.content = ctMatch ? ctMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "";
+        let btContent = null;
+        const btMatch = raw2.match(/"content"\s*:\s*`([\s\S]*?)`/);
+        if (btMatch) { btContent = btMatch[1]; }
+        const ctMatch = !btContent ? raw2.match(/"content"\s*:\s*"((?:[^"\\]|\\.)*)/) : null;
+        safe.content = btContent || (ctMatch ? ctMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "");
         if (safe.filePath && safe.content.length > 0) {
           log(`\x1b[33m[create_file] salvaged path=${safe.filePath} contentLen=${safe.content.length}\x1b[0m`);
           const fixed = JSON.stringify(safe);
@@ -1043,6 +1047,10 @@ function normalizeToolCall(tc) {
         } else {
           const unq = raw2.match(/"includePattern"\s*:\s*([^,}\s]+)/);
           safe.includePattern = (unq && unq[1] !== 'null') ? unq[1] : null;
+          if (!unq) {
+            const truncated = raw2.match(/"includePattern"\s*:\s*"((?:[^"\\]|\\.)*)/);
+            if (truncated) safe.includePattern = truncated[1].replace(/\\+/g, "\\");
+          }
         }
         const mrMatch = raw2.match(/"maxResults"\s*:\s*(\d+)/);
         safe.maxResults = mrMatch ? parseInt(mrMatch[1], 10) : null;
@@ -1061,6 +1069,35 @@ function normalizeToolCall(tc) {
             log(`\x1b[33m[plan] salvaged planLen=${planMarkdown.length}\x1b[0m`);
             return { ...tc, function: { ...tc.function, arguments: JSON.stringify({ planMarkdown }) } };
           }
+        }
+      } catch {}
+    }
+    if (/^(code_search|search_code|semantic_search)$/i.test(name)) {
+      try {
+        const safe = {};
+        let queries = [];
+        let sqMatch = raw2.match(/"searchQueries"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+        if (sqMatch) {
+          queries = [sqMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\")];
+        } else {
+          const tailMatch = raw2.match(/"searchQueries"\s*:\s*(.*?)\s*\}/);
+          if (tailMatch) {
+            let raw = tailMatch[1].trim().replace(/^"/, "").replace(/"?$/,"").replace(/"/g, "").trim();
+            if (raw) queries = [raw];
+          }
+        }
+        if (!queries.length) {
+          const qMatch = raw2.match(/"queries"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+          if (qMatch) queries = [qMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\")];
+        }
+        if (!queries.length) {
+          const unq = raw2.match(/"searchQueries"\s*:\s*"?\s*([^"}]+)/);
+          if (unq) queries = [unq[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\").trim()];
+        }
+        if (queries.length) {
+          safe.searchQueries = queries;
+          log(`\x1b[33m[${name}] salvaged queries=[${queries.map(q => q.slice(0,40)).join(",")}]\x1b[0m`);
+          return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
         }
       } catch {}
     }
@@ -1092,7 +1129,7 @@ function normalizeToolCall(tc) {
       } catch {}
     }
   }
-  return tc;
+  return null; // salvage failed — drop broken tool call
 }
 
 function extractToolCalls(text, workspaceRoot = "", messages = []) {
@@ -1103,18 +1140,33 @@ function extractToolCalls(text, workspaceRoot = "", messages = []) {
   // 0. Detect VS context from messages for better path resolution
   const vsCtx = workspaceRoot ? { workspace_root: workspaceRoot } : extractVSContext(messages);
 
-  // 1. Explicit ```tool blocks
-  const toolBlockRe = /```tool\n(\{[\s\S]*?\})\n```/g;
+  // 1. Explicit ```tool blocks — brace-counted to handle nested { } in string content
+  const toolBlockStartRe = /```tool\n\{/gi;
   let tb;
-  while ((tb = toolBlockRe.exec(text)) !== null) {
+  while ((tb = toolBlockStartRe.exec(text)) !== null) {
+    const jsonStart = tb.index + tb[0].length - 1; // position of {
+    let depth = 1, endPos = -1, inStr = false, esc = false;
+    for (let i = jsonStart + 1; i < text.length; i++) {
+      const ch = text[i];
+      if (esc) { esc = false; continue; }
+      if (ch === "\\") { esc = true; continue; }
+      if (ch === "\"") { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (ch === "{") depth++;
+      else if (ch === "}") { depth--; if (depth === 0) { endPos = i; break; } }
+    }
+    if (endPos < 0) continue;
+    toolBlockStartRe.lastIndex = endPos + 1;
+    const jsonStr = text.slice(jsonStart, endPos + 1);
+    const fullMatch = text.slice(tb.index, endPos + 1);
     try {
-      const parsed = JSON.parse(tb[1]);
+      const parsed = JSON.parse(jsonStr);
       const tc = normalizeToolCall({
         id: callId(), type: "function",
         function: { name: parsed.name, arguments: JSON.stringify(parsed.arguments || {}) },
       });
-      calls.push(tc);
-      remaining = remaining.replace(tb[0], "");
+      if (tc) calls.push(tc);
+      remaining = remaining.replace(fullMatch, "");
     } catch {}
   }
 
@@ -1143,36 +1195,77 @@ function extractToolCalls(text, workspaceRoot = "", messages = []) {
     remaining = remaining.replace(fc[0], "");
   }
 
-  // 2b. ```json tool call blocks: {"name":"create_file","arguments":{...}}
-  const jsonBlockRe = /```json\s*\n(\{[\s\S]*?\})\s*\n```/g;
+  // 2b. ```json tool call blocks — brace-counted to handle nested { } in string content
+  const jsonBlockStartRe = /```json\s*\n\{/gi;
   let jb;
-  while ((jb = jsonBlockRe.exec(text)) !== null) {
+  while ((jb = jsonBlockStartRe.exec(text)) !== null) {
+    const jsonStart = jb.index + jb[0].length - 1; // position of {
+    let depth = 1, endPos = -1, inStr = false, esc = false;
+    for (let i = jsonStart + 1; i < text.length; i++) {
+      const ch = text[i];
+      if (esc) { esc = false; continue; }
+      if (ch === "\\") { esc = true; continue; }
+      if (ch === "\"") { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (ch === "{") depth++;
+      else if (ch === "}") { depth--; if (depth === 0) { endPos = i; break; } }
+    }
+    if (endPos < 0) continue;
+    jsonBlockStartRe.lastIndex = endPos + 1;
+    const jsonStr = text.slice(jsonStart, endPos + 1);
+    const fullMatch = text.slice(jb.index, endPos + 1);
     try {
-      const parsed = JSON.parse(jb[1]);
+      const parsed = JSON.parse(jsonStr);
       if (parsed.name && parsed.arguments) {
         const tc = normalizeToolCall({
           id: callId(), type: "function",
           function: { name: parsed.name, arguments: JSON.stringify(parsed.arguments || {}) },
         });
-        if (tc) { calls.push(tc); remaining = remaining.replace(jb[0], ""); }
+        if (tc) { calls.push(tc); remaining = remaining.replace(fullMatch, ""); }
       }
     } catch {}
   }
 
   // 2c. Inline JSON tool calls: {"name":"create_file","arguments":{...}} (standalone, no code fence)
-  const inlineJsonRe = /\{\s*"name"\s*:\s*"(create_file|replace_string_in_file|multi_replace_string_in_file|remove_file|get_file|read_file|grep_search|file_search|find_symbol|search_symbol|run_command_in_terminal|execute_command|replace_in_file|task_complete|start_modernization)"\s*,\s*"arguments"\s*:\s*\{[\s\S]*?\}\s*\}/gi;
+  // Use brace-counting to handle content with nested { } — the old regex \{[\\s\\S]*?\}\\s*\\}
+  // would incorrectly match }} inside string content (e.g. nested JS functions).
+  const inlineJsonHeadRe = /\{\s*"name"\s*:\s*"(create_file|replace_string_in_file|multi_replace_string_in_file|remove_file|get_file|read_file|grep_search|file_search|find_symbol|search_symbol|run_command_in_terminal|execute_command|replace_in_file|task_complete|start_modernization)"\s*,\s*"arguments"\s*:\s*\{/gi;
   let ij;
-  while ((ij = inlineJsonRe.exec(text)) !== null) {
+  while ((ij = inlineJsonHeadRe.exec(text)) !== null) {
+    const fnName = ij[1];
+    const startPos = ij.index;
+    const braceStart = ij.index + ij[0].length - 1; // position of the opening { before arguments
+    let depth = 1;
+    let endPos = -1;
+    let inString = false;
+    let escape = false;
+    for (let i = braceStart + 1; i < text.length; i++) {
+      const ch = text[i];
+      if (escape) { escape = false; continue; }
+      if (ch === "\\") { escape = true; continue; }
+      if (ch === '"') { inString = !inString; continue; }
+      if (inString) continue;
+      if (ch === "{") depth++;
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) { endPos = i; break; }
+      }
+    }
+    if (endPos < 0) continue;
+    inlineJsonHeadRe.lastIndex = endPos + 1; // advance past brace-counted match so subsequent tool calls are found
+    const fullJson = text.slice(startPos, endPos + 1);
     try {
-      const parsed = JSON.parse(ij[0]);
+      const parsed = JSON.parse(fullJson);
       if (parsed.name && parsed.arguments) {
         const tc = normalizeToolCall({
           id: callId(), type: "function",
           function: { name: parsed.name, arguments: JSON.stringify(parsed.arguments || {}) },
         });
-        if (tc) { calls.push(tc); remaining = remaining.replace(ij[0], ""); }
+        if (tc) { calls.push(tc); remaining = remaining.replace(fullJson, ""); }
       }
-    } catch {}
+    } catch (e) {
+      if (fnName === "create_file") log(`\x1b[31m[extract-inline] create_file JSON parse failed: ${e.message}\x1b[0m`);
+    }
   }
 
   // 3. Markdown file creation: ## `path` ```lang\ncontent\n```
@@ -2282,7 +2375,7 @@ app.post("/v1/chat/completions", async c => {
             }
           }
         }
-        let allToolCalls = [...tcBuilders.values()].map(normalizeToolCall);
+        let allToolCalls = [...tcBuilders.values()].map(normalizeToolCall).filter(Boolean);
         if (!allToolCalls.length && vsTools?.length && fullText) {
           const extracted = extractToolCalls(fullText, getWorkspaceRoot(messages), messages);
           if (extracted.toolCalls.length) {
@@ -2408,7 +2501,7 @@ app.post("/v1/chat/completions", async c => {
 
     let allToolCalls = [];
     if (nativeCalls?.length) {
-      allToolCalls = nativeCalls.map(normalizeToolCall);
+      allToolCalls = nativeCalls.map(normalizeToolCall).filter(Boolean);
       cleanText = "";
     } else if (vsTools?.length) {
       const extracted = extractToolCalls(fullText, getWorkspaceRoot(messages), messages);

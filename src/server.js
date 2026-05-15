@@ -648,16 +648,16 @@ function normalizeToolCall(tc) {
       safe.maxResults = (typeof args.maxResults === "number" && args.maxResults >= 1) ? args.maxResults : 20;
     } else if (/^replace_string_in_file$/i.test(name)) {
       // required: ["filePath","oldString","newString"]  properties: filePath,oldString,newString
-      safe.filePath = String(args.filePath ?? args.path ?? args.filename ?? "");
-      safe.oldString = String(args.oldString ?? args.old_str ?? args.search ?? args.old_text ?? "");
-      safe.newString = String(args.newString ?? args.new_str ?? args.replace ?? args.new_text ?? "");
+      safe.filePath = String(args.filePath ?? args.path ?? args.filename ?? args.file ?? "");
+      safe.oldString = String(args.oldString ?? args.old_string ?? args.old_str ?? args.search ?? args.old_text ?? "");
+      safe.newString = String(args.newString ?? args.new_string ?? args.new_str ?? args.replace ?? args.new_text ?? "");
     } else if (/^multi_replace_string_in_file$/i.test(name)) {
       // required: ["replacements","explanation"]  properties: replacements,explanation
       const list = args.replacements ?? args.edits ?? args.changes ?? args.patches ?? args.operations ?? args.diffs;
       if (Array.isArray(list)) {
         safe.replacements = list.map(r => {
           const e = {};
-          e.filePath = String(r.filePath ?? r.filepath ?? r.path ?? r.filename ?? "");
+          e.filePath = String(r.filePath ?? r.filepath ?? r.path ?? r.filename ?? r.file ?? "");
           e.oldString = String(r.oldString ?? r.old_str ?? r.search ?? r.old_text ?? r.find ?? r.from ?? "");
           e.newString = String(r.newString ?? r.new_str ?? r.replace ?? r.new_text ?? r.to ?? "");
           return e;
@@ -976,11 +976,11 @@ function normalizeToolCall(tc) {
     if (/^replace_string_in_file$/i.test(name)) {
       try {
         const safe = {};
-        const fpMatch = raw2.match(/"(?:filePath|filename|path)"\s*:\s*"((?:[^"\\]|\\.)*)/) || raw2.match(/"(?:filePath|filename|path)"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+        const fpMatch = raw2.match(/"(?:filePath|filename|path|file)"\s*:\s*"((?:[^"\\]|\\.)*)/) || raw2.match(/"(?:filePath|filename|path|file)"\s*:\s*"((?:[^"\\]|\\.)*)"/);
         safe.filePath = fpMatch ? fpMatch[1].replace(/\\+/g, "/").replace(/\/{2,}/g, "/") : "";
-        const osMatch = raw2.match(/"oldString"\s*:\s*"((?:[^"\\]|\\.)*)/);
+        const osMatch = raw2.match(/"(?:oldString|old_string|old_str|old|search)"\s*:\s*"((?:[^"\\]|\\.)*)/);
         safe.oldString = osMatch ? osMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "";
-        const nsMatch = raw2.match(/"newString"\s*:\s*"((?:[^"\\]|\\.)*)/);
+        const nsMatch = raw2.match(/"(?:newString|new_string|new_str|new|replace)"\s*:\s*"((?:[^"\\]|\\.)*)/);
         safe.newString = nsMatch ? nsMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "";
         if (safe.filePath && (safe.oldString || safe.newString)) {
           log(`\x1b[33m[replace_string_in_file] salvaged path=${safe.filePath} oldLen=${safe.oldString.length} newLen=${safe.newString.length}\x1b[0m`);
@@ -990,9 +990,9 @@ function normalizeToolCall(tc) {
     }
     if (/^multi_replace_string_in_file$/i.test(name)) {
       try {
-        const fpMatch = raw2.match(/"(?:filePath|filename|path)"\s*:\s*"((?:[^"\\]|\\.)*)/) || raw2.match(/"(?:filePath|filename|path)"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-        const osMatch = raw2.match(/"oldString"\s*:\s*"((?:[^"\\]|\\.)*)/);
-        const nsMatch = raw2.match(/"newString"\s*:\s*"((?:[^"\\]|\\.)*)/);
+        const fpMatch = raw2.match(/"(?:filePath|filename|path|file)"\s*:\s*"((?:[^"\\]|\\.)*)/) || raw2.match(/"(?:filePath|filename|path|file)"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+        const osMatch = raw2.match(/"(?:oldString|old_string|old_str|old|search)"\s*:\s*"((?:[^"\\]|\\.)*)/);
+        const nsMatch = raw2.match(/"(?:newString|new_string|new_str|new|replace)"\s*:\s*"((?:[^"\\]|\\.)*)/);
         if (fpMatch) {
           const rep = {
             filePath: fpMatch[1].replace(/\\+/g, "/").replace(/\/{2,}/g, "/"),
@@ -1007,7 +1007,7 @@ function normalizeToolCall(tc) {
     if (/^insert_edit_into_file$/i.test(name)) {
       try {
         const safe = {};
-        const fpMatch = raw2.match(/"filePath"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+        const fpMatch = raw2.match(/"(?:filePath|filename|path|file)"\s*:\s*"((?:[^"\\]|\\.)*)/) || raw2.match(/"(?:filePath|filename|path|file)"\s*:\s*"((?:[^"\\]|\\.)*)"/);
         safe.filePath = fpMatch ? fpMatch[1].replace(/\\+/g, "/").replace(/\/{2,}/g, "/") : "";
         const cdMatch = raw2.match(/"code"\s*:\s*"((?:[^"\\]|\\.)*)/);
         safe.code = cdMatch ? cdMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "";
@@ -1860,6 +1860,7 @@ app.post("/v1/chat/completions", async c => {
     let toolFailStreak = 0;
     let toolLoopBroken = false;
     let taskCompleteOnly = false;
+    let filterNags = false;
     const provider = isM365Model(goModel) ? "m365" : isPollModel(goModel) ? "poll" : isFreeTierModel(goModel) ? "zen" : "go";
     const reasoningCtx = createReasoningContext(messages, goModel, getWorkspaceRoot(messages), clientTag, provider, thinkingTag);
     reasoningCtx.reset();
@@ -2004,11 +2005,13 @@ app.post("/v1/chat/completions", async c => {
     }
     if (vsTaskCompleteNags >= 3) {
       reasoningCtx.sessionEntry.loopHits = (reasoningCtx.sessionEntry.loopHits || 0) + 1;
-      reasoningCtx.seslog(`\x1b[33m[LOOP-BREAK] VS has nagged ${vsTaskCompleteNags} times — forcing task_complete-only tools (loop hits: ${reasoningCtx.sessionEntry.loopHits})\x1b[0m`);
-      // Filter tools to only task_complete — forces the model to signal completion
+      reasoningCtx.seslog(`\x1b[33m[LOOP-BREAK] VS has nagged ${vsTaskCompleteNags} times — filtering nags & forcing task_complete (loop hits: ${reasoningCtx.sessionEntry.loopHits})\x1b[0m`);
+      // Filter out VS nag messages so the model isn't confused by them
       taskCompleteOnly = true;
+      filterNags = true;
     }
     if (vsTaskCompleteNags >= 12) {
+      reasoningCtx.seslog(`\x1b[31m[LOOP-BREAK] VS has nagged ${vsTaskCompleteNags} times — returning stop as last resort\x1b[0m`);
       reasoningCtx.seslog(`\x1b[31m[LOOP-BREAK] VS has nagged ${vsTaskCompleteNags} times — returning stop as last resort\x1b[0m`);
       if (clientWantsStream) {
         return stream(c, async (s) => {
@@ -2052,7 +2055,18 @@ app.post("/v1/chat/completions", async c => {
     // Forward to Go API with native tool support
     const apiMessages = [];
     if (taskCompleteOnly) {
-      systemMsg = "TASK COMPLETE: Your only available tool is task_complete. Call it NOW to signal completion. No other actions are possible.\n\n" + systemMsg;
+      systemMsg = "CRITICAL: You must respond with ONLY a task_complete tool call. Do NOT output any text. Use exactly this format:\n```tool\n{\"name\":\"task_complete\",\"arguments\":{}}\n```\n\n" + systemMsg;
+      // Strip VS nag messages so they don't confuse the model
+      if (filterNags) {
+        const nagRe = /\byou have not yet marked the task as complete\b/i;
+        const before = userMsgs.length;
+        for (let i = userMsgs.length - 1; i >= 0; i--) {
+          if (userMsgs[i].role === "user" && typeof userMsgs[i].content === "string" && nagRe.test(userMsgs[i].content)) {
+            userMsgs.splice(i, 1);
+          }
+        }
+        if (userMsgs.length < before) reasoningCtx.seslog(`\x1b[33m[nags] filtered ${before - userMsgs.length} nag messages\x1b[0m`);
+      }
     }
     if (systemMsg) apiMessages.push({ role: "system", content: systemMsg });
     apiMessages.push(...userMsgs);

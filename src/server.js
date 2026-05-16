@@ -238,6 +238,18 @@ function _stripAllToolCalls(messages) {
   });
 }
 
+// Check if a user message is just a greeting/chitchat with no actual task
+const _NO_TASK_KEYWORDS = /\b(fix|change|add|create|make|implement|write|build|debug|error|bug|issue|refactor|optimiz|test|deploy|install|setup|config|run|find|search|explain|show|list|[?]|help|how|what|can|need|want|modify|update|remove|delete|move|rename|convert|generate|rewrite)\b/i;
+function _isNoTaskMessage(text) {
+  if (!text) return true;
+  const t = text.trim();
+  if (!t) return true;
+  if (t.length < 5) return true;
+  if (_NO_TASK_KEYWORDS.test(t)) return false;
+  if (t.length > 60) return false;
+  return /^(hey|hi|hello|sup|yo|hola|hai|heyy|heya|greet|what.?s up|good (morning|afternoon|evening)|howdy|yo|he[l]+o)/i.test(t);
+}
+
 // Pre-flight: strip orphaned tool_calls from assistant messages that have no
 // matching tool results. This prevents DeepSeek validation errors (tool_calls
 // must have matching results) without injecting fake results that confuse the model.
@@ -2398,8 +2410,8 @@ app.post("/v1/chat/completions", async c => {
 
     // Detect VS task_complete retry loop — if VS keeps nagging the model
     // to call task_complete, short-circuit with stop to break the loop.
-    // Using stop (not task_complete auto-injection) because VS Insiders
-    // rejects auto-injected tool calls and keeps retrying.
+    // Escalates after 2 consecutive nags (was 3) when the last assistant
+    // had no tool_calls — catches "no task given" greetings faster.
     // HOWEVER: if the LLM is still producing useful tool calls, don't
     // terminate — VS nags are often premature.
     let vsTaskCompleteNags = 0;
@@ -2412,28 +2424,33 @@ app.post("/v1/chat/completions", async c => {
         break;
       }
     }
-    // Check if the LLM is still actively working (last assistant has tool_calls)
+    // Check if the LLM is still actively working (last assistant has tool_calls
+    // OR markdown-based tool patterns for VS/VS Insiders where tool_calls come as markdown)
     let lastAssistantHasTools = false;
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role === "assistant") {
-        lastAssistantHasTools = !!(messages[i].tool_calls?.length);
+        const content = typeof messages[i].content === "string" ? messages[i].content : "";
+        lastAssistantHasTools = !!(
+          messages[i].tool_calls?.length ||
+          /```tool\n\{|```json\s*\n\{|<function_calls>|## `[^`]+`\n```/.test(content)
+        );
         break;
       }
     }
-    if (vsTaskCompleteNags >= 3 && !lastAssistantHasTools) {
+    if (vsTaskCompleteNags >= 2 && !lastAssistantHasTools) {
       reasoningCtx.sessionEntry.loopHits = (reasoningCtx.sessionEntry.loopHits || 0) + 1;
       reasoningCtx.seslog(`\x1b[33m[LOOP-BREAK] VS has nagged ${vsTaskCompleteNags} times — filtering nags & forcing task_complete (loop hits: ${reasoningCtx.sessionEntry.loopHits})\x1b[0m`);
       // Filter out VS nag messages so the model isn't confused by them
       taskCompleteOnly = true;
       filterNags = true;
-    } else if (vsTaskCompleteNags >= 3 && lastAssistantHasTools) {
+    } else if (vsTaskCompleteNags >= 2 && lastAssistantHasTools) {
       reasoningCtx.seslog(`\x1b[35m[nags] ignoring ${vsTaskCompleteNags} VS nags — LLM is still producing tool calls\x1b[0m`);
       filterNags = true; // still filter nags so the model isn't confused
       // Reset loopHits since we're not escalating
       if (reasoningCtx.sessionEntry.loopHits > 0) reasoningCtx.sessionEntry.loopHits = 0;
     }
     if (reasoningCtx.sessionEntry.loopHits >= 4) {
-      reasoningCtx.seslog(`\x1b[31m[LOOP-BREAK] VS has nagged ${reasoningCtx.sessionEntry.loopHits} rounds (${reasoningCtx.sessionEntry.loopHits * 3}+ nags) — returning stop as last resort\x1b[0m`);
+      reasoningCtx.seslog(`\x1b[31m[LOOP-BREAK] VS has nagged ${reasoningCtx.sessionEntry.loopHits} rounds (${reasoningCtx.sessionEntry.loopHits * 2}+ nags) — returning stop as last resort\x1b[0m`);
       if (clientWantsStream) {
         return stream(c, async (s) => {
           const w = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
@@ -2446,8 +2463,8 @@ app.post("/v1/chat/completions", async c => {
       return c.json(oaiResp("", undefined, "stop", model));
     }
     // Only reset loop counter when no nags detected in this request.
-    // When nags >= 3, loopHits was incremented above — keep it to accumulate across requests.
-    if (vsTaskCompleteNags < 3 && reasoningCtx.sessionEntry.loopHits > 0) reasoningCtx.sessionEntry.loopHits = 0;
+    // When nags >= 2, loopHits was incremented above — keep it to accumulate across requests.
+    if (vsTaskCompleteNags < 2 && reasoningCtx.sessionEntry.loopHits > 0) reasoningCtx.sessionEntry.loopHits = 0;
 
     // Identity override — MUST be first system instruction to override VS built-in
     systemMsg = compactIdentity(goModel, thinkingTag) + (systemMsg ? "\n\n" : "") + systemMsg;
@@ -2504,6 +2521,29 @@ app.post("/v1/chat/completions", async c => {
         }
       }
     }
+
+    // Detect first-message greetings with no actual task — short-circuit before LLM.
+    // Check the last user message. Only fire on the initial request (no prior
+    // assistant/tool messages, no nags yet).
+    if (!vsTaskCompleteNags && userMsgs.filter(m => m.role !== "user").length === 0) {
+      const lum = userMsgs[userMsgs.length - 1];
+      const t = typeof lum?.content === "string" ? lum.content.trim() : "";
+      if (lum?.role === "user" && _isNoTaskMessage(t)) {
+        reasoningCtx.seslog(`\x1b[33m[no-task] greeting detected ("${t.slice(0, 40)}") — auto task_complete\x1b[0m`);
+        const tc = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
+        if (clientWantsStream) {
+          return stream(c, async (s) => {
+            const w = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
+            const base = { id: chatId, object: "chat.completion.chunk", created, model, system_fingerprint: systemFp };
+            await w({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+            await _simStream(w, base, true, tc, "", null);
+            await s.write("data: [DONE]\n\n");
+          });
+        }
+        return c.json(oaiResp(null, tc, "tool_calls", model));
+      }
+    }
+
     if (systemMsg) apiMessages.push({ role: "system", content: systemMsg });
     apiMessages.push(...userMsgs);
 
@@ -2521,12 +2561,22 @@ app.post("/v1/chat/completions", async c => {
     }
     const compressedMessages = compressMessages(validatedMessages, compLevel, true);
 
-    let upstreamTools = vsTools || undefined;
-    if (taskCompleteOnly && vsTools?.length) {
-      const tcTool = vsTools.find(t => t.function?.name === "task_complete");
-      upstreamTools = tcTool ? [tcTool] : [{ type: "function", function: { name: "task_complete", description: "Signal task completion", parameters: { type: "object", properties: {}, required: [] } } }];
-      reasoningCtx.seslog(`\x1b[33m[tools] restricting to task_complete only\x1b[0m`);
+    if (taskCompleteOnly) {
+      reasoningCtx.seslog(`\x1b[33m[shortcut] bypassing LLM — auto task_complete\x1b[0m`);
+      const tc = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
+      if (clientWantsStream) {
+        return stream(c, async (s) => {
+          const w = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
+          const base = { id: chatId, object: "chat.completion.chunk", created, model, system_fingerprint: systemFp };
+          await w({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+          await _simStream(w, base, true, tc, "", null);
+          await s.write("data: [DONE]\n\n");
+        });
+      }
+      return c.json(oaiResp(null, tc, "tool_calls", model));
     }
+
+    let upstreamTools = vsTools || undefined;
     const ollamaReq = { model: goModel, messages: compressedMessages, stream: streamMode, tools: upstreamTools, clientTag, sessionId: reasoningCtx.sessionId };
     if (body.chat_template_kwargs != null) ollamaReq.chat_template_kwargs = body.chat_template_kwargs;
     if (body.thinking_token_budget != null) ollamaReq.thinking_token_budget = body.thinking_token_budget;

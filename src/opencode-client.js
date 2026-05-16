@@ -658,7 +658,6 @@ function loadKeyHashFromDisk() {
     if (!_fs) { log("[keys] no fs module loaded"); return null; }
     const path = getKeyHashPath();
     const data = JSON.parse(_fs.readFileSync(path, "utf8"));
-    log(`[keys] loaded hash from ${path}: ${(data.h || "").slice(0, 5)}`);
     return data.h || null;
   } catch (e) {
     log(`[keys] no hash file yet (${e.message})`);

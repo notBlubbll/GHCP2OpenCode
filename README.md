@@ -1,11 +1,7 @@
 # gc2oc — GitHub Copilot to [OpenCode]
 
-```
-  █▀▀▀ █▀▀▀ ▀▀▀█ █▀▀█ █▀▀▀
-  █ ▀█ █    █▀▀▀ █░░█ █░░░
-  ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀
-github copilot proxy
-```
+<img width="213" height="46" alt="image" src="https://github.com/user-attachments/assets/6a6a2626-1779-4873-a30e-7fc2d8621967" />
+
 
 Ollama-emulating proxy that connects **GitHub Copilot Chat&Agent** to the [OpenCode](https://opencode.ai) Zen + Go APIs + models.
 

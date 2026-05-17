@@ -1,8 +1,6 @@
 @echo off
 setlocal
 
-title gc2oc Update+Build
-
 echo ================================================
 echo  gc2oc -- Update + Build
 echo ================================================
@@ -10,6 +8,7 @@ echo.
 
 REM Kill running proxy (by window title + by port)
 powershell -NoProfile -Command "Get-Process | Where-Object { $_.MainWindowTitle -like 'gc2oc*' } | Stop-Process -Force" >nul 2>&1
+title gc2oc Update+Build
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":11434 " ^| findstr "LISTENING" 2^>nul') do (
     taskkill /pid %%a /f >nul 2>&1
 )

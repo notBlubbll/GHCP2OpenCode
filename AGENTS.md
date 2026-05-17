@@ -620,6 +620,31 @@ VS agent mode sends bare `"continue"` as a user message when the user clicks con
 
 VS nags with `"You have not yet marked the task as complete"` even when the LLM is actively producing useful tool calls. The nag detector (`vsTaskCompleteNags >= 3`) should only escalate to `taskCompleteOnly` when the **last assistant message has NO tool_calls**. If the LLM is still working (has tool calls), only filter the nag messages but let the LLM continue. This prevents premature termination of productive sessions.
 
+### Rate-limit session gate (`server.js`)
+
+When a free-tier model returns HTTP 429, VS enters an aggressive retry loop that sends parallel requests and nags. Previous attempts to inject `task_complete` or return empty assistant messages created self-reinforcing loops (the injected response triggered more nags).
+
+**Solution**: Once a session hits a 429, mark it in `_rateLimitedSessions` (convId → `{ at: timestamp }`). For **30 seconds**, any further request for that conversation returns a hard **HTTP 429** with an OpenAI-compatible error body:
+
+```json
+{
+  "error": {
+    "message": "Rate limit exceeded for this session.",
+    "type": "invalid_request_error",
+    "code": "rate_limit_exceeded"
+  }
+}
+```
+
+This applies to:
+- The **early gate** (catches retries before upstream is called)
+- The **nag loop-break** (catches VS nags after the first 429)
+- The **stream catch** (returns an SSE error event)
+- The **outer catch** (after zenRequest retries are exhausted)
+- The **RateLimitError** path (concurrency manager rejection)
+
+VS receives a proper error status and stops retrying instead of spiraling into nags. The 30s window is long enough to absorb VS's burst and short enough that the user can retry manually once the upstream cooldown expires.
+
 ### `maxRequestBodyBytes` default: 32MB
 
 VS sends large workspace context blocks (often 16MB+). The default `maxRequestBodyBytes` in `concurrency.js` is raised from 10MB to 32MB (`33554432`) to avoid false 413 rejections.

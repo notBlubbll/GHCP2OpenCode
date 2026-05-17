@@ -1,9 +1,10 @@
 // ── Token Optimization ──
+// Enriched from https://github.com/kitpilot/kit-pilot (delta context stripping, ~3× fewer tokens; tool-output compacting)
 // Enriched from https://github.com/barrersoftware/copilot-plugin-mcp-server (67% token reduction)
 // Enriched from https://github.com/diegosouzapw/OmniRoute (RTK+Caveman stacked compression up to ~95%)
 // Enriched from https://github.com/JuliusBrussee/caveman (30+ regex rules for filler removal)
 //
-// Compression levels (inspired by OmniRoute):
+// Compression levels:
 //   Off       (0%)    — No compression
 //   Lite      (~15%)  — Whitespace collapse, dedup system prompts
 //   Caveman   (~30%)  — 30+ regex rules: filler removal, context condensation, structural compression
@@ -11,6 +12,7 @@
 //   Ultra     (~75%)  — All Aggressive + heuristic token pruning + stopword removal
 //   RTK       (60-90%)— Command-aware filters for shell/test/build/git output
 //   Stacked   (78-95%)— RTK first, then Caveman — best for mixed prompts with tool logs + prose
+//   Delta     (60-90%)— Historical VS context stripping (KitPilot) + tool output compacting
 //
 // Also compresses tool descriptions, schemas, identity prompts, and tool instructions.
 import { log } from "./logger.js";
@@ -23,6 +25,7 @@ import { log } from "./logger.js";
 //   5. Caveman: 30+ regex rules for filler removal, structural compression
 //   6. RTK: command-aware output compression (shell, git, grep, test, build)
 //   7. Stacked: RTK → Caveman chain for maximum savings
+//   8. Delta: strip historical VS context blocks, compact consumed tool outputs
 
 // ── Compression level enum ──
 export const CompressionLevel = Object.freeze({
@@ -34,6 +37,7 @@ export const CompressionLevel = Object.freeze({
   ULTRA: "ultra",
   RTK: "rtk",
   STACKED: "stacked",
+  DELTA: "delta",
 });
 
 // ── Common term substitutions ──
@@ -741,6 +745,137 @@ function _stripStopwords(text) {
 }
 
 // ═══════════════════════════════════════════════════
+// Delta compression (~60-90% savings)
+// KitPilot-inspired: strip historical VS context blocks, compact consumed tool outputs
+// Key insight from KitPilot: VS sends the same ~16KB+ environment block every turn.
+// In a 10-turn conversation, that's 160KB of redundant context.
+// Stripping historical copies and keeping only the current turn's block saves ~3× tokens.
+// ═══════════════════════════════════════════════════
+
+// ── VS context block detection patterns ──
+const VS_CONTEXT_PATTERNS = [
+  /\n*#+\s*Context:[\s\S]{200,}?(?=\n#+\s|\n*$)/gi,
+  /\n*<context>[\s\S]*?<\/context>\n*/gi,
+  /\n*<environment_details>[\s\S]*?<\/environment_details>\n*/gi,
+  /\n*<CurrentWorkingDirectory>[\s\S]*?<\/CurrentWorkingDirectory>\n*/gi,
+  /\n*<open_and_recently_viewed_files>[\s\S]*?<\/open_and_recently_viewed_files>\n*/gi,
+  /\n*<attached_files>[\s\S]*?<\/attached_files>\n*/gi,
+  /\n*<project_layout>[\s\S]*?<\/project_layout>\n*/gi,
+];
+
+function _detectVSBlock(content) {
+  if (!content || typeof content !== "string") return { hasBlock: false };
+  for (const p of VS_CONTEXT_PATTERNS) {
+    const m = content.match(p);
+    if (m && m.some(s => (s.match(/\n/g) || []).length >= 3)) {
+      return { hasBlock: true };
+    }
+  }
+  // Heuristic: long first user message (>2KB) with VS version or workspace root patterns
+  if (content.length > 2000) {
+    if (/visual\s+studio\s+\d{4}/i.test(content) ||
+        /workspace root/i.test(content) ||
+        /currently opened file/i.test(content) ||
+        /active file/i.test(content) ||
+        /open tabs/i.test(content)) {
+      return { hasBlock: true, heuristic: true };
+    }
+  }
+  return { hasBlock: false };
+}
+
+function _extractContextSummary(content) {
+  const parts = [];
+  const wsMatch = content.match(/(?:workspace root|path to (?:the )?workspace root):?\s*(\S+)/i);
+  if (wsMatch) parts.push(`ws:${wsMatch[1].split("/").pop() || wsMatch[1].split("\\").pop() || wsMatch[1]}`);
+  const afMatch = content.match(/(?:currently opened|active) file:?\s*(\S+)/i);
+  if (afMatch) parts.push(`file:${afMatch[1].split("/").pop() || afMatch[1].split("\\").pop()}`);
+  const vsMatch = content.match(/visual\s+studio\s+(enterprise|professional|community)?\s*(\d{4})\s*\((\d+\.\d+\.\d+)(-insiders)?\)/i);
+  if (vsMatch) parts.push(`VS${vsMatch[3]}`);
+  const tabCount = (content.match(/open tabs/i) ? (content.match(/^[ \t]*[^\n]+\.(cs|ts|js|py|go|rs|java|cpp|c|h|json|xml|yaml|yml|md|sql)/gim) || []).length : 0);
+  if (tabCount > 0) parts.push(`${tabCount} tabs`);
+  return parts.length ? `[gc2oc: prior turn snapshot — ${parts.join(", ")}]` : "[gc2oc: prior turn snapshot]";
+}
+
+function _stripHistoricalVSContext(messages, isVSClient) {
+  if (!messages?.length || !isVSClient) return messages;
+  if (messages.length <= 2) return messages;
+
+  const result = [];
+  let lastUserIdx = -1;
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") { lastUserIdx = i; break; }
+  }
+  if (lastUserIdx < 0) return messages;
+
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (i === lastUserIdx || m.role !== "user") {
+      result.push(m);
+      continue;
+    }
+
+    const content = typeof m.content === "string" ? m.content : "";
+    const { hasBlock } = _detectVSBlock(content);
+
+    if (hasBlock) {
+      const summary = _extractContextSummary(content);
+      result.push({ ...m, content: summary });
+      log(`[delta] stripped VS context block (${content.length} → ${summary.length} chars) at message[${i}]`);
+    } else {
+      result.push(m);
+    }
+  }
+  return result;
+}
+
+function _compactHistoricalToolOutputs(messages) {
+  if (!messages?.length || messages.length <= 2) return messages;
+
+  const result = [];
+  const consumedTools = new Set();
+
+  for (let i = 1; i < messages.length; i++) {
+    const m = messages[i];
+    const prev = messages[i - 1] || {};
+    const next = messages[i + 1] || {};
+
+    if (m.role === "tool" && prev.role === "assistant" && next.role === "assistant") {
+      consumedTools.add(i);
+    }
+  }
+
+  for (let i = 0; i < messages.length; i++) {
+    if (consumedTools.has(i)) {
+      const m = messages[i];
+      const content = typeof m.content === "string" ? m.content : "";
+      if (content.length > 500) {
+        const head = content.slice(0, 200).replace(/\n/g, " ").trim();
+        const compact = `[gc2oc: consumed tool output — ${head}... (${content.length} chars)]`;
+        result.push({ ...m, content: compact });
+        log(`[delta] compacted consumed tool output (${content.length} → ${compact.length} chars) at message[${i}]`);
+      } else {
+        result.push(m);
+      }
+    } else {
+      result.push(messages[i]);
+    }
+  }
+  return result;
+}
+
+export function compressHistory(messages, isVSClient = true) {
+  if (!messages?.length) return messages;
+  let msgs = messages;
+  if (isVSClient) {
+    msgs = _stripHistoricalVSContext(msgs, true);
+  }
+  msgs = _compactHistoricalToolOutputs(msgs);
+  return msgs;
+}
+
+// ═══════════════════════════════════════════════════
 // Main compression pipeline
 // ═══════════════════════════════════════════════════
 
@@ -825,6 +960,17 @@ export function compressMessages(messages, level = "stacked", progressiveAging =
 
   let msgs = messages;
 
+  // Delta compression: strip historical VS context blocks, compact consumed tool outputs
+  if (level === "delta") {
+    const beforeLen = JSON.stringify(msgs).length;
+    msgs = compressHistory(msgs, true);
+    if (JSON.stringify(msgs).length < beforeLen) {
+      const saved = beforeLen - JSON.stringify(msgs).length;
+      log(`[delta] history compression saved ~${Math.round(saved / beforeLen * 100)}% (${beforeLen} → ${JSON.stringify(msgs).length} chars)`);
+    }
+    return msgs;
+  }
+
   // Inject tool history summary before compression — preserves context about what was done
   if (level !== "off" && level !== "lite") {
     msgs = _injectToolSummary(msgs);
@@ -844,6 +990,7 @@ export function compressMessages(messages, level = "stacked", progressiveAging =
         case "stacked":  keepCount = 0; break;
         case "aggressive": keepCount = 0; break;
         case "ultra":    keepCount = 0; break;
+        case "delta":    keepCount = 0; break;
         default:         keepCount = 0; break;
       }
     }
@@ -924,6 +1071,7 @@ export function estimatedSavings(level) {
     case "ultra": return 75;
     case "rtk": return 80;
     case "stacked": return 89;
+    case "delta": return 80;
     default: return 0;
   }
 }

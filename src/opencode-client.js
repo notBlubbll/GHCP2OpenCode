@@ -346,10 +346,14 @@ export function setApiKey(key) { Bun.env.OPENCODE_API_KEY = key; }
 
 const COOLDOWN_429_FIRST = 5 * 60 * 60 * 1000;  // 5 hours
 const COOLDOWN_429_SECOND = 7 * 24 * 60 * 60 * 1000;  // 1 week
+const COOLDOWN_429_RETRY = 30 * 1000;  // 30s — short cooldown so next retry picks a different key
 const CONSECUTIVE_429_THRESHOLD = 10;
+const RETRY_DELAY_429 = 3 * 1000;  // 3s delay before retrying on 429
+const ZEN_429_COOLDOWN = 60 * 1000;  // 60s — block further free/poll requests after a Zen 429
 
 let _keys = [];
 let _balancer = null;
+let _zen429Until = 0;  // timestamp until which free/poll requests are blocked
 const _key429Count = new Map();  // key → consecutive 429 count
 
 function cacheDir() {
@@ -378,22 +382,31 @@ function loadKeyState() {
 
 let _lastKeyStateHash = "";
 
+function keyId(key) {
+  // Unique per-key identifier for state persistence (avoids short-key collisions)
+  if (_crypto) return _crypto.createHash("sha256").update(key).digest("hex").slice(0, 16);
+  // Fallback: djb2 hash
+  let h = 5381;
+  for (let i = 0; i < key.length; i++) { h = ((h << 5) + h + key.charCodeAt(i)) | 0; }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+
 function saveKeyState() {
   if (!_fs) return;
   try {
     const now = Date.now();
     const keys = {};
     for (const key of _keys) {
-      const short = `${key.slice(0, 6)}...${key.slice(-4)}`;
-      keys[short] = {
+      const id = keyId(key);
+      keys[id] = {
         consecutive429: _key429Count.get(key) || 0,
       };
       if (_balancer) {
         if (_balancer.cooldownUntil.has(key)) {
           const until = _balancer.cooldownUntil.get(key);
           if (until > now) {
-            keys[short].cooldownUntil = new Date(until).toISOString();
-            keys[short].cooldownReason = _balancer.cooldownReason.get(key) || "429";
+            keys[id].cooldownUntil = new Date(until).toISOString();
+            keys[id].cooldownReason = _balancer.cooldownReason.get(key) || "429";
           }
         }
       }
@@ -439,14 +452,13 @@ class ApiBalancer {
   _restoreState(savedState) {
     const keyMap = {};
     for (const k of this.keys) {
-      const short = `${k.slice(0, 6)}...${k.slice(-4)}`;
-      keyMap[short] = k;
+      keyMap[keyId(k)] = k;
     }
     let restoredCooldowns = 0;
     let skippedExpired = 0;
-    for (const [short, info] of Object.entries(savedState.keys || {})) {
-      const fullKey = keyMap[short];
-      if (!fullKey) { log(`[keys] state has ${short} but no matching key — skipping`); continue; }
+    for (const [id, info] of Object.entries(savedState.keys || {})) {
+      const fullKey = keyMap[id];
+      if (!fullKey) continue;
       if (info.cooldownUntil || info.bannedUntil) {
         const until = new Date(info.cooldownUntil || info.bannedUntil).getTime();
         if (until > Date.now()) {
@@ -471,27 +483,19 @@ class ApiBalancer {
       if (this.cooldownUntil.has(key) && this.cooldownUntil.get(key) > now) continue;
       this.pool.push(key);
     }
-    if (this.pool.length === 0) {
-      // All keys in cooldown — use the one with earliest expiry
-      let earliestKey = null;
-      let earliestTime = Infinity;
-      for (const [key, until] of this.cooldownUntil.entries()) {
-        if (until < earliestTime) {
-          earliestTime = until;
-          earliestKey = key;
-        }
-      }
-      if (earliestKey) {
-        this.pool = [earliestKey];
-      } else {
-        this.pool = [...this.keys];
-      }
-    }
     // Shuffle
     for (let i = this.pool.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [this.pool[i], this.pool[j]] = [this.pool[j], this.pool[i]];
     }
+  }
+
+  hasAvailable() {
+    const now = Date.now();
+    for (const key of this.keys) {
+      if (!this.cooldownUntil.has(key) || this.cooldownUntil.get(key) <= now) return true;
+    }
+    return false;
   }
 
   getNextKey() {
@@ -521,27 +525,32 @@ class ApiBalancer {
     const short = `${key.slice(0, 6)}...${key.slice(-4)}`;
     this.cooldownReason.set(key, "429");
 
-    // Start cooldown immediately if we have upstream timing (e.g. "Resets in 1 day"), or after threshold
-    if (resetSeconds > 0 || count >= CONSECUTIVE_429_THRESHOLD) {
-      let cdMs;
-      let label;
+    let cdMs;
+    let label;
 
-      if (resetSeconds > 0) {
-        cdMs = resetSeconds * 1000;
-        label = cdMs >= 86400000 ? `~${Math.round(cdMs / 86400000)}d` : `~${Math.round(cdMs / 3600000)}h`;
-      } else if (this.cooldownUntil.has(key) && this.cooldownUntil.get(key) > Date.now()) {
+    if (resetSeconds > 0) {
+      // Upstream-provided reset timing
+      cdMs = resetSeconds * 1000;
+      label = cdMs >= 86400000 ? `~${Math.round(cdMs / 86400000)}d` : `~${Math.round(cdMs / 3600000)}h`;
+    } else if (count >= CONSECUTIVE_429_THRESHOLD) {
+      // Threshold exceeded — long cooldown
+      if (this.cooldownUntil.has(key) && this.cooldownUntil.get(key) > Date.now()) {
         cdMs = COOLDOWN_429_SECOND;
         label = '~1 week';
       } else {
         cdMs = COOLDOWN_429_FIRST;
         label = '~5h';
       }
-
-      const until = Date.now() + cdMs;
-      this.cooldownUntil.set(key, until);
-      this.cooldownReason.set(key, "429");
-      warn(`[keys] ${short} in cooldown for ${label}${resetSeconds > 0 ? ` (upstream)` : ` after ${count} consecutive 429s`} (until ${new Date(until).toLocaleString()})`);
+    } else {
+      // Short cooldown to ensure next retry picks a different key
+      cdMs = COOLDOWN_429_RETRY;
+      label = '~30s';
     }
+
+    const until = Date.now() + cdMs;
+    this.cooldownUntil.set(key, until);
+    this.cooldownReason.set(key, "429");
+    warn(`[keys] ${short} in cooldown for ${label}${resetSeconds > 0 ? ` (upstream)` : count >= CONSECUTIVE_429_THRESHOLD ? ` after ${count} consecutive 429s` : ` (retry rotation)`} (until ${new Date(until).toLocaleString()})`);
     saveKeyState();
   }
 
@@ -595,8 +604,7 @@ class ApiBalancer {
 function withKey() {
   loadKeys();
   if (!_balancer) return _keys[0] || "";
-  const key = _balancer.getNextKey();
-  return key || _keys[0] || "";
+  return _balancer.getNextKey();
 }
 
 function report429(key, resetSeconds = 0) {
@@ -1350,11 +1358,12 @@ function isoNow() { return new Date().toISOString(); }
 // ── API Error ──
 
 export class APIError extends Error {
-  constructor(status, body, message) {
+  constructor(status, body, message, retriesExhausted = false) {
     super(message || `API ${status}`);
     this.status = status;
     this.body = body;
     this.name = "APIError";
+    this._retriesExhausted = retriesExhausted;
   }
 }
 
@@ -1382,6 +1391,20 @@ async function zenRequest(endpoint, body, opts = {}) {
   const isPoll = isPollModel(body.model);
   const isFree = !isPoll && isFreeTierModel(body.model);
   const isFm = !isPoll && isFreemiumModel(body.model);
+
+  // Circuit breaker: block NEW free/poll requests after a 429 (retries within chain still go through)
+  if ((isFree || isPoll) && _zen429Until > Date.now() && (opts.retries || 0) === 0) {
+    throw new APIError(429, "", "Zen free tier is throttled.", true);
+  }
+  // Gate concurrent free/poll requests — only one at a time to prevent hammering
+  if ((isFree || isPoll) && (opts.retries || 0) === 0) {
+    if (_zen429Until > Date.now()) {
+      if (config.requestLog) log(`[${isFree ? "zen" : "pol"}] gated — concurrent request blocked`);
+      throw new APIError(429, "", "Zen free tier is throttled.", true);
+    }
+    _zen429Until = Date.now() + 10000;
+  }
+
   const base = isPoll ? config.baseUrlPoll : ((isFree || isFm) ? config.baseUrlFree : config.baseUrl);
   const url = `${base}${endpoint}`;
   const key = withKey();
@@ -1413,12 +1436,17 @@ async function zenRequest(endpoint, body, opts = {}) {
   } else if (isFm) {
     if (key) {
       headers["Authorization"] = `Bearer ${key}`;
+    } else if (_balancer && !_balancer.hasAvailable()) {
+      throw new APIError(429, "", "All API keys are rate-limited. Please wait for cooldown to expire.");
     } else {
       throw new APIError(401, "", "Freemium models require an OpenCode API key. Configure OPENCODE_API_KEY or OPENCODE_API_KEYS.");
     }
   } else if (key && !isFree) {
     headers["Authorization"] = `Bearer ${key}`;
   } else if (!isFree) {
+    if (_balancer && !_balancer.hasAvailable()) {
+      throw new APIError(429, "", "All API keys are rate-limited. Please wait for cooldown to expire.");
+    }
     throw new APIError(401, "", "No API key configured. Free tier models can be used without a key.");
   }
 
@@ -1427,6 +1455,11 @@ async function zenRequest(endpoint, body, opts = {}) {
   if (!resp.ok) {
     const txt = await resp.text().catch(() => "");
     error(`[${provider}] ${resp.status}`);
+
+    // Circuit breaker: block free/poll requests after a Zen 429
+    if (resp.status === 429 && (isFree || isPoll)) {
+      _zen429Until = Date.now() + ZEN_429_COOLDOWN;
+    }
 
     // Extract detailed error from upstream JSON responses
     let upstreamMsg = "API error";
@@ -1454,11 +1487,9 @@ async function zenRequest(endpoint, body, opts = {}) {
       throw new APIError(mappedStatus, txt, upstreamMsg);
     }
 
-    // Retry: rotate key on auth/rate-limit errors, up to configurable max
-    if (key && (resp.status === 401 || resp.status === 429) && retries < maxRetries && retries < _keys.length) {
-      if (resp.status === 429) {
-        // Try to extract upstream reset seconds from response body
-        // Priority: monthly > weekly > rolling (only if rate-limited)
+    // Handle 429 (rate limit) — retry for all models (key rotation for paid, delay for free)
+    if (resp.status === 429 && retries < maxRetries) {
+      if (key && !isFree && !isPoll) {
         let resetSec = 0;
         try {
           const parsed = JSON.parse(txt);
@@ -1471,11 +1502,24 @@ async function zenRequest(endpoint, body, opts = {}) {
           }
         } catch {}
         report429(key, resetSec);
-      } else {
-        // Log upstream auth error detail before rotating
-        if (config.requestLog) log(`[${provider}] 401 on key — rotating: ${upstreamMsg}`);
-        if (_balancer) _balancer.mark401(key, upstreamMsg);
+
+        if (_balancer && !_balancer.hasAvailable()) {
+          throw new APIError(mappedStatus, txt, upstreamMsg, true);
+        }
       }
+
+      const tag = (isFree || isPoll) ? "(keyless)" : `${key.slice(0, 6)}...${key.slice(-4)}`;
+      const delay = (isFree || isPoll) ? 5000 : RETRY_DELAY_429;
+      if (config.requestLog) log(`[${provider}] retry ${retries + 1}/${maxRetries} after ${resp.status} (${tag})`);
+      await new Promise(r => setTimeout(r, delay));
+      return zenRequest(endpoint, body, { ...opts, retries: retries + 1 });
+    }
+
+    // Handle 401 (auth) — retry with key rotation only
+    if (key && resp.status === 401 && retries < maxRetries && retries < _keys.length) {
+      // Log upstream auth error detail before rotating
+      if (config.requestLog) log(`[${provider}] 401 on key — rotating: ${upstreamMsg}`);
+      if (_balancer) _balancer.mark401(key, upstreamMsg);
       if (config.requestLog) { const short = `${key.slice(0, 6)}...${key.slice(-4)}`; log(`[${provider}] retry ${retries + 1}/${maxRetries} after ${resp.status} (key ${short})`); }
       return zenRequest(endpoint, body, { ...opts, retries: retries + 1 });
     }
@@ -1863,7 +1907,15 @@ export async function* chatCompletion(req) {
     }
     logDone?.(Date.now() - t0);
   } catch (e) {
-    if (e instanceof APIError) throw e; // propagate HTTP errors to server.js
+    if (e instanceof APIError && e.status === 429) {
+      yield {
+        model: req.model, created_at: created,
+        message: { role: "assistant", content: "🚨 **Rate limit exceeded.** Please try again later." },
+        done: true, done_reason: "stop",
+      };
+      return;
+    }
+    if (e instanceof APIError) throw e;
     const base = isPollModel(info.id) ? config.baseUrlPoll : (isFreeTierModel(info.id) ? config.baseUrlFree : config.baseUrl);
     const fullUrl = `${base}/chat/completions`;
     error(`[stream] ${e.message} (${fullUrl})`);

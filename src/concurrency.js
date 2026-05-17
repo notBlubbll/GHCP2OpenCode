@@ -149,13 +149,16 @@ export async function retryWithBackoff(fn, options = {}) {
 }
 
 function _shouldRetry(err) {
-  if (err instanceof RateLimitError) return true;
+  // zenRequest handles its own 429 retries — don't double-retry
+  if (err?._retriesExhausted) return false;
+  if (err instanceof RateLimitError) return false;
   const status = err?.response?.status ?? err?.status ?? err?.statusCode;
-  if (status === 429) return true;
-  if (err instanceof Error) {
-    const msg = err.message.toLowerCase();
-    return /429|rate limit|too many requests|quota exceeded|resource_exhausted/i.test(msg);
-  }
+  if (status === 429) return false;
+  const msg = err?.message?.toLowerCase() || "";
+  if (/429|rate limit|too many requests|quota exceeded|resource_exhausted/i.test(msg)) return false;
+  // Retry on server errors (502/503/504) and network errors
+  if (status >= 500 && status < 600) return true;
+  if (err instanceof Error && /econnrefused|econnreset|enotfound|etimedout|socket|network/i.test(msg)) return true;
   return false;
 }
 

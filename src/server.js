@@ -47,7 +47,7 @@ import { compress } from "hono/compress";
 import { config, getModels, initModels, resolveModel, resolveModelMetadata, isKnownModel, chatCompletion, APIError, isSeparator, isFreeTierModel, isFreemiumModel, isPollModel, isM365Model, SEP_PAID, SEP_FREE, SEP_FREE_P, SEP_M365, refreshModels, validateFreeModels, bgFetchDone, getKeyStatus, fetchWithAgent, getThinkingModes, parseThinkingMode } from "./opencode-client.js";
 import { check as cacheCheck, store as cacheStore, cacheKey } from "./cache.js";
 import { ModelConcurrencyManager, RateLimitError, truncateToolMessagesInPayload, checkRequestBodySize } from "./concurrency.js";
-import { compactIdentity, compactToolInstructions, compactOllamaToolInstructions, compactCodeCompletionPrompt, compressMessages, buildToolRunSummary, condenseAfterTaskComplete } from "./token-optimizer.js";
+import { compactIdentity, compactToolInstructions, compactOllamaToolInstructions, compactCodeCompletionPrompt, compressMessages, compressHistory, buildToolRunSummary, condenseAfterTaskComplete } from "./token-optimizer.js";
 import { m365ChatCompletion, m365ChatCompletionStream, M365CopilotError } from "./m365-client.js";
 import { trackSession, touchSession, stopSession as keepaliveStopSession, shutdown as keepaliveShutdown, stats as keepaliveStats } from "./session-keepalive.js";
 import { handleServiceCommand, runAsService } from "./win-service.js";
@@ -467,6 +467,7 @@ const _workspaceSessions = new Map(); // `${workspaceRoot}|${model}` → { convI
 // Workspace summaries — compact task-completion summaries to inject into future sessions
 const _workspaceSummaries = new Map(); // workspaceRoot → { summary: string, timestamp, sessionId, model }
 const _taskCompletedSessions = new Map(); // convId → true (set when LLM finishes task_complete naturally)
+const _rateLimitedSessions = new Map();     // convId → { at: timestamp } (set when upstream returns 429)
 let _sessionCounter = 0;
 
 function _convId(messages, model, workspaceRoot) {
@@ -2191,6 +2192,15 @@ app.post("/v1/chat/completions", async c => {
   }
   reasoningCtx.sessionEntry.stopCount = 0;
 
+  // Rate-limit gate: if this session already hit a 429 recently, return 429
+  // immediately so VS stops retrying.
+  const rlEntry = _rateLimitedSessions.get(reasoningCtx.conv);
+  if (rlEntry && Date.now() - rlEntry.at < 30000) {
+    reasoningCtx.seslog(`[rate-limit] session throttled, returning 429`);
+    const errResp = apiErr(new APIError(429, "", "Rate limit exceeded for this session."));
+    return c.json(errResp.body, errResp.status);
+  }
+
   // Request body size guardrail (from antigravity-copilot enrichment)
   const sizeCheck = checkRequestBodySize(rawBody);
   if (sizeCheck.exceeds) {
@@ -2435,6 +2445,7 @@ app.post("/v1/chat/completions", async c => {
     // Check if the LLM is still actively working (last assistant has tool_calls
     // OR markdown-based tool patterns for VS/VS Insiders where tool_calls come as markdown)
     let lastAssistantHasTools = false;
+    let lastAssistantIsRateLimited = false;
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role === "assistant") {
         const content = typeof messages[i].content === "string" ? messages[i].content : "";
@@ -2442,10 +2453,16 @@ app.post("/v1/chat/completions", async c => {
           messages[i].tool_calls?.length ||
           /```tool\n\{|```json\s*\n\{|<function_calls>|## `[^`]+`\n```/.test(content)
         );
+        lastAssistantIsRateLimited = /rate limit( exceeded)?/i.test(content);
         break;
       }
     }
-    if (vsTaskCompleteNags >= 3 && !lastAssistantHasTools) {
+    const rlEntry2 = _rateLimitedSessions.get(reasoningCtx.conv);
+    if ((lastAssistantIsRateLimited || rlEntry2) && vsTaskCompleteNags >= 1) {
+      reasoningCtx.seslog(`\x1b[33m[LOOP-BREAK] VS nagged ${vsTaskCompleteNags}x after rate limit — returning 429\x1b[0m`);
+      const errResp = apiErr(new APIError(429, "", "Rate limit exceeded for this session."));
+      return c.json(errResp.body, errResp.status);
+    } else if (vsTaskCompleteNags >= 3 && !lastAssistantHasTools) {
       reasoningCtx.seslog(`\x1b[33m[LOOP-BREAK] VS nagged ${vsTaskCompleteNags}x, LLM idle — cutting session\x1b[0m`);
       filterNags = true;
     } else if (vsTaskCompleteNags >= 3 && lastAssistantHasTools) {
@@ -2564,6 +2581,11 @@ app.post("/v1/chat/completions", async c => {
     // Strip orphaned tool_calls before compression (prevents upstream 400)
     const { messages: validatedMessages, stripped: _strippedOrphaned } = _stripOrphanedToolCalls(apiMessages);
 
+    // Delta compression (KitPilot): strip historical VS context blocks, compact consumed tool outputs.
+    // Only for VS/VS Insiders clients where context blocks are 16KB+ per turn.
+    const isVSClient = vs2026 || vsInsiders || (clientTag && (clientTag.startsWith("vs") || clientTag.startsWith("vsi")));
+    let deltaMessages = isVSClient ? compressHistory(validatedMessages, true) : validatedMessages;
+
     // Apply prompt compression — auto-select best level per model tier
     let compLevel = config.compressionLevel;
     if (compLevel === "auto") {
@@ -2573,7 +2595,7 @@ app.post("/v1/chat/completions", async c => {
       else if (isFreeTierModel(goModel)) compLevel = "stacked";    // free tier — max savings
       else compLevel = "caveman";                                   // paid — preserve quality
     }
-    const compressedMessages = compressMessages(validatedMessages, compLevel, true);
+    const compressedMessages = compressMessages(deltaMessages, compLevel, true);
 
     let upstreamTools = vsTools || undefined;
     const ollamaReq = { model: goModel, messages: compressedMessages, stream: streamMode, tools: upstreamTools, clientTag, sessionId: reasoningCtx.sessionId };
@@ -2596,6 +2618,11 @@ app.post("/v1/chat/completions", async c => {
       // Checks BOTH the original incoming messages (always have VS's real results)
       // AND compressedMessages (post-processing) for resilience.
       let cacheBypassed = false;
+      // Cut session if cached task_complete is being replayed
+      if (toolCalls?.some(tc => tc.function?.name === "task_complete")) {
+        reasoningCtx.seslog(`\x1b[33m[cache] LOOP-BREAK: cached task_complete, cutting session\x1b[0m`);
+        return c.json(oaiResp(text || "Task complete.", undefined, "stop", model));
+      }
       if (toolCalls?.length) {
         const cachedIds = new Set(toolCalls.map(tc => tc.id));
         const cachedNames = new Set(toolCalls.map(tc => tc.function?.name).filter(Boolean));
@@ -2666,7 +2693,8 @@ app.post("/v1/chat/completions", async c => {
           });
         }
 
-        const resp = oaiResp(hasTools ? null : text, hasTools ? toolCalls : undefined, hasTools ? "tool_calls" : "stop", model);
+        const hasTC = toolCalls?.length && toolCalls.some(tc => tc.function?.name === "task_complete");
+        const resp = oaiResp(hasTools && !hasTC ? null : text, hasTools ? toolCalls : undefined, hasTools ? "tool_calls" : "stop", model);
         if (reasoningContent) {
           const choice = resp.choices[0];
           if (_displayReasoning) {
@@ -2678,6 +2706,7 @@ app.post("/v1/chat/completions", async c => {
         return c.json(resp);
       }
     }
+
     // Cache bypassed or not cached — going to upstream.
 
     // ── Stream mode: pipe directly from upstream async generator ──
@@ -2751,6 +2780,12 @@ app.post("/v1/chat/completions", async c => {
             }
           }
         } catch (e) {
+          if (e instanceof APIError && e.status === 429) {
+            _rateLimitedSessions.set(reasoningCtx.conv, { at: Date.now() });
+            await w({ error: { message: "Rate limit exceeded for this session.", type: "rate_limit_exceeded", code: "rate_limit_exceeded" } });
+            await s.write("data: [DONE]\n\n");
+            return;
+          }
           if (e instanceof APIError && e.status === 400 && /reasoning_content.*must be passed back/i.test(e.message)) {
             err(`  stream reasoning error: stripping thinking mode for next request`);
           }
@@ -2839,19 +2874,13 @@ app.post("/v1/chat/completions", async c => {
           result.push(chunk);
         }
         return result;
-      }, true);
+      }, false);
       _tool400Streak = 0;
     } catch (e) {
       if (e.name === "RateLimitError") {
+        _rateLimitedSessions.set(reasoningCtx.conv, { at: Date.now() });
         const errResp = apiErr(new APIError(429, e.body, e.message));
-        return c.json({
-          error: {
-            message: "Model temporarily unavailable",
-            details: "The upstream model quota is exhausted. Please wait a moment and try again.",
-            code: "rate_limit_exceeded",
-            retryable: true,
-          },
-        }, 503);
+        return c.json(errResp.body, errResp.status);
       }
       if (e instanceof APIError && e.status === 400 && /reasoning_content.*must be passed back/i.test(e.message)) {
         err(`  [reasoning] stripping thinking mode & retrying (reasoning_content missing in history)`);
@@ -2938,6 +2967,10 @@ app.post("/v1/chat/completions", async c => {
       if (ch.usage) usage = ch.usage;
     }
 
+    if (/rate limit/i.test(fullText)) {
+      _rateLimitedSessions.set(reasoningCtx.conv, { at: Date.now() });
+    }
+
     const rawFullText = fullText;
     const thinkResult = processThinkTags(fullText);
     let cleanText = thinkResult.content;
@@ -2946,8 +2979,9 @@ app.post("/v1/chat/completions", async c => {
     let allToolCalls = [];
 
     if (nativeCalls?.length) {
+      const hasTaskComplete = nativeCalls.some(tc => tc.function?.name === "task_complete");
       allToolCalls = nativeCalls.map(normalizeToolCall).filter(Boolean);
-      cleanText = "";
+      if (!hasTaskComplete) cleanText = "";
     } else if (vsTools?.length) {
       const extracted = extractToolCalls(fullText, getWorkspaceRoot(messages), messages);
       if (extracted.toolCalls.length) {
@@ -3042,14 +3076,15 @@ app.post("/v1/chat/completions", async c => {
       }
     }
 
-    const resp = oaiResp(hasTools ? null : cleanText, hasTools ? allToolCalls : undefined, hasTools ? "tool_calls" : "stop", model, usage);
+    const hasTaskComplete = allToolCalls.length && allToolCalls.some(tc => tc.function?.name === "task_complete");
+    const resp = oaiResp(hasTools && !hasTaskComplete ? null : cleanText, hasTools ? allToolCalls : undefined, hasTools ? "tool_calls" : "stop", model, usage);
     if (hasTools) debug(`${reasoningCtx.sessionPrefix} \x1b[35m[TOOLS-TO-VS] ${allToolCalls.map(tc => `${tc.function.name}(${tc.function.arguments})`).join(" \u2502 ")}\x1b[0m`);
     else debug(`${reasoningCtx.sessionPrefix} \x1b[35m[TEXT-TO-VS] ${(cleanText || "").slice(0, 200).replace(/\n/g,"\\n")}\x1b[0m`);
 
     // When LLM calls task_complete, summarize the completed task's tool calls
     // + results into a compact instructional summary. Store per workspace so
     // future sessions inherit context without the full tool history clutter.
-    const completedTask = hasTools && allToolCalls.some(tc => tc.function?.name === "task_complete");
+    const completedTask = hasTaskComplete || (hasTools && allToolCalls.some(tc => tc.function?.name === "task_complete"));
     if (completedTask) {
       // Mark session so the NEXT request condenses tool history
       _taskCompletedSessions.set(reasoningCtx.conv, true);
@@ -3093,6 +3128,11 @@ app.post("/v1/chat/completions", async c => {
       let tools = "?";
       try { tools = _toolNames(compressedMessages); } catch {}
       err(`  [400] tool error: ${tools} — ${e.message}`);
+    }
+    if (e instanceof APIError && e.status === 429) {
+      _rateLimitedSessions.set(reasoningCtx.conv, { at: Date.now() });
+      const errResp = apiErr(e);
+      return c.json(errResp.body, errResp.status);
     }
     err(`  Error: ${e.message}`);
     const errResp = apiErr(e);
@@ -3379,6 +3419,11 @@ app.post("/api/chat", async c => {
 
       const apiMessages = systemMsg ? [{ role: "system", content: systemMsg }, ...userMsgs] : userMsgs;
       const { messages: validatedMessages, stripped: _strippedOrphaned2 } = _stripOrphanedToolCalls(apiMessages);
+
+      // Delta compression (KitPilot): strip historical VS context blocks, compact consumed tool outputs
+      const isVSClient = clientTag === "vs" || clientTag === "vsi" || (clientTag && clientTag.startsWith("vs"));
+      let deltaMessages = isVSClient ? compressHistory(validatedMessages, true) : validatedMessages;
+
       let compLevel = config.compressionLevel;
       if (compLevel === "auto") {
         const msgCount = userMsgs.length;
@@ -3387,7 +3432,7 @@ app.post("/api/chat", async c => {
         else if (isFreeTierModel(model)) compLevel = "stacked";
         else compLevel = "caveman";
       }
-      const compressedMessages = compressMessages(validatedMessages, compLevel, true);
+      const compressedMessages = compressMessages(deltaMessages, compLevel, true);
       const reqBody = { model, messages: compressedMessages, stream: false, options: body.options, format: body.format, clientTag, tools: vsTools || undefined };
       if (body.chat_template_kwargs != null) reqBody.chat_template_kwargs = body.chat_template_kwargs;
       if (body.thinking_token_budget != null) reqBody.thinking_token_budget = body.thinking_token_budget;
@@ -3808,7 +3853,10 @@ function printTable(list) {
     const id = (m.model.replace(":latest", "")).length > 22
       ? (m.model.replace(":latest", "")).slice(0, 21) + "\u2026"
       : (m.model.replace(":latest", "")).padEnd(22);
-    const params = m.maxParams ? m.maxParams.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".").padEnd(7) : "-".padEnd(7);
+    const n = +m.maxParams;
+    const params = n
+      ? (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}K` : String(n)).padEnd(7)
+      : "-".padEnd(7);
     P(line(nameColor + name + nameReset + S + " \u2502 " + R + id + S + " \u2502 " + R + params + R));
   }
 }

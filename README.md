@@ -15,7 +15,7 @@ Ollama-emulating proxy that connects **GitHub Copilot Chat&Agent** to the [OpenC
 
 <table><tr>
 <td><img width="731" height="643" alt="image" src="https://github.com/user-attachments/assets/0185f535-1000-47ae-af70-ad3abdc9a43c" /></td>
-<td><img alt="Console paid mode" src="https://github.com/user-attachments/assets/dbb734c3-0f2e-4d9b-84b8-f11a2fc6fb1e"></td>
+<!--<td><img alt="Console paid mode" src="https://github.com/user-attachments/assets/dbb734c3-0f2e-4d9b-84b8-f11a2fc6fb1e"></td>-->
 </tr></table>
 
 **Agent mode** — tool calling with free and paid models:
@@ -23,6 +23,8 @@ Ollama-emulating proxy that connects **GitHub Copilot Chat&Agent** to the [OpenC
 <p align="center"><img alt="Free model agent mode" src="https://github.com/user-attachments/assets/04c37339-5b65-456d-a57f-7d7a442ea915"></p>
 
 <p align="center"><img alt="Paid model agent mode" src="https://github.com/user-attachments/assets/8e5311f4-6736-422e-8816-fbdc4d5413b0"></p>
+
+Chit-chat:
 
 ---
 

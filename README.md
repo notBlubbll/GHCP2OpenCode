@@ -1,5 +1,12 @@
 # gc2oc — GitHub Copilot to [OpenCode]
 
+```
+  █▀▀▀ █▀▀▀ ▀▀▀█ █▀▀█ █▀▀▀
+  █ ▀█ █    █▀▀▀ █░░█ █░░░
+  ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀
+github copilot proxy
+```
+
 Ollama-emulating proxy that connects **GitHub Copilot Chat&Agent** to the [OpenCode](https://opencode.ai) Zen + Go APIs + models.
 
 **No key needed** — free models work immediately. Add an API key in `.env` to unlock paid models *and* enable **freemium** mode (free models with API key auth). Full tool calling and streaming.
@@ -11,7 +18,7 @@ Ollama-emulating proxy that connects **GitHub Copilot Chat&Agent** to the [OpenC
 **Console** — model table, context lengths, key status, commands:
 
 <table><tr>
-<td><img width="731" height="643" alt="image" src="https://github.com/user-attachments/assets/0185f535-1000-47ae-af70-ad3abdc9a43c" />/td>
+<td><img width="731" height="643" alt="image" src="https://github.com/user-attachments/assets/0185f535-1000-47ae-af70-ad3abdc9a43c" /></td>
 <td><img alt="Console paid mode" src="https://github.com/user-attachments/assets/dbb734c3-0f2e-4d9b-84b8-f11a2fc6fb1e"></td>
 </tr></table>
 

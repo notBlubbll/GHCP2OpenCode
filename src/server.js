@@ -2,7 +2,8 @@
 if (typeof Bun === 'undefined') {
   globalThis.Bun = { env: process.env };
 }
-if (Bun.env.DEBUG) try { process.stderr.write(`[gc2oc] startup pid=${process.pid} argv=${JSON.stringify(process.argv)}\r\n`); } catch {}
+const _isDebug = () => { const v = Bun.env.DEBUG; return v === "1" || v === "true" || v === "yes"; };
+if (_isDebug()) try { process.stderr.write(`[gc2oc] startup pid=${process.pid} argv=${JSON.stringify(process.argv)}\r\n`); } catch {}
 
 // 1b. Crypto polyfill (Node.js < 19)
 if (typeof crypto === 'undefined' || typeof crypto.randomUUID !== 'function') {
@@ -43,14 +44,14 @@ import { Hono } from "hono";
 import { stream } from "hono/streaming";
 import { cors } from "hono/cors";
 import { compress } from "hono/compress";
-import { config, getModels, initModels, resolveModel, resolveModelMetadata, isKnownModel, chatCompletion, APIError, isSeparator, isFreeTierModel, isPollModel, isM365Model, SEP_PAID, SEP_FREE, SEP_FREE_P, SEP_M365, refreshModels, validateFreeModels, bgFetchDone, getKeyStatus, fetchWithAgent, getThinkingModes, parseThinkingMode } from "./opencode-client.js";
+import { config, getModels, initModels, resolveModel, resolveModelMetadata, isKnownModel, chatCompletion, APIError, isSeparator, isFreeTierModel, isFreemiumModel, isPollModel, isM365Model, SEP_PAID, SEP_FREE, SEP_FREE_P, SEP_M365, refreshModels, validateFreeModels, bgFetchDone, getKeyStatus, fetchWithAgent, getThinkingModes, parseThinkingMode } from "./opencode-client.js";
 import { check as cacheCheck, store as cacheStore, cacheKey } from "./cache.js";
 import { ModelConcurrencyManager, RateLimitError, truncateToolMessagesInPayload, checkRequestBodySize } from "./concurrency.js";
-import { compactIdentity, compactToolInstructions, compactOllamaToolInstructions, compactCodeCompletionPrompt, compressMessages } from "./token-optimizer.js";
+import { compactIdentity, compactToolInstructions, compactOllamaToolInstructions, compactCodeCompletionPrompt, compressMessages, buildToolRunSummary, condenseAfterTaskComplete } from "./token-optimizer.js";
 import { m365ChatCompletion, m365ChatCompletionStream, M365CopilotError } from "./m365-client.js";
 import { trackSession, touchSession, stopSession as keepaliveStopSession, shutdown as keepaliveShutdown, stats as keepaliveStats } from "./session-keepalive.js";
 import { handleServiceCommand, runAsService } from "./win-service.js";
-import { log, error as logErr, reqLog } from "./logger.js";
+import { log, error as logErr, debug, reqLog, enableDashboard, disableDashboard, onCommand, collapseBanner, redrawBanner } from "./logger.js";
 
 // ── Service command routing (early exit for install/uninstall) ──
 {
@@ -463,6 +464,9 @@ function _stripDisplayedThinking(content) {
 const _sessionRegistry = new Map(); // convId → { id, clientTag, createdAt, workspaceRoot }
 // Workspace continuity — track most recent session per workspace+model for cross-session context
 const _workspaceSessions = new Map(); // `${workspaceRoot}|${model}` → { convId, sessionId, lastSeen, clientTag }
+// Workspace summaries — compact task-completion summaries to inject into future sessions
+const _workspaceSummaries = new Map(); // workspaceRoot → { summary: string, timestamp, sessionId, model }
+const _taskCompletedSessions = new Map(); // convId → true (set when LLM finishes task_complete naturally)
 let _sessionCounter = 0;
 
 function _convId(messages, model, workspaceRoot) {
@@ -472,10 +476,85 @@ function _convId(messages, model, workspaceRoot) {
     if (role === "assistant" || role === "tool") break;
     if (role === "user") preAssistant.push(typeof m.content === "string" ? m.content : JSON.stringify(m.content));
   }
-  const anchor = preAssistant.join("\n") + "|" + (workspaceRoot || "");
+  const anchor = preAssistant.join("\n") + "|" + (workspaceRoot || "") + "|" + (model || "");
   let h = 5381;
   for (let i = 0; i < anchor.length; i++) h = ((h << 5) + h + anchor.charCodeAt(i)) | 0;
   return (h >>> 0).toString(36);
+}
+
+// ── Task completion summary ──
+// When LLM calls task_complete, boil down tool calls + results into a compact
+// instructional summary. Strips raw code/tool output, keeps only findings and
+// actions the LLM can parse as instructions.
+function _summarizeCompletedTask(messages) {
+  const findings = [];
+  const filesModified = new Set();
+  const filesRead = new Set();
+  let lastAssistantText = "";
+
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m.role === "assistant") {
+      // Collect tool calls
+      const tcs = m.tool_calls || [];
+      for (const tc of tcs) {
+        const fn = tc.function || {};
+        const name = fn.name || "";
+        let args = {};
+        try { args = typeof fn.arguments === "string" ? JSON.parse(fn.arguments) : (fn.arguments || {}); } catch {}
+        if (name === "create_file" || name === "write_to_file" || name === "write_file") {
+          if (args.filePath || args.path || args.filename) filesModified.add(args.filePath || args.path || args.filename);
+        } else if (name === "replace_in_file" || name === "replace_string_in_file" || name === "multi_replace_string_in_file") {
+          if (args.filePath || args.path) filesModified.add(args.filePath || args.path);
+        } else if (name === "remove_file" || name === "delete_file") {
+          if (args.filePath || args.path) filesModified.add(args.filePath || args.path);
+        } else if (name === "read_file" || name === "get_file" || name === "open_file") {
+          if (args.filePath || args.path || args.filename) filesRead.add(args.filePath || args.path || args.filename);
+        } else if (name === "grep_search" || name === "search_content" || name === "file_search") {
+          const q = args.query || args.pattern || args.search || "";
+          if (q) findings.push(`searched for "${q.slice(0, 80)}"`);
+        } else if (name === "find_symbol" || name === "search_symbol") {
+          const sym = args.symbolName || args.name || "";
+          if (sym) findings.push(`looked up symbol "${sym}"`);
+        } else if (name === "run_command_in_terminal" || name === "execute_command") {
+          const cmd = args.command || args.cmd || "";
+          if (cmd) findings.push(`ran: ${cmd.slice(0, 100)}`);
+        } else if (name === "task_complete" || name === "start_modernization") {
+          // skip — this is the completion marker itself
+        } else {
+          findings.push(`used ${name}()`);
+        }
+      }
+      // Capture assistant text for context
+      if (typeof m.content === "string" && m.content.trim()) {
+        lastAssistantText = m.content.trim().split("\n").filter(l => l.trim()).slice(0, 3).join(" ");
+      }
+    } else if (m.role === "tool") {
+      // Boil down tool results to key findings
+      const content = typeof m.content === "string" ? m.content : "";
+      if (!content) continue;
+      // Extract file paths mentioned in results
+      const pathRe = /([\w./\\-]+\.(?:js|ts|tsx|jsx|cs|py|java|go|rs|cpp|c|h|hpp|css|html|json|xml|yaml|yml|md|sql|sh|bat|cmd|ps1))/gi;
+      let match;
+      while ((match = pathRe.exec(content)) !== null) {
+        filesRead.add(match[1]);
+      }
+      // Extract error mentions
+      const errRe = /Error[:\s]+([^\n]{10,120})/g;
+      while ((match = errRe.exec(content)) !== null) {
+        findings.push(`error: ${match[1].trim().slice(0, 120)}`);
+      }
+    }
+  }
+
+  // Build compact summary
+  const parts = [];
+  if (filesModified.size > 0) parts.push(`Modified: ${[...filesModified].join(", ")}`);
+  if (filesRead.size > 0) parts.push(`Read: ${[...filesRead].slice(0, 8).join(", ")}${filesRead.size > 8 ? ` (+${filesRead.size - 8} more)` : ""}`);
+  if (findings.length > 0) parts.push(`Actions: ${findings.join("; ")}`);
+  if (lastAssistantText) parts.push(`Conclusion: ${lastAssistantText.slice(0, 300)}`);
+
+  return parts.length > 0 ? parts.join(". ") : "";
 }
 
 // ── Reasoning cache helpers (multi-tier key system, inspired by yxlao/deepseek-cursor-proxy) ──
@@ -560,26 +639,52 @@ function createReasoningContext(messages, model, workspaceRoot, clientTag, provi
   let cursor = 0;
 
   // ── Workspace continuity detection ──
-  const wsKey = workspaceRoot ? `${workspaceRoot}|${model}` : null;
+  let effectiveWorkspace = workspaceRoot;
+  // Fallback: if no workspace detected, inherit from the most recent session with same client family
+  // No time limit — workspace persists across the server lifetime
+  if (!effectiveWorkspace && clientTag) {
+    const family = clientTag.replace(/_.*$/, ""); // "vsi_e-18.7.0" → "vsi"
+    for (const [, entry] of [..._sessionRegistry].reverse()) {
+      const entryFamily = (entry.clientTag || "").replace(/_.*$/, "");
+      if (entryFamily === family && entry.workspaceRoot) {
+        effectiveWorkspace = entry.workspaceRoot;
+        debug(`[session] inherited workspace "${effectiveWorkspace}" from session ${entry.id}`);
+        break;
+      }
+    }
+  }
+  const wsKey = effectiveWorkspace ? `${effectiveWorkspace}|${model}` : null;
   const wsPrev = wsKey ? _workspaceSessions.get(wsKey) : null;
   const isContinuation = wsPrev && wsPrev.convId !== conv; // different conversation, same workspace+model
 
   let sessionEntry = _sessionRegistry.get(conv);
+  let reusedExisting = false;
+  const isNewSession = !sessionEntry;
   if (!sessionEntry) {
-    _sessionCounter++;
-    sessionEntry = { id: _sessionCounter, clientTag, createdAt: new Date().toISOString(), workspaceRoot, loopHits: 0, lastRequestTime: 0, cacheHitStreak: 0 };
-    _sessionRegistry.set(conv, sessionEntry);
-
     if (isContinuation) {
-      log(`\x1b[36mcontinued session ${_sessionCounter} \x1b[90m(was session ${wsPrev.sessionId}, \x1b[0m${clientTag}\x1b[90m, \x1b[0m${provider}/${model}\x1b[90m, \x1b[0m${workspaceRoot || "?"}\x1b[90m)\x1b[0m`);
+      // Reuse the previous session ID — the old session is gone, so this session
+      // continues as the same number instead of getting a new one.
+      _sessionCounter = wsPrev.sessionId;
+      sessionEntry = { id: _sessionCounter, clientTag, createdAt: new Date().toISOString(), workspaceRoot: effectiveWorkspace, lastRequestTime: 0, cacheHitStreak: 0, thinkFallbackStreak: 0, stopCount: 0 };
+      _sessionRegistry.set(conv, sessionEntry);
+      debug(`\x1b[36mcontinued session ${_sessionCounter} \x1b[90m(was session ${wsPrev.sessionId}, \x1b[0m${clientTag}\x1b[90m, \x1b[0m${provider}/${model}\x1b[90m, \x1b[0m${effectiveWorkspace || "?"}\x1b[90m)\x1b[0m`);
+      debug(`[session] NEW convId=${conv} wsRoot=${effectiveWorkspace || "(empty)"}`);
     } else {
-      log(`\x1b[36mnew session ${_sessionCounter} \x1b[90m(\x1b[0m${clientTag}\x1b[90m, \x1b[0m${provider}/${model}\x1b[90m, \x1b[0m${workspaceRoot || "?"}\x1b[90m)\x1b[0m`);
+      _sessionCounter++;
+      sessionEntry = { id: _sessionCounter, clientTag, createdAt: new Date().toISOString(), workspaceRoot: effectiveWorkspace, lastRequestTime: 0, cacheHitStreak: 0, thinkFallbackStreak: 0, stopCount: 0 };
+      _sessionRegistry.set(conv, sessionEntry);
+      log(`\x1b[36mnew session ${_sessionCounter} \x1b[90m(\x1b[0m${clientTag}\x1b[90m, \x1b[0m${provider}/${model}\x1b[90m, \x1b[0m${effectiveWorkspace || "?"}\x1b[90m)\x1b[0m`);
+      debug(`[session] NEW convId=${conv} wsRoot=${effectiveWorkspace || "(empty)"}`);
     }
+  } else if (!reusedExisting) {
+    debug(`[session] REUSE convId=${conv} sessionId=${sessionEntry.id}`);
+  } else {
+    debug(`\x1b[36mcontinued session ${sessionEntry.id} \x1b[90m(same client, active session reused, \x1b[0m${clientTag}\x1b[90m, \x1b[0m${provider}/${model}\x1b[90m, \x1b[0m${effectiveWorkspace || "?"}\x1b[90m)\x1b[0m`);
   }
 
   // Update workspace registry (always — tracks the most recent session per workspace+model)
   if (wsKey) {
-    _workspaceSessions.set(wsKey, { convId: conv, sessionId: _sessionCounter, lastSeen: new Date().toISOString(), clientTag });
+    _workspaceSessions.set(wsKey, { convId: conv, sessionId: sessionEntry.id, lastSeen: new Date().toISOString(), clientTag });
   }
 
   const sessionId = sessionEntry.id;
@@ -603,6 +708,7 @@ function createReasoningContext(messages, model, workspaceRoot, clientTag, provi
   return {
     conv,
     sessionId,
+    isNew: isNewSession,
     sessionPrefix,
     seslog,
     workspaceContinuity: isContinuation ? { previousSessionId: wsPrev.sessionId, workspaceRoot } : null,
@@ -806,12 +912,23 @@ function _dumpToolSchemas(tools) {
   }
 }
 
+const _normLog = (msg) => { debug(msg); };
+
+// Fix JSON.parse damage on path fields: \n → \n (newline), \t → \t (tab), \r → \r (carriage return)
+// AI writes Windows paths like "dir\ntl\file" but JSON.parse interprets \n as newline, \t as tab
+function _fixPathEscapes(s) {
+  return s.replace(/\n/g, '\\n').replace(/\t/g, '\\t').replace(/\r/g, '\\r');
+}
+
 function normalizeToolCall(tc) {
    const name = tc.function?.name || "";
   try {
     const raw = tc.function.arguments || "{}";
     // Pre-sanitize: fix common AI malformed JSON (unquoted identifiers in arrays/values)
     let json = raw;
+    // Fix invalid escape sequences: \_ → \\_ (AI writes \_ but JSON only allows \\, \n, \t, \", etc.)
+    // Use negative lookbehind to avoid matching \\_ (already valid: escaped backslash + _)
+    json = json.replace(/(?<!\\)\\([^"\\\/bfnrtu])/g, '\\\\$1');
     // "queries": foo → "queries":["foo"]
     json = json.replace(/"queries"\s*:\s*([^\[",}\s][^,}]*)/, (_, v) => {
       const t = v.trim();
@@ -840,25 +957,29 @@ function normalizeToolCall(tc) {
     // ── Confirmed VS schemas (VS Insiders 18.7) ──
     if (/^get_file$/i.test(name)) {
       // VS: required ["filename","startLine","endLine"]  properties: filename,startLine,endLine,includeLineNumbers
-      safe.filename = String(args.filename ?? args.filePath ?? args.path ?? args.uri ?? args.resource ?? "");
+      safe.filename = _fixPathEscapes(String(args.filename ?? args.filePath ?? args.path ?? args.uri ?? args.resource ?? ""));
       safe.startLine = (typeof args.startLine === "number" && args.startLine >= 1) ? args.startLine : 1;
       safe.endLine = (typeof args.endLine === "number" && args.endLine >= safe.startLine) ? args.endLine : 999999;
+      // Expand small ranges to full file — prevents line-by-line reads
+      if (safe.endLine < 200 && safe.endLine !== 999999) safe.endLine = 999999;
       if (typeof args.includeLineNumbers === "boolean") safe.includeLineNumbers = args.includeLineNumbers;
     } else if (/^read_file$/i.test(name)) {
       // VSCode: required ["filePath","startLine","endLine"]  properties: filePath,startLine,endLine
-      safe.filePath = String(args.filePath ?? args.filename ?? args.path ?? args.uri ?? "");
+      safe.filePath = _fixPathEscapes(String(args.filePath ?? args.filename ?? args.path ?? args.uri ?? ""));
       safe.startLine = (typeof args.startLine === "number" && args.startLine >= 1) ? args.startLine : 1;
       safe.endLine = (typeof args.endLine === "number" && args.endLine >= safe.startLine) ? args.endLine : 999999;
+      // Expand small ranges to full file — prevents line-by-line reads
+      if (safe.endLine < 200 && safe.endLine !== 999999) safe.endLine = 999999;
     } else if (/^(grep_search|search_content|search_file)$/i.test(name)) {
       // required: ["query","isRegexp","includePattern","maxResults"]  properties: query,isRegexp,includePattern,maxResults
       safe.query = String(args.query ?? args.pattern ?? args.search ?? args.searchTerm ?? "");
       safe.isRegexp = (typeof args.isRegexp === "boolean") ? args.isRegexp : (typeof args.regex === "boolean" ? args.regex : false);
       safe.includePattern = args.includePattern ?? args.include ?? args.fileTypes ?? args.glob ?? null;
-      if (safe.includePattern !== null) safe.includePattern = String(safe.includePattern);
+      if (safe.includePattern !== null) safe.includePattern = _fixPathEscapes(String(safe.includePattern));
       safe.maxResults = (typeof args.maxResults === "number" && args.maxResults >= 1) ? args.maxResults : 20;
     } else if (/^replace_string_in_file$/i.test(name)) {
       // required: ["filePath","oldString","newString"]  properties: filePath,oldString,newString
-      safe.filePath = String(args.filePath ?? args.path ?? args.filename ?? args.file ?? "");
+      safe.filePath = _fixPathEscapes(String(args.filePath ?? args.path ?? args.filename ?? args.file ?? ""));
       safe.oldString = String(args.oldString ?? args.old_string ?? args.old_str ?? args.search ?? args.old_text ?? "");
       safe.newString = String(args.newString ?? args.new_string ?? args.new_str ?? args.replace ?? args.new_text ?? "");
     } else if (/^multi_replace_string_in_file$/i.test(name)) {
@@ -867,7 +988,7 @@ function normalizeToolCall(tc) {
       if (Array.isArray(list)) {
         safe.replacements = list.map(r => {
           const e = {};
-          e.filePath = String(r.filePath ?? r.filepath ?? r.path ?? r.filename ?? r.file ?? "");
+          e.filePath = _fixPathEscapes(String(r.filePath ?? r.filepath ?? r.path ?? r.filename ?? r.file ?? ""));
           e.oldString = String(r.oldString ?? r.old_str ?? r.search ?? r.old_text ?? r.find ?? r.from ?? "");
           e.newString = String(r.newString ?? r.new_str ?? r.replace ?? r.new_text ?? r.to ?? "");
           return e;
@@ -880,7 +1001,7 @@ function normalizeToolCall(tc) {
       safe.explanation = String(args.explanation ?? "");
     } else if (/^create_file$/i.test(name)) {
       // required: ["filePath","content"]  properties: filePath,content
-      safe.filePath = String(args.filePath ?? args.file_path ?? args.path ?? args.filename ?? "").replace(/\\/g, "/");
+      safe.filePath = _fixPathEscapes(String(args.filePath ?? args.file_path ?? args.path ?? args.filename ?? "")).replace(/\\/g, "/");
       safe.content = String(args.content ?? args.contents ?? args.text ?? args.code ?? "");
       // Preserve any extra fields VS might require beyond the schema
       for (const k of Object.keys(args)) {
@@ -888,7 +1009,7 @@ function normalizeToolCall(tc) {
       }
     } else if (/^remove_file|delete_file(s)?$/i.test(name)) {
       // required: ["filePath"]  properties: filePath
-      safe.filePath = String(args.filePath ?? args.path ?? args.filename ?? "");
+      safe.filePath = _fixPathEscapes(String(args.filePath ?? args.path ?? args.filename ?? ""));
     } else if (/^run_command_in_terminal|execute_command$/i.test(name)) {
       // required: ["command","summary","background"]  properties: command,summary,background
       safe.command = String(args.command ?? args.cmd ?? "");
@@ -896,163 +1017,14 @@ function normalizeToolCall(tc) {
       safe.background = (typeof args.background === "boolean") ? args.background : (typeof args.runInBackground === "boolean" ? args.runInBackground : false);
     } else if (/^get_background_terminal_output$/i.test(name)) {
       // required: ["terminal_id","headLines","tailLines","stop","waitMs"]  properties: terminal_id,headLines,tailLines,stop,waitMs
-      safe.terminal_id = String(args.terminal_id ?? args.terminalId ?? args.terminal ?? "");
+      safe.terminal_id = _fixPathEscapes(String(args.terminal_id ?? args.terminalId ?? args.terminal ?? ""));
       safe.headLines = (typeof args.headLines === "number") ? args.headLines : 0;
       safe.tailLines = (typeof args.tailLines === "number") ? args.tailLines : 0;
       safe.stop = (typeof args.stop === "boolean") ? args.stop : false;
       safe.waitMs = (typeof args.waitMs === "number") ? args.waitMs : (typeof args.timeout === "number" ? args.timeout : 0);
-    } else if (/^(code_search|search_code|semantic_search)$/i.test(name)) {
-      // required: ["searchQueries"]  properties: searchQueries
-      safe.searchQueries = args.searchQueries ?? args.queries ?? args.query ?? args.search ?? [];
-      if (!Array.isArray(safe.searchQueries)) safe.searchQueries = [String(safe.searchQueries ?? "")];
-    } else if (/^(file_search|search_files|find_files|glob_search|list_files)$/i.test(name)) {
-      // required: ["queries","maxResults"]  properties: queries,maxResults
-      safe.queries = args.queries ?? args.query ?? args.pattern ?? [];
-      if (!Array.isArray(safe.queries)) safe.queries = [String(safe.queries ?? "")];
-      safe.maxResults = (typeof args.maxResults === "number" && args.maxResults >= 1) ? args.maxResults : 20;
-    } else if (/^(get_files_in_project|list_project_files|get_project_files|list_files_in_project)$/i.test(name)) {
-      // required: ["projectPath"]  properties: projectPath
-      safe.projectPath = String(args.projectPath ?? args.projectName ?? args.project ?? args.name ?? args.project_name ?? "");
-    } else if (/^(get_projects_in_solution)$/i.test(name)) {
-      // required: []  properties: []
-      // no-op — just return the safe empty object
-    } else if (/^(run_build|build)$/i.test(name)) {
-      // required: []  properties: []
-      // no-op
-    } else if (/^(run_tests|execute_tests)$/i.test(name)) {
-      // required: ["filterTypes","filterValues"]  properties: filterTypes,filterValues
-      safe.filterTypes = args.filterTypes ?? args.filter_types ?? [];
-      if (!Array.isArray(safe.filterTypes)) safe.filterTypes = [String(safe.filterTypes ?? "")];
-      safe.filterValues = args.filterValues ?? args.filter_values ?? args.testName ?? args.test ?? [];
-      if (!Array.isArray(safe.filterValues)) safe.filterValues = [String(safe.filterValues ?? "")];
-    } else if (/^(get_tests|list_tests|discover_tests)$/i.test(name)) {
-      // required: ["filterTypes","filterValues"]  properties: filterTypes,filterValues
-      safe.filterTypes = args.filterTypes ?? args.filter_types ?? [];
-      if (!Array.isArray(safe.filterTypes)) safe.filterTypes = [String(safe.filterTypes ?? "")];
-      safe.filterValues = args.filterValues ?? args.filter_values ?? args.filePath ?? args.projectName ?? [];
-      if (!Array.isArray(safe.filterValues)) safe.filterValues = [String(safe.filterValues ?? "")];
-    } else if (/^(get_errors|list_errors|get_diagnostics)$/i.test(name)) {
-      // required: ["filePaths"]  properties: filePaths
-      safe.filePaths = args.filePaths ?? args.filePath ?? [];
-      if (!Array.isArray(safe.filePaths)) safe.filePaths = [String(safe.filePaths ?? "")];
-    } else if (/^get_output_window_logs$/i.test(name)) {
-      // required: ["paneId"]  properties: paneId
-      safe.paneId = String(args.paneId ?? args.outputPane ?? args.pane ?? "");
-    } else if (/^get_web_pages$/i.test(name)) {
-      // required: ["urls"]  properties: urls
-      safe.urls = args.urls ?? args.url ?? [];
-      if (!Array.isArray(safe.urls)) safe.urls = [String(safe.urls ?? "")];
-    } else if (/^(find_symbol|search_symbol)$/i.test(name)) {
-      // Actual VS schema (live dump): required ["navigationType","filepath","symbolName","lineText"]
-      // navigationType: 0=goToDefinition, 1=findReferences — must be integer, NOT string
-      const q = String(args.query ?? args.symbolName ?? args.symbol ?? args.name ?? "");
-      safe.symbolName = q;
-      safe.navigationType = typeof args.navigationType === "number" ? args.navigationType
-        : (typeof args.navType === "number" ? args.navType
-        : (typeof args.type === "number" ? args.type : 1));
-      safe.filepath = String(args.filepath ?? args.filePath ?? args.filename ?? "");
-      safe.lineText = String(args.lineText ?? args.line ?? args.text ?? "");
-    } else if (/^nuget_get_latest_package_version$/i.test(name)) {
-      // required: ["solutionDirectory","packageName","includePrerelease"]  properties: solutionDirectory,packageName,includePrerelease
-      safe.solutionDirectory = String(args.solutionDirectory ?? args.solution ?? "");
-      safe.packageName = String(args.packageName ?? args.package ?? args.name ?? args.id ?? "");
-      safe.includePrerelease = (typeof args.includePrerelease === "boolean") ? args.includePrerelease : false;
-    } else if (/^nuget_get_package_context$/i.test(name)) {
-      // required: ["solutionDirectory","packageName","packageVersion"]  properties: solutionDirectory,packageName,packageVersion
-      safe.solutionDirectory = String(args.solutionDirectory ?? args.solution ?? "");
-      safe.packageName = String(args.packageName ?? args.package ?? args.name ?? args.id ?? "");
-      safe.packageVersion = String(args.packageVersion ?? args.version ?? "");
-    } else if (/^nuget_upgrade_packages_to_latest$/i.test(name)) {
-      // required: ["solutionDirectory","projectPaths","includeVulnerable","includePrerelease"]
-      safe.solutionDirectory = String(args.solutionDirectory ?? args.solution ?? "");
-      safe.projectPaths = args.projectPaths ?? args.projectPath ?? args.projectName ?? [];
-      if (!Array.isArray(safe.projectPaths)) safe.projectPaths = [String(safe.projectPaths ?? "")];
-      safe.includeVulnerable = (typeof args.includeVulnerable === "boolean") ? args.includeVulnerable : false;
-      safe.includePrerelease = (typeof args.includePrerelease === "boolean") ? args.includePrerelease : false;
-    } else if (/^nuget_fix_vulnerable_packages$/i.test(name)) {
-      // required: ["solutionDirectory","projectPaths","includePrerelease"]
-      safe.solutionDirectory = String(args.solutionDirectory ?? args.solution ?? "");
-      safe.projectPaths = args.projectPaths ?? args.projectPath ?? args.projectName ?? [];
-      if (!Array.isArray(safe.projectPaths)) safe.projectPaths = [String(safe.projectPaths ?? "")];
-      safe.includePrerelease = (typeof args.includePrerelease === "boolean") ? args.includePrerelease : false;
-    } else if (/^(plan)$/i.test(name)) {
-      // required: ["planMarkdown"]  properties: planMarkdown
-      safe.planMarkdown = String(args.planMarkdown ?? args.task ?? args.plan ?? "");
-    } else if (/^(adapt_plan)$/i.test(name)) {
-      // required: ["observation"]  properties: observation
-      safe.observation = String(args.observation ?? args.changes ?? args.note ?? "");
-    } else if (/^(update_plan_progress)$/i.test(name)) {
-      // required: ["stepId","status","message","autoAdvance"]  properties: stepId,status,message,autoAdvance
-      safe.stepId = String(args.stepId ?? args.step ?? "");
-      safe.status = String(args.status ?? "in-progress");
-      safe.message = String(args.message ?? "");
-      safe.autoAdvance = (typeof args.autoAdvance === "boolean") ? args.autoAdvance : true;
-    } else if (/^(record_observation)$/i.test(name)) {
-      // required: ["observation"]  properties: observation
-      safe.observation = String(args.observation ?? args.note ?? args.finding ?? "");
-    } else if (/^(finish_plan)$/i.test(name)) {
-      // required: []  properties: []
-      // no-op
-    } else if (/^(signal_plan_ready)$/i.test(name)) {
-      // required: ["planTitle"]  properties: planTitle
-      safe.planTitle = String(args.planTitle ?? args.title ?? args.name ?? "");
-    } else if (/^(clarify_requirements)$/i.test(name)) {
-      // required: ["questions"]  properties: questions
-      safe.questions = args.questions ?? args.question ?? [];
-      if (!Array.isArray(safe.questions)) safe.questions = [String(safe.questions ?? "")];
-    } else if (/^(detect_memories)$/i.test(name)) {
-      // required: ["memory","confidence"]  properties: memory,confidence
-      safe.memory = String(args.memory ?? args.query ?? args.text ?? "");
-      safe.confidence = (typeof args.confidence === "number") ? args.confidence : 0.5;
-    } else if (/^(profiler_agent)$/i.test(name)) {
-      // required: ["reason"]  properties: reason
-      safe.reason = String(args.reason ?? args.prompt ?? args.query ?? args.question ?? "");
-    } else if (/^(start_modernization|task_complete)$/i.test(name)) {
-      // required: []  properties: []
-      // no-op
-    } else if (/^(query_azure_resource_graph)$/i.test(name)) {
-      // required: ["prompt"]  properties: prompt
-      safe.prompt = String(args.prompt ?? args.query ?? "");
-    } else if (/^(run_subagent)$/i.test(name)) {
-      // required: ["prompt","description","agentName"]  properties: prompt,description,agentName
-      safe.prompt = String(args.prompt ?? args.task ?? "");
-      safe.description = String(args.description ?? args.desc ?? "");
-      safe.agentName = String(args.agentName ?? args.agent ?? args.name ?? "");
-    } else if (/^(search_agent)$/i.test(name)) {
-      // required: ["query","description","details"]  properties: query,description,details
-      safe.query = String(args.query ?? args.search ?? "");
-      safe.description = String(args.description ?? args.desc ?? "");
-      safe.details = String(args.details ?? args.info ?? "");
-    } else if (/^Azure_MCP_Server_/i.test(name)) {
-      if (args.intent != null) safe.intent = String(args.intent);
-      if (args.command != null) safe.command = String(args.command);
-      if (args.parameters != null) safe.parameters = args.parameters;
-      if (args.learn != null) safe.learn = String(args.learn);
-      if (args.tenant != null) safe.tenant = String(args.tenant);
-      if (args.subscription != null) safe.subscription = String(args.subscription);
-      if (args["resource-group"] != null) safe["resource-group"] = String(args["resource-group"]);
-      if (args["cli-type"] != null) safe["cli-type"] = String(args["cli-type"]);
-      if (args["auth-method"] != null) safe["auth-method"] = String(args["auth-method"]);
-      if (args["retry-delay"] != null) safe["retry-delay"] = String(args["retry-delay"]);
-      if (args["retry-max-delay"] != null) safe["retry-max-delay"] = String(args["retry-max-delay"]);
-      if (typeof args["retry-max-retries"] === "number") safe["retry-max-retries"] = args["retry-max-retries"];
-      if (args["retry-mode"] != null) safe["retry-mode"] = String(args["retry-mode"]);
-      if (args["retry-network-timeout"] != null) safe["retry-network-timeout"] = String(args["retry-network-timeout"]);
-    // ── VSCode Copilot tools ──
-    } else if (/^list_dir$/i.test(name)) {
-      // required: ["path"]  properties: path
-      safe.path = String(args.path ?? args.dirPath ?? "");
-    } else if (/^create_directory$/i.test(name)) {
-      // required: ["dirPath"]  properties: dirPath
-      safe.dirPath = String(args.dirPath ?? args.path ?? "");
-    } else if (/^insert_edit_into_file$/i.test(name)) {
-      // required: ["explanation","filePath","code"]  properties: explanation,filePath,code
-      safe.explanation = String(args.explanation ?? "");
-      safe.filePath = String(args.filePath ?? args.path ?? args.filename ?? "");
-      safe.code = String(args.code ?? args.content ?? args.text ?? "");
-    } else if (/^(run_in_terminal|send_to_terminal)$/i.test(name)) {
-      // run_in_terminal: required ["command","explanation","goal","mode"]  send_to_terminal: required ["id","command"]
-      safe.command = String(args.command ?? args.cmd ?? "");
+    } else if (/^run_command_in_terminal|execute_command$/i.test(name)) {
+      // required: ["command","summary","background"]  properties: command,summary,background
+      safe.command = _fixPathEscapes(String(args.command ?? args.cmd ?? ""));
       if (args.id != null) safe.id = String(args.id);
       if (args.explanation != null) safe.explanation = String(args.explanation);
       if (args.goal != null) safe.goal = String(args.goal);
@@ -1087,7 +1059,7 @@ function normalizeToolCall(tc) {
     } else if (/^memory$/i.test(name)) {
       // required: ["command"]  properties: command,path,file_text,old_str,new_str,...
       safe.command = String(args.command ?? "");
-      if (args.path != null) safe.path = String(args.path);
+      if (args.path != null) safe.path = _fixPathEscapes(String(args.path));
       if (args.file_text != null) safe.file_text = String(args.file_text);
       if (args.old_str != null) safe.old_str = String(args.old_str);
       if (args.new_str != null) safe.new_str = String(args.new_str);
@@ -1100,14 +1072,14 @@ function normalizeToolCall(tc) {
       // required: ["symbol","lineContent"]  properties: symbol,uri,filePath,lineContent
       safe.symbol = String(args.symbol ?? args.symbolName ?? args.query ?? "");
       safe.lineContent = String(args.lineContent ?? args.line ?? "");
-      if (args.filePath != null) safe.filePath = String(args.filePath);
+      if (args.filePath != null) safe.filePath = _fixPathEscapes(String(args.filePath));
       if (args.uri != null) safe.uri = String(args.uri);
     } else if (/^vscode_renameSymbol$/i.test(name)) {
       // required: ["symbol","newName","lineContent"]  properties: symbol,newName,uri,filePath,lineContent
       safe.symbol = String(args.symbol ?? "");
       safe.newName = String(args.newName ?? args.new_name ?? "");
       safe.lineContent = String(args.lineContent ?? args.line ?? "");
-      if (args.filePath != null) safe.filePath = String(args.filePath);
+      if (args.filePath != null) safe.filePath = _fixPathEscapes(String(args.filePath));
       if (args.uri != null) safe.uri = String(args.uri);
     } else if (/^vscode_askQuestions$/i.test(name)) {
       // required: ["questions"]  properties: questions
@@ -1146,7 +1118,7 @@ function normalizeToolCall(tc) {
     }
 
     const fixed = JSON.stringify(safe);
-    if (name) log(`\x1b[35m[normalize] ${name} RAW: ${raw} → ${fixed}\x1b[0m`);
+    if (name) _normLog(`\x1b[35m[normalize] ${name} RAW: ${raw} → ${fixed}\x1b[0m`);
     return { ...tc, function: { ...tc.function, arguments: fixed } };
   } catch (e) {
     const raw2 = tc.function?.arguments;
@@ -1164,7 +1136,7 @@ function normalizeToolCall(tc) {
         const ctMatch = !btContent ? raw2.match(/"content"\s*:\s*"((?:[^"\\]|\\.)*)/) : null;
         safe.content = btContent || (ctMatch ? ctMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "");
         if (safe.filePath && safe.content.length > 0) {
-          log(`\x1b[33m[create_file] salvaged path=${safe.filePath} contentLen=${safe.content.length}\x1b[0m`);
+          _normLog(`\x1b[33m[create_file] salvaged path=${safe.filePath} contentLen=${safe.content.length}\x1b[0m`);
           const fixed = JSON.stringify(safe);
           return { ...tc, function: { ...tc.function, arguments: fixed } };
         }
@@ -1181,7 +1153,7 @@ function normalizeToolCall(tc) {
         const elMatch = raw2.match(/"endLine"\s*:\s*(\d+)/);
         safe.endLine = elMatch ? parseInt(elMatch[1], 10) : 999999;
         if (safe.filename) {
-          log(`\x1b[33m[get_file] salvaged filename=${safe.filename} startLine=${safe.startLine} endLine=${safe.endLine}\x1b[0m`);
+          _normLog(`\x1b[33m[get_file] salvaged filename=${safe.filename} startLine=${safe.startLine} endLine=${safe.endLine}\x1b[0m`);
           return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
         }
       } catch {}
@@ -1196,7 +1168,7 @@ function normalizeToolCall(tc) {
         const nsMatch = raw2.match(/"(?:newString|new_string|new_str|new|replace)"\s*:\s*"((?:[^"\\]|\\.)*)/);
         safe.newString = nsMatch ? nsMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "";
         if (safe.filePath && (safe.oldString || safe.newString)) {
-          log(`\x1b[33m[replace_string_in_file] salvaged path=${safe.filePath} oldLen=${safe.oldString.length} newLen=${safe.newString.length}\x1b[0m`);
+          _normLog(`\x1b[33m[replace_string_in_file] salvaged path=${safe.filePath} oldLen=${safe.oldString.length} newLen=${safe.newString.length}\x1b[0m`);
           return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
         }
       } catch {}
@@ -1212,7 +1184,7 @@ function normalizeToolCall(tc) {
             oldString: osMatch ? osMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "",
             newString: nsMatch ? nsMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "",
           };
-          log(`\x1b[33m[multi_replace_string_in_file] salvaged 1 replacement path=${rep.filePath}\x1b[0m`);
+          _normLog(`\x1b[33m[multi_replace_string_in_file] salvaged 1 replacement path=${rep.filePath}\x1b[0m`);
           return { ...tc, function: { ...tc.function, arguments: JSON.stringify({ replacements: [rep] }) } };
         }
       } catch {}
@@ -1225,7 +1197,7 @@ function normalizeToolCall(tc) {
         const cdMatch = raw2.match(/"code"\s*:\s*"((?:[^"\\]|\\.)*)/);
         safe.code = cdMatch ? cdMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "";
         if (safe.filePath && safe.code.length > 0) {
-          log(`\x1b[33m[insert_edit_into_file] salvaged path=${safe.filePath} codeLen=${safe.code.length}\x1b[0m`);
+          _normLog(`\x1b[33m[insert_edit_into_file] salvaged path=${safe.filePath} codeLen=${safe.code.length}\x1b[0m`);
           return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
         }
       } catch {}
@@ -1239,7 +1211,7 @@ function normalizeToolCall(tc) {
         safe.summary = sumMatch ? sumMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\").trim() : "";
         safe.background = /"background"\s*:\s*true/i.test(raw2);
         if (safe.command) {
-          log(`\x1b[33m[${name}] salvaged command="${safe.command.slice(0,60)}${safe.command.length > 60 ? "..." : ""}" summary="${safe.summary.slice(0,40)}${safe.summary.length > 40 ? "..." : ""}" background=${safe.background}\x1b[0m`);
+          _normLog(`\x1b[33m[${name}] salvaged command="${safe.command.slice(0,60)}${safe.command.length > 60 ? "..." : ""}" summary="${safe.summary.slice(0,40)}${safe.summary.length > 40 ? "..." : ""}" background=${safe.background}\x1b[0m`);
           return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
         }
       } catch {}
@@ -1264,7 +1236,7 @@ function normalizeToolCall(tc) {
         const mrMatch = raw2.match(/"maxResults"\s*:\s*(\d+)/);
         safe.maxResults = mrMatch ? parseInt(mrMatch[1], 10) : null;
         if (safe.query || safe.includePattern) {
-          log(`\x1b[33m[${name}] salvaged query="${safe.query}" isRegexp=${safe.isRegexp} includePattern=${safe.includePattern} maxResults=${safe.maxResults}\x1b[0m`);
+          _normLog(`\x1b[33m[${name}] salvaged query="${safe.query}" isRegexp=${safe.isRegexp} includePattern=${safe.includePattern} maxResults=${safe.maxResults}\x1b[0m`);
           return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
         }
       } catch {}
@@ -1286,7 +1258,7 @@ function normalizeToolCall(tc) {
         const ltMatch = raw2.match(/"lineText"\s*:\s*"((?:[^"\\]|\\.)*)"/) || raw2.match(/"lineText"\s*:\s*"((?:[^"\\]|\\.)*)/);
         safe.lineText = ltMatch ? ltMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\") : "";
         if (safe.symbolName) {
-          log(`\x1b[33m[${name}] salvaged symbolName="${safe.symbolName.slice(0,40)}" navigationType=${safe.navigationType} filepath=${safe.filepath}\x1b[0m`);
+          _normLog(`\x1b[33m[${name}] salvaged symbolName="${safe.symbolName.slice(0,40)}" navigationType=${safe.navigationType} filepath=${safe.filepath}\x1b[0m`);
           return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
         }
       } catch {}
@@ -1301,7 +1273,7 @@ function normalizeToolCall(tc) {
         const elMatch = raw2.match(/"endLine"\s*:\s*(\d+)/);
         safe.endLine = elMatch ? parseInt(elMatch[1], 10) : 999999;
         if (safe.filePath) {
-          log(`\x1b[33m[read_file] salvaged filePath=${safe.filePath} startLine=${safe.startLine} endLine=${safe.endLine}\x1b[0m`);
+          _normLog(`\x1b[33m[read_file] salvaged filePath=${safe.filePath} startLine=${safe.startLine} endLine=${safe.endLine}\x1b[0m`);
           return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
         }
       } catch {}
@@ -1335,7 +1307,7 @@ function normalizeToolCall(tc) {
         safe.filterTypes = ft;
         safe.filterValues = fv;
         if (ft.length || fv.length) {
-          log(`\x1b[33m[${name}] salvaged filterTypes=[${ft.join(",")}] filterValues=[${fv.join(",")}]\x1b[0m`);
+          _normLog(`\x1b[33m[${name}] salvaged filterTypes=[${ft.join(",")}] filterValues=[${fv.join(",")}]\x1b[0m`);
           return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
         }
       } catch {}
@@ -1364,7 +1336,7 @@ function normalizeToolCall(tc) {
         }
         if (terms.length) {
           safe.terms = terms;
-          log(`\x1b[33m[lookup_vs] salvaged terms=[${terms.map(t => t.slice(0,40)).join(",")}]\x1b[0m`);
+          _normLog(`\x1b[33m[lookup_vs] salvaged terms=[${terms.map(t => t.slice(0,40)).join(",")}]\x1b[0m`);
           return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
         }
       } catch {}
@@ -1379,7 +1351,7 @@ function normalizeToolCall(tc) {
         const expMatch = raw2.match(/"explanation"\s*:\s*"((?:[^"\\]|\\.)*)"/) || raw2.match(/"explanation"\s*:\s*"((?:[^"\\]|\\.)*)/);
         if (expMatch) safe.explanation = expMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\");
         if (safe.command) {
-          log(`\x1b[33m[${name}] salvaged command="${safe.command.slice(0,60)}${safe.command.length>60?"...":""}"\x1b[0m`);
+          _normLog(`\x1b[33m[${name}] salvaged command="${safe.command.slice(0,60)}${safe.command.length>60?"...":""}"\x1b[0m`);
           return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
         }
       } catch {}
@@ -1390,7 +1362,7 @@ function normalizeToolCall(tc) {
         if (pmMatch) {
           const planMarkdown = pmMatch[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
           if (planMarkdown.length > 0) {
-            log(`\x1b[33m[plan] salvaged planLen=${planMarkdown.length}\x1b[0m`);
+            _normLog(`\x1b[33m[plan] salvaged planLen=${planMarkdown.length}\x1b[0m`);
             return { ...tc, function: { ...tc.function, arguments: JSON.stringify({ planMarkdown }) } };
           }
         }
@@ -1420,7 +1392,7 @@ function normalizeToolCall(tc) {
         }
         if (queries.length) {
           safe.searchQueries = queries;
-          log(`\x1b[33m[${name}] salvaged queries=[${queries.map(q => q.slice(0,40)).join(",")}]\x1b[0m`);
+          _normLog(`\x1b[33m[${name}] salvaged queries=[${queries.map(q => q.slice(0,40)).join(",")}]\x1b[0m`);
           return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
         }
       } catch {}
@@ -1447,13 +1419,13 @@ function normalizeToolCall(tc) {
         const mrMatch = raw2.match(/"maxResults"\s*:\s*(\d+)/);
         safe.maxResults = mrMatch ? parseInt(mrMatch[1], 10) : 20;
         if (safe.queries.length) {
-          log(`\x1b[33m[${name}] salvaged queries=[${safe.queries.join(",")}] maxResults=${safe.maxResults}\x1b[0m`);
+          _normLog(`\x1b[33m[${name}] salvaged queries=[${safe.queries.join(",")}] maxResults=${safe.maxResults}\x1b[0m`);
           return { ...tc, function: { ...tc.function, arguments: JSON.stringify(safe) } };
         }
       } catch {}
     }
   }
-  log(`\x1b[31m[drop] ${name}: JSON parse failed, salvage unsuccessful — discarding\x1b[0m`);
+  _normLog(`\x1b[31m[drop] ${name}: JSON parse failed, salvage unsuccessful — discarding\x1b[0m`);
   return null;
 }
 
@@ -1759,7 +1731,7 @@ async function handleTags(c) {
         maxParams: m.maxParams || 0,
         capabilities: caps,
         context_length: ctxLen,
-        max_output_tokens: 4096,
+        max_output_tokens: Math.min(Math.floor(ctxLen * 0.1), 32768),
         pricing: isM365 ? "m365" : (isPoll ? "free_poll" : (isFree ? "free" : "premium")),
         details: {
           parent_model: parentModel || (m.details?.parent_model || ""),
@@ -2102,7 +2074,7 @@ app.get("/v1/models", async c => {
           limits: {
             max_prompt_tokens: maxPrompt,
             max_context_window_tokens: ctxLen,
-            max_output_tokens: 4096,
+            max_output_tokens: Math.min(Math.floor(ctxLen * 0.1), 32768),
           },
           tokenizer: inferTokenizer(family),
           type: "chat",
@@ -2110,7 +2082,7 @@ app.get("/v1/models", async c => {
         },
         pricing: isM365 ? "m365" : (isPoll ? "free_poll" : (isFree ? "free" : "premium")),
         context_length: ctxLen,
-        max_output_tokens: 4096,
+        max_output_tokens: Math.min(Math.floor(ctxLen * 0.1), 32768),
       });
     }
 
@@ -2170,6 +2142,8 @@ app.post("/v1/chat/completions", async c => {
   const chatId = `chatcmpl-${startTime}`;
   const created = ~~(startTime / 1000);
 
+  collapseBanner();
+
   if (!messages.length) return c.json({ error: { message: "messages is required and must be non-empty", type: "invalid_request_error", code: "missing_messages" } }, 400);
 
   // ── Per-message validation (copilot-proxy pattern) ──
@@ -2194,6 +2168,29 @@ app.post("/v1/chat/completions", async c => {
 
   const systemFp = `fp_${crypto.randomUUID().slice(0, 12)}`;
 
+  // ── Early model mapping & session context (before expensive body processing) ──
+  const goModel = mapModel(model);
+  const provider = isM365Model(goModel) ? "m365" : isPollModel(goModel) ? "poll" : isFreeTierModel(goModel) ? "zen" : "go";
+  const reasoningCtx = createReasoningContext(messages, goModel, getWorkspaceRoot(messages), clientTag, provider, thinkingTag);
+  // DEBUG: log raw first user message (VS context block) on every request, hidden
+  if (messages.length > 0) {
+    const firstUser = messages.find(m => (m.role || "").toLowerCase() === "user");
+    if (firstUser && typeof firstUser.content === "string") {
+      const preview = firstUser.content.substring(0, 300);
+      debug(`[context] ${firstUser.content.length}ch: ${preview}${firstUser.content.length > 300 ? "…" : ""}`);
+    }
+  }
+  // Flood guard: if think-fallback streak persists across too many requests, 503
+  if (reasoningCtx.sessionEntry.thinkFallbackStreak >= 2) {
+    reasoningCtx.sessionEntry.stopCount = (reasoningCtx.sessionEntry.stopCount || 0) + 1;
+    if (reasoningCtx.sessionEntry.stopCount >= 5) {
+      reasoningCtx.seslog(`\x1b[31m[think-fallback] flood ${reasoningCtx.sessionEntry.stopCount} stops — returning 503\x1b[0m`);
+      return c.json({ error: { message: "Service temporarily unavailable", type: "server_error", code: "rate_limit_exceeded" } }, 503);
+    }
+    // Allow request to proceed — taskCompleteOnly will be set downstream
+  }
+  reasoningCtx.sessionEntry.stopCount = 0;
+
   // Request body size guardrail (from antigravity-copilot enrichment)
   const sizeCheck = checkRequestBodySize(rawBody);
   if (sizeCheck.exceeds) {
@@ -2204,7 +2201,7 @@ app.post("/v1/chat/completions", async c => {
   // Tool output truncation (from antigravity-copilot enrichment)
   const truncResult = truncateToolMessagesInPayload(rawBody);
   if (truncResult.truncatedMessages > 0) {
-    log(`  tool output truncation: ${truncResult.truncatedMessages} messages, ${truncResult.originalTotalChars} → ${truncResult.finalTotalChars} chars`);
+    debug(`  tool output truncation: ${truncResult.truncatedMessages} messages, ${truncResult.originalTotalChars} → ${truncResult.finalTotalChars} chars`);
   }
 
   const cm = ModelConcurrencyManager.getInstance();
@@ -2214,7 +2211,6 @@ app.post("/v1/chat/completions", async c => {
     // Build system prompt with tool info for agent mode
     let systemMsg = "";
     const userMsgs = [];
-    const goModel = mapModel(model);
 
     // ── M365 Copilot path (no tools, no streaming via Go API) ──
     if (isM365Model(goModel)) {
@@ -2277,10 +2273,8 @@ app.post("/v1/chat/completions", async c => {
 
     let toolFailStreak = 0;
     let toolLoopBroken = false;
-    let taskCompleteOnly = false;
     let filterNags = false;
-    const provider = isM365Model(goModel) ? "m365" : isPollModel(goModel) ? "poll" : isFreeTierModel(goModel) ? "zen" : "go";
-    const reasoningCtx = createReasoningContext(messages, goModel, getWorkspaceRoot(messages), clientTag, provider, thinkingTag);
+
     reasoningCtx.reset();
     for (const m of messages) {
       const role = (m.role || "").toLowerCase().trim();
@@ -2408,10 +2402,26 @@ app.post("/v1/chat/completions", async c => {
       }
     }
 
-    // Detect VS task_complete retry loop — if VS keeps nagging the model
-    // to call task_complete, short-circuit to break the loop.
-    // HOWEVER: if the LLM is still producing useful tool calls, don't
-    // terminate — VS nags are often premature.
+    // ── Condense tool history after task_complete ──
+    // Only fires at the start of a NEW request after the LLM finished a task
+    // naturally (not cancelled). Replaces heavy tool messages with a compact summary.
+    if (_taskCompletedSessions.get(reasoningCtx.conv)) {
+      _taskCompletedSessions.delete(reasoningCtx.conv);
+      const before = userMsgs.length;
+      const condensed = condenseAfterTaskComplete(userMsgs);
+      if (condensed.length < before) {
+        const dropped = before - condensed.length;
+        userMsgs.length = 0;
+        userMsgs.push(...condensed);
+        const summaryMsg = condensed.find(m => m.role === "system" && m.content?.includes("[Task Summary]"));
+        reasoningCtx.seslog(`\x1b[35m[condensed] replaced ${dropped} tool messages with summary${summaryMsg ? " (" + summaryMsg.content.slice(0, 80) + "...)" : ""}\x1b[0m`);
+      }
+    }
+
+    // ── VS nag detection ──
+    // VS sends "you have not yet marked the task as complete" when the LLM
+    // produces text without tool calls. If the LLM is still actively working
+    // (has tool calls), filter the nags but let it continue.
     let vsTaskCompleteNags = 0;
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role !== "user") continue;
@@ -2436,74 +2446,80 @@ app.post("/v1/chat/completions", async c => {
       }
     }
     if (vsTaskCompleteNags >= 3 && !lastAssistantHasTools) {
-      reasoningCtx.sessionEntry.loopHits = (reasoningCtx.sessionEntry.loopHits || 0) + 1;
-      reasoningCtx.seslog(`\x1b[33m[LOOP-BREAK] VS has nagged ${vsTaskCompleteNags} times — filtering nags & forcing task_complete (loop hits: ${reasoningCtx.sessionEntry.loopHits})\x1b[0m`);
-      // Filter out VS nag messages so the model isn't confused by them
-      taskCompleteOnly = true;
+      reasoningCtx.seslog(`\x1b[33m[LOOP-BREAK] VS nagged ${vsTaskCompleteNags}x, LLM idle — cutting session\x1b[0m`);
       filterNags = true;
     } else if (vsTaskCompleteNags >= 3 && lastAssistantHasTools) {
-      reasoningCtx.seslog(`\x1b[35m[nags] ignoring ${vsTaskCompleteNags} VS nags — LLM is still producing tool calls\x1b[0m`);
-      filterNags = true; // still filter nags so the model isn't confused
-      // Reset loopHits since we're not escalating
-      if (reasoningCtx.sessionEntry.loopHits > 0) reasoningCtx.sessionEntry.loopHits = 0;
+      reasoningCtx.seslog(`\x1b[35m[nags] ignoring ${vsTaskCompleteNags} VS nags — LLM still has tool calls\x1b[0m`);
+      filterNags = true;
     }
-    if (reasoningCtx.sessionEntry.loopHits >= 4) {
-      reasoningCtx.seslog(`\x1b[31m[LOOP-BREAK] VS has nagged ${reasoningCtx.sessionEntry.loopHits} rounds (${reasoningCtx.sessionEntry.loopHits * 3}+ nags) — returning stop as last resort\x1b[0m`);
-      if (clientWantsStream) {
-        return stream(c, async (s) => {
-          const w = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
-          const base = { id: chatId, object: "chat.completion.chunk", created, model, system_fingerprint: systemFp };
-          await w({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
-          await w({ ...base, choices: [{ index: 0, delta: { content: "" }, finish_reason: "stop" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } });
-          await s.write("data: [DONE]\n\n");
-        });
+
+    // ── Autopilot stall detection ──
+    // VS sends bare "continue" when the user clicks continue in autopilot mode.
+    // If the LLM keeps responding with text-only (no tools) to repeated continues,
+    // it's stalled — cut the session.
+    let bareContinueCount = 0;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role !== "user") continue;
+      const t = typeof messages[i].content === "string" ? messages[i].content.trim().toLowerCase() : "";
+      if (t === "continue" || t === "proceed" || t === "go on" || t === "go ahead") {
+        bareContinueCount++;
+      } else {
+        break;
       }
-      return c.json(oaiResp("", undefined, "stop", model));
     }
-    // Only reset loop counter when no nags detected in this request.
-    // When nags >= 3, loopHits was incremented above — keep it to accumulate across requests.
-    if (vsTaskCompleteNags < 3 && reasoningCtx.sessionEntry.loopHits > 0) reasoningCtx.sessionEntry.loopHits = 0;
+    // Also count our replaced version — if LLM keeps getting "Continue with your current task"
+    // and responding with text-only, same stall pattern
+    let replacedContinueCount = 0;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role !== "user") continue;
+      const t = typeof messages[i].content === "string" ? messages[i].content.trim() : "";
+      if (/^continue with your current task/i.test(t)) {
+        replacedContinueCount++;
+      } else {
+        break;
+      }
+    }
+    const totalContinueCount = bareContinueCount + replacedContinueCount;
+    if (totalContinueCount >= 3 && !lastAssistantHasTools) {
+      reasoningCtx.seslog(`\x1b[33m[LOOP-BREAK] autopilot stall — ${totalContinueCount} continues with no tool output — cutting session\x1b[0m`);
+      filterNags = true;
+    }
 
     // Identity override — MUST be first system instruction to override VS built-in
     systemMsg = compactIdentity(goModel, thinkingTag) + (systemMsg ? "\n\n" : "") + systemMsg;
 
     // Workspace continuity — if this is a new chat in a previously active workspace,
-    // enrich the system prompt with a hint that prior context is available (TaskSync-inspired)
+    // enrich the system prompt with a compact summary of the last completed task,
+    // stripped of raw tool output clutter. (TaskSync-inspired)
     if (reasoningCtx.workspaceContinuity) {
       const wsContinuity = reasoningCtx.workspaceContinuity;
-      systemMsg = `CONTEXT: You previously worked on this project (workspace: ${wsContinuity.workspaceRoot}). Your prior knowledge of this codebase still applies. Continue where you left off.\n\n` + systemMsg;
-      reasoningCtx.seslog(`\x1b[90m[continuity] workspace continued from session ${wsContinuity.previousSessionId}\x1b[0m`);
+      const wsSummary = _workspaceSummaries.get(wsContinuity.workspaceRoot);
+      if (wsSummary) {
+        systemMsg = `PREVIOUS TASK SUMMARY (workspace: ${wsContinuity.workspaceRoot}): ${wsSummary.summary}\n\n` + systemMsg;
+        reasoningCtx.seslog(`\x1b[35m[continuity] injected workspace summary from session ${wsContinuity.previousSessionId} (${wsSummary.summary.slice(0, 80)}...)\x1b[0m`);
+      } else {
+        systemMsg = `CONTEXT: You previously worked on this project (workspace: ${wsContinuity.workspaceRoot}). Your prior knowledge of this codebase still applies. Continue where you left off.\n\n` + systemMsg;
+        // [continuity] workspace continued from session ${wsContinuity.previousSessionId} (debug-only, removed from output)
+      }
     }
 
     // Inject tool instructions into system prompt for agent mode (token-optimized)
     if (vsTools?.length) {
-      systemMsg += (systemMsg ? "\n\n" : "") + compactToolInstructions();
-      // Terminal guidance: tell AI how to handle VS terminal unavailability
-      if (config.terminalFallback !== false && vsTools.some(t => t.function?.name === "run_command_in_terminal" || t.function?.name === "execute_command")) {
-        systemMsg += "\n\nVS TERMINAL: The Visual Studio terminal may not be available. If run_command_in_terminal fails with 'Failed to find a valid Visual Studio terminal', output the command in a ```powershell code block for the user to paste into Developer PowerShell (View > Terminal in VS).";
-      }
-    }
-
-    // VS: prepend project file update instruction at TOP for maximum attention
-    if (vs2026 || vsInsiders || (clientTag && clientTag !== "vscode" && /^vs/.test(clientTag))) {
-      systemMsg = "CRITICAL WORKFLOW for file creation:\n1. Output the new file as: ## `filename`\n```lang\ncode\n```\n2. Output a code block to ADD the new file to the project: ## `project.ext`\n```xml\n<ItemGroup>\n  <Content Include=\"filename\" />\n</ItemGroup>\n```\n\n" + systemMsg;
+      systemMsg += (systemMsg ? "\n\n" : "") + compactToolInstructions(clientTag);
     }
 
     // Forward to Go API with native tool support
     const apiMessages = [];
-    if (taskCompleteOnly) {
-      systemMsg = "CRITICAL: You must respond with ONLY a task_complete tool call. Do NOT output any text. Use exactly this format:\n```tool\n{\"name\":\"task_complete\",\"arguments\":{}}\n```\n\n" + systemMsg;
-      // Strip VS nag messages so they don't confuse the model
-      if (filterNags) {
-        const nagRe = /\byou have not yet marked the task as complete\b/i;
-        const before = userMsgs.length;
-        for (let i = userMsgs.length - 1; i >= 0; i--) {
-          if (userMsgs[i].role === "user" && typeof userMsgs[i].content === "string" && nagRe.test(userMsgs[i].content)) {
-            userMsgs.splice(i, 1);
-          }
+    // Strip VS nag messages so they don't confuse the model
+    if (filterNags) {
+      const nagRe = /\byou have not yet marked the task as complete\b/i;
+      const before = userMsgs.length;
+      for (let i = userMsgs.length - 1; i >= 0; i--) {
+        if (userMsgs[i].role === "user" && typeof userMsgs[i].content === "string" && nagRe.test(userMsgs[i].content)) {
+          userMsgs.splice(i, 1);
         }
-        if (userMsgs.length < before) reasoningCtx.seslog(`\x1b[33m[nags] filtered ${before - userMsgs.length} nag messages\x1b[0m`);
       }
+      if (userMsgs.length < before) reasoningCtx.seslog(`\x1b[33m[nags] filtered ${before - userMsgs.length} nag messages\x1b[0m`);
     }
     // Replace bare "continue" from VS autopilot — the LLM already has full context,
     // so stripping it makes the model ask "what should I do?". Replace with a
@@ -2560,11 +2576,6 @@ app.post("/v1/chat/completions", async c => {
     const compressedMessages = compressMessages(validatedMessages, compLevel, true);
 
     let upstreamTools = vsTools || undefined;
-    if (taskCompleteOnly && vsTools?.length) {
-      const tcTool = vsTools.find(t => t.function?.name === "task_complete");
-      upstreamTools = tcTool ? [tcTool] : [{ type: "function", function: { name: "task_complete", description: "Signal task completion", parameters: { type: "object", properties: {}, required: [] } } }];
-      reasoningCtx.seslog(`\x1b[33m[tools] restricting to task_complete only\x1b[0m`);
-    }
     const ollamaReq = { model: goModel, messages: compressedMessages, stream: streamMode, tools: upstreamTools, clientTag, sessionId: reasoningCtx.sessionId };
     if (body.chat_template_kwargs != null) ollamaReq.chat_template_kwargs = body.chat_template_kwargs;
     if (body.thinking_token_budget != null) ollamaReq.thinking_token_budget = body.thinking_token_budget;
@@ -2632,19 +2643,17 @@ app.post("/v1/chat/completions", async c => {
         }
 
         if (matched.size === cachedIds.size) {
-          reasoningCtx.sessionEntry.loopHits = (reasoningCtx.sessionEntry.loopHits || 0) + 1;
-          reasoningCtx.seslog(`\x1b[35m[cache] bypass — all ${cachedIds.size} cached tool calls already fulfilled in messages (loop hits: ${reasoningCtx.sessionEntry.loopHits})\x1b[0m`);
+          reasoningCtx.seslog(`\x1b[35m[cache] bypass — all ${cachedIds.size} cached tool calls already fulfilled\x1b[0m`);
           cacheBypassed = true;
         }
       }
 
       if (!cacheBypassed) {
-        // Loop-break on cache hit: if AI text is telling itself to call task_complete, auto-inject it
+        // Loop-break on cache hit: if AI text is telling itself to call task_complete, cut session
         if (!toolCalls?.length && text && /\b(?:task_complete|mark(?:ed)?\s+(?:the\s+)?task\s+as\s+complete|If\s+you\s+believe\s+the\s+task\s+is\s+done)\b/i.test(text)) {
-            reasoningCtx.seslog(`\x1b[33m[cache] LOOP-BREAK: auto-calling task_complete\x1b[0m`);
-            toolCalls = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
-            hasTools = true;
+            reasoningCtx.seslog(`\x1b[33m[cache] LOOP-BREAK: cutting session (AI telling itself to complete)\x1b[0m`);
             text = "";
+            hasTools = false;
         }
 
         if (clientWantsStream) {
@@ -2670,8 +2679,6 @@ app.post("/v1/chat/completions", async c => {
       }
     }
     // Cache bypassed or not cached — going to upstream.
-    // Keep loop counter active when VS nags are ongoing so it accumulates for the 12-nag stop.
-    if (!taskCompleteOnly && reasoningCtx.sessionEntry.loopHits > 0) reasoningCtx.sessionEntry.loopHits = 0;
 
     // ── Stream mode: pipe directly from upstream async generator ──
     if (streamMode) {
@@ -2938,14 +2945,7 @@ app.post("/v1/chat/completions", async c => {
 
     let allToolCalls = [];
 
-    // When VS is nagging, force task_complete regardless of what the model returned.
-    // This MUST be first — before nativeCalls and extractToolCalls — to prevent
-    // any tool call extraction from overriding the forced completion.
-    if (taskCompleteOnly) {
-      reasoningCtx.seslog(`\x1b[33m[FORCE-COMPLETE] taskCompleteOnly — forcing task_complete\x1b[0m`);
-      allToolCalls = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
-      cleanText = "";
-    } else if (nativeCalls?.length) {
+    if (nativeCalls?.length) {
       allToolCalls = nativeCalls.map(normalizeToolCall).filter(Boolean);
       cleanText = "";
     } else if (vsTools?.length) {
@@ -2963,14 +2963,14 @@ app.post("/v1/chat/completions", async c => {
 
     // Prevent infinite "call task_complete" loop:
     // When the AI's text-only response is telling itself to call task_complete
-    // instead of actually calling it, auto-inject the call.
+    // instead of actually calling it, cut the session.
     if (!allToolCalls.length && cleanText && /\b(?:task_complete|mark(?:ed)?\s+(?:the\s+)?task\s+as\s+complete|If\s+you\s+believe\s+the\s+task\s+is\s+done)\b/i.test(cleanText)) {
-      reasoningCtx.seslog(`\x1b[33m[LOOP-BREAK] auto-calling task_complete to prevent infinite loop\x1b[0m`);
-      allToolCalls = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
+      reasoningCtx.seslog(`\x1b[33m[LOOP-BREAK] cutting session (AI telling itself to complete)\x1b[0m`);
+      allToolCalls = [];
       cleanText = "";
     }
 
-    const hasTools = allToolCalls.length > 0;
+    let hasTools = allToolCalls.length > 0;
 
     // Store reasoning keyed by content/tool hash
     if (reasoningContent) {
@@ -2985,17 +2985,88 @@ app.post("/v1/chat/completions", async c => {
     _recordTps(usage?.completion_tokens || Math.round((cleanText || fullText || "").length / 4), Date.now() - startTime);
 
     // DeepSeek thinking mode: when the model puts everything in <think> tags,
-    // cleanText is empty but reasoning exists. Fall back to a summary so VS
-    // doesn't get an empty response and loop forever.
+    // cleanText is empty but reasoning exists. Fall back smartly:
+    //  1. Scan reasoning for tool calls (model may put them inside <think>)
+    //  2. Track consecutive think-fallbacks and cut session if stuck
+    //  3. Use a better fallback text than just the first line
     if (!hasTools && !cleanText && reasoningContent) {
-      const summaryLine = reasoningContent.split("\n")[0].slice(0, 200);
-      cleanText = summaryLine || "(thinking)";
-      reasoningCtx.seslog(`\x1b[36m[think-fallback] empty text, using reasoning summary\x1b[0m`);
+      reasoningCtx.sessionEntry.thinkFallbackStreak = (reasoningCtx.sessionEntry.thinkFallbackStreak || 0) + 1;
+      const streak = reasoningCtx.sessionEntry.thinkFallbackStreak;
+      // First, try to extract tool calls from the reasoning content
+      const reasonExtract = extractToolCalls(reasoningContent, getWorkspaceRoot(messages), messages);
+      if (reasonExtract.toolCalls.length) {
+        allToolCalls = reasonExtract.toolCalls;
+        cleanText = reasonExtract.content;
+        hasTools = true;
+        reasoningCtx.seslog(`\x1b[36m[think-fallback] found ${allToolCalls.length} tool call(s) in reasoning\x1b[0m`);
+        reasoningCtx.sessionEntry.thinkFallbackStreak = 0; // resolved
+      } else if (streak >= 2) {
+        // Model is stuck in analysis paralysis — cut the session.
+        allToolCalls = [];
+        hasTools = false;
+        cleanText = "";
+        reasoningCtx.sessionEntry.thinkFallbackStreak = 0;
+        reasoningCtx.seslog(`\x1b[33m[think-fallback] streak ${streak} — cutting session (analysis paralysis)\x1b[0m`);
+      } else {
+        // Skip intro/blurb lines, then take a substantial chunk of reasoning
+        const lines = reasoningContent.split("\n");
+        const introRe = /^(let me|the user|the error|the issue|the problem|the task|i (?:need to|should|will|want|can|am|think|believe|see|notice|observe|note)|ok[,.!]?\s*$|right[,.!]?\s*$|first[,.]?\s|now[,.]?\s|so[,.]?\s|here'?s?\s|looking at|based on|from the|according to|to (?:understand|fix|debug|resolve|reproduce))/i;
+        const boringRe = /^(the error trace is|the stack trace|the exception|the call stack|error occurs|the problem is|error details)[:.]?\s*$/i;
+        // Strip leading intro/boring lines
+        let startIdx = 0;
+        for (let i = 0; i < lines.length; i++) {
+          const t = lines[i].trim();
+          if (!t) { startIdx = i + 1; continue; }
+          if (introRe.test(t) || boringRe.test(t)) { startIdx = i + 1; continue; }
+          break;
+        }
+        // Take up to 8000 chars from the remaining substantial content
+        let summary = "";
+        if (startIdx < lines.length) {
+          summary = lines.slice(startIdx).join("\n").trim().slice(0, 8000);
+        }
+        if (!summary) {
+          // Absolute fallback: last non-empty line
+          for (let i = lines.length - 1; i >= 0; i--) {
+            const t = lines[i].trim();
+            if (t) { summary = t.slice(0, 4000); break; }
+          }
+        }
+        cleanText = summary || "(thinking)";
+        reasoningCtx.seslog(`\x1b[35m[think-fallback] streak ${streak}: empty text, using reasoning summary\x1b[0m`);
+      }
+    } else if (hasTools || cleanText) {
+      // Reset think-fallback streak when model produces a real response
+      if (reasoningCtx.sessionEntry.thinkFallbackStreak > 0) {
+        reasoningCtx.sessionEntry.thinkFallbackStreak = 0;
+      }
     }
 
     const resp = oaiResp(hasTools ? null : cleanText, hasTools ? allToolCalls : undefined, hasTools ? "tool_calls" : "stop", model, usage);
-    if (hasTools) reasoningCtx.seslog(`\x1b[35m[TOOLS-TO-VS] ${allToolCalls.map(tc => `${tc.function.name}(${tc.function.arguments})`).join(" | ")}\x1b[0m`);
-    else reasoningCtx.seslog(`\x1b[35m[TEXT-TO-VS] ${(cleanText || "").slice(0, 200).replace(/\n/g,"\\n")}\x1b[0m`);
+    if (hasTools) debug(`${reasoningCtx.sessionPrefix} \x1b[35m[TOOLS-TO-VS] ${allToolCalls.map(tc => `${tc.function.name}(${tc.function.arguments})`).join(" \u2502 ")}\x1b[0m`);
+    else debug(`${reasoningCtx.sessionPrefix} \x1b[35m[TEXT-TO-VS] ${(cleanText || "").slice(0, 200).replace(/\n/g,"\\n")}\x1b[0m`);
+
+    // When LLM calls task_complete, summarize the completed task's tool calls
+    // + results into a compact instructional summary. Store per workspace so
+    // future sessions inherit context without the full tool history clutter.
+    const completedTask = hasTools && allToolCalls.some(tc => tc.function?.name === "task_complete");
+    if (completedTask) {
+      // Mark session so the NEXT request condenses tool history
+      _taskCompletedSessions.set(reasoningCtx.conv, true);
+      const wsRoot = getWorkspaceRoot(messages);
+      const summary = _summarizeCompletedTask(messages);
+      if (summary && wsRoot) {
+        _workspaceSummaries.set(wsRoot, { summary, timestamp: new Date().toISOString(), sessionId: reasoningCtx.sessionId, model: goModel });
+        // Clear session-scoped reasoning cache entries (task done, no longer needed)
+        const convPrefix = `c:${reasoningCtx.conv}:`;
+        let cleared = 0;
+        for (const k of _crossReqReasoningCache.keys()) {
+          if (k.startsWith(convPrefix)) { _crossReqReasoningCache.delete(k); cleared++; }
+        }
+        reasoningCtx.seslog(`\x1b[35m[summary] stored workspace summary (${summary.slice(0, 100)})\x1b[0m\x1b[90m | cleared ${cleared} reasoning entries\x1b[0m`);
+      }
+    }
+
     if (reasoningContent) {
       const choice = resp.choices[0];
       if (_displayReasoning) {
@@ -3164,7 +3235,7 @@ app.post("/api/show", async c => {
     billing: { multiplier: 1 },
     pricing: isPoll ? "free_poll" : (isFree ? "free" : "premium"),
     context_length: ctxLen,
-    max_output_tokens: 4096,
+    max_output_tokens: Math.min(Math.floor(ctxLen * 0.1), 32768),
     capabilities: caps,
     details: {
       parent_model: "",
@@ -3217,6 +3288,8 @@ app.post("/api/chat", async c => {
     else if (isVSCode(c)) clientTag = "vscode";
   }
 
+  collapseBanner();
+
   return stream(c, async s => {
     try {
       const cm = ModelConcurrencyManager.getInstance();
@@ -3226,6 +3299,14 @@ app.post("/api/chat", async c => {
   _dumpToolSchemas(vsTools);
   const provider = isM365Model(model) ? "m365" : isPollModel(model) ? "poll" : isFreeTierModel(model) ? "zen" : "go";
   const reasoningCtx = createReasoningContext(messages, model, getWorkspaceRoot(messages), clientTag, provider, apiThinking);
+  // DEBUG: log raw first user message (VS context block) on every request, hidden
+  if (messages.length > 0) {
+    const firstUser = messages.find(m => (m.role || "").toLowerCase() === "user");
+    if (firstUser && typeof firstUser.content === "string") {
+      const preview = firstUser.content.substring(0, 300);
+      debug(`[context] ${firstUser.content.length}ch: ${preview}${firstUser.content.length > 300 ? "…" : ""}`);
+    }
+  }
   reasoningCtx.reset();
 
       // Build messages with tool info in system prompt
@@ -3278,7 +3359,7 @@ app.post("/api/chat", async c => {
       systemMsg = compactIdentity(model, apiThinking) + (systemMsg ? "\n\n" : "") + systemMsg;
 
       if (vsTools?.length) {
-        systemMsg += (systemMsg ? "\n\n" : "") + compactOllamaToolInstructions(vsTools);
+        systemMsg += (systemMsg ? "\n\n" : "") + compactOllamaToolInstructions(vsTools, clientTag);
       }
 
       // Replace bare "continue" from VS autopilot with a contextual prompt
@@ -3339,10 +3420,10 @@ app.post("/api/chat", async c => {
       }
       // Session keepalive
       trackSession(reasoningCtx.sessionId, model, compressedMessages, clientTag);
-      // Loop-break: if AI text is telling itself to call task_complete, auto-inject it
+      // Loop-break: if AI text is telling itself to call task_complete, cut session
       if (!rawCalls.length && cleanText && /\b(?:task_complete|mark(?:ed)?\s+(?:the\s+)?task\s+as\s+complete|If\s+you\s+believe\s+the\s+task\s+is\s+done)\b/i.test(cleanText)) {
-          log(`\x1b[33m[LOOP-BREAK] auto-calling task_complete\x1b[0m`);
-          rawCalls = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
+          log(`\x1b[33m[LOOP-BREAK] cutting session (AI telling itself to complete)\x1b[0m`);
+          rawCalls = [];
           cleanText = "";
       }
       // Convert OpenAI format to Ollama format (drop id/type, parse args to object)
@@ -3405,6 +3486,7 @@ app.post("/api/generate", async c => {
   logReq(c);
   const body = await getBody(c);
   const startTime = Date.now();
+  collapseBanner();
 
   return stream(c, async s => {
     try {
@@ -3628,12 +3710,10 @@ const R = "\x1b[0m";
 const C = "\x1b[36m";
 const S = "\x1b[90m";
 const W = "\x1b[37m";
-const boxW = 64;
-const P = (s) => process.stdout.write(s + "\n");
+const boxW = 78;
 const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, "").length;
-// CJK-safe: use ASCII | and - for borders (Unicode box-drawing is double-width in CJK fonts)
-const V = "|";   // vertical border
-const H = "-";   // horizontal border
+const V = "\u2502";   // │ vertical border
+const H = "\u2500";   // ─ horizontal border
 const line = (l) => {
   const pad = boxW - 4 - vis(l);
   return S + V + R + "  " + l + " ".repeat(Math.max(0, pad)) + S + V + R;
@@ -3643,24 +3723,44 @@ const hr = S + H.repeat(boxW - 2);
 const hasPaid = models.some(m => m.model === `${SEP_PAID}:latest`);
 const hasPoll = models.some(m => m.model === `${SEP_FREE_P}:latest`);
 const hasM365 = models.some(m => m.model === `${SEP_M365}:latest`);
+const hasFreemium = models.some(m => m._freemium === true);
 const modeLabel = (hasPaid
   ? (config.hideFree ? " \x1b[32m(premium mode)\x1b[90m" : " \x1b[32m(premium+free mode)\x1b[90m")
-  : (hasPoll ? " \x1b[33m(free+poll mode)\x1b[90m" : " \x1b[33m(free mode)\x1b[90m"))
+  : (hasFreemium ? " \x1b[38;5;214m(freemium mode)\x1b[90m"
+    : (hasPoll ? " \x1b[33m(free+poll mode)\x1b[90m" : " \x1b[33m(free mode)\x1b[90m")))
   + (hasM365 ? " \x1b[36m+ M365\x1b[90m" : "");
 if (hasPaid) { const ks = getKeyStatus(); const firstKey = ks[0]?.keyPrefix || "?"; log(`\x1b[32m[status] Authenticated — Premium+Free (${firstKey})\x1b[0m`); }
+else if (hasFreemium) log(`\x1b[38;5;214m[status] Freemium mode — free models use API key\x1b[0m`);
 else if (hasPoll) log("\x1b[33m[status] Free mode — OpenCode free + Pollinations\x1b[0m");
 else log("\x1b[33m[status] Free mode — no API key\x1b[0m");
 if (hasM365) log("\x1b[36m[status] M365 Copilot connected\x1b[0m");
 
+let _buildDate = "";
+try {
+  const raw = require("fs").readFileSync(VERSION_FILE, "utf8").trim();
+  const ts = Number(raw);
+  if (ts > 0) _buildDate = new Date(ts).toISOString().slice(0, 10);
+} catch {}
+
+let _bannerLines = [];
+const P = (s) => { process.stdout.write(s + "\n"); _bannerLines.push(s); };
+const _G = "\x1b[32m"; // green for active debug
+const _cmdLine = () => {
+  const dc = _isDebug() ? _G : C;
+  return line(S + "Commands: " + C + "s" + R + W + "/" + R + C + "stop" + R + S + "  " + C + "r" + R + W + "/" + R + C + "restart" + R + S + "  " + C + "u" + R + W + "/" + R + C + "update" + R + S + "  " + dc + "d" + R + W + "/" + R + dc + "debug" + R + S + "  \u2190\u2192 collapse  \u2191\u2193PgUp/PgDn" + R);
+};
+
 P("");
-P(W + "+" + hr + W + "+" + R);                                            // ╭───╮
-P(line(S + B + "\u250f\u2513\u2513\u250f\u250f\u2513\u250f\u2513\u250f\u2513\u250f\u2513\u250f\u2513" + R));  // gc2oc logo
-P(line(S + B + "\u2503\u2513\u2523\u252b\u2503 \u2503\u2503\u250f\u251b\u2503\u2503\u2503 " + R + " " + S + "github copilot proxy" + modeLabel + R));
-P(line(S + B + "\u2517\u251b\u251b\u2517\u2517\u251b\u2523\u251b\u2517\u2501\u2517\u251b\u2517\u251b" + R));
-P(W + "+" + hr + W + "+" + R);                                            // ├───┤
+P(W + "\u250C" + hr + W + "\u2510" + R);                                            // ┌───┐
+P(line(S + B + "  █▀▀▀ █▀▀▀ " + C + B + "▀▀▀█ " + W + B + "█▀▀█ █▀▀▀" + R));
+P(line(S + B + "  █ ▀█ █    " + C + B + "█▀▀▀ " + W + B + "█░░█ █░░░" + R));
+P(line(S + B + "  ▀▀▀▀ ▀▀▀▀ " + C + B + "▀▀▀▀ " + W + B + "▀▀▀▀ ▀▀▀▀" + R));
+P(line(S + "github copilot proxy" + modeLabel + R));
+P(W + "\u251C" + hr + W + "\u2524" + R);                                            // ├───┤
 const portLabel = port === 11434 ? `port: ${port} (default)` : `port: ${port}`;
-P(line(S + portLabel + "  |  vs2026  |  models.dev" + R));
-P(W + "+" + hr + W + "+" + R);                                            // ├───┤
+P(line(S + portLabel + "  \u2502  built " + C + _buildDate + R + S + "  \u2502  models.dev" + R));
+P(_cmdLine());
+P(W + "\u251C" + hr + W + "\u2524" + R);                                            // ├───┤
 
 // Split models into sections by separator order (M365 → Free → Poll → Premium)
 const m365Start = models.findIndex(m => m.model === `${SEP_M365}:latest`);
@@ -3678,49 +3778,109 @@ const freeModels = freeStart >= 0 ? models.slice(freeStart + 1, freeEnd) : [];
 const pollModels = pollStart >= 0 ? models.slice(pollStart + 1, pollEnd) : [];
 const paidModels = paidStart >= 0 ? models.slice(paidStart + 1) : [];
 
+// Build collapsed banner: header + category summaries + bottom border
+const _bannerCollapsed = [..._bannerLines];
+if (hasM365) _bannerCollapsed.push(line(S + C + "\u25B6 " + R + S + "M365 Copilot (" + m365Models.length + ")" + R));
+if (!config.hideFree && freeModels.length) {
+  const fmCount = freeModels.filter(m => m._freemium).length;
+  const fmLabel = fmCount > 0 ? ` \x1b[38;5;214m${fmCount}freemium\x1b[0m` : "";
+  _bannerCollapsed.push(line(S + C + "\u25B6 " + R + S + "Free (" + freeModels.length + ")" + fmLabel + R));
+}
+if (config.showPollModels && pollModels.length) _bannerCollapsed.push(line(S + C + "\u25B6 " + R + S + "Pollinations (" + pollModels.length + ")" + R));
+if (hasPaid) _bannerCollapsed.push(line(S + C + "\u25B6 " + R + S + "Premium (" + paidModels.length + ")" + R));
+_bannerCollapsed.push(W + "\u2514" + hr + W + "\u2518" + R);
+_bannerCollapsed.push("");
+
 function printTable(list) {
   for (const m of list) {
-    const name = m.name.length > 20 ? m.name.slice(0, 19) + "\u2026" : m.name.padEnd(20);
-    const id = (m.model.replace(":latest", "")).length > 24
-      ? (m.model.replace(":latest", "")).slice(0, 23) + "\u2026"
-      : (m.model.replace(":latest", "")).padEnd(24);
-    const params = m.maxParams ? m.maxParams.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".").padEnd(9) : "-".padEnd(9);
-    P(line(name + S + " | " + R + id + S + " | " + R + params + R));
+    const modes = getThinkingModes(m.model.replace(":latest", ""));
+    const modeMap = { LOW: "L", MEDIUM: "M", HIGH: "H", MAXIMUM: "MX" };
+    const thinkLabel = modes.length ? " \x1b[37m" + modes.map(t => modeMap[t] || t[0]).join("\x1b[0m\x1b[90m,\x1b[0m\x1b[37m") + "\x1b[0m" : "";
+    const isFm = m._freemium || isFreemiumModel(m.model.replace(":latest", ""));
+    const nameColor = isFm ? "\x1b[38;5;214m" : S;
+    const nameReset = isFm ? "\x1b[0m" : R;
+    const nameW = 38;
+    const rawName = m.name + thinkLabel;
+    const nameLen = rawName.replace(/\x1b\[[0-9;]*m/g, "").length;
+    const name = nameLen > nameW
+      ? rawName.slice(0, nameW - 1) + "\u2026"
+      : rawName + " ".repeat(Math.max(0, nameW - nameLen));
+    const id = (m.model.replace(":latest", "")).length > 22
+      ? (m.model.replace(":latest", "")).slice(0, 21) + "\u2026"
+      : (m.model.replace(":latest", "")).padEnd(22);
+    const params = m.maxParams ? m.maxParams.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".").padEnd(7) : "-".padEnd(7);
+    P(line(nameColor + name + nameReset + S + " \u2502 " + R + id + S + " \u2502 " + R + params + R));
   }
 }
 
 if (hasM365) {
-  P(line(S + "M365 Copilot: " + S + `(${m365Models.length})` + R));
-  P(line(S + "Name".padEnd(20) + " | " + "ID".padEnd(24) + " | " + "Context" + R));
+  P(line(S + C + "\u25C0 " + R + S + "M365 Copilot: " + S + `(${m365Models.length})` + R));
+  P(line(S + "Name".padEnd(38) + " \u2502 " + "ID".padEnd(22) + " \u2502 " + "Context".padEnd(7) + R));
   printTable(m365Models);
 }
 
 if (!config.hideFree && freeModels.length) {
   if (hasM365) P(line(""));
-  P(line(S + "Free: " + S + `(${freeModels.length})` + R));
-  P(line(S + "Name".padEnd(20) + " | " + "ID".padEnd(24) + " | " + "Context" + R));
+  const fmSuffix = config.hasKey ? " \x1b[38;5;214m(freemium)\x1b[0m" : "";
+  P(line(S + C + "\u25C0 " + R + S + "Free:" + fmSuffix + S + ` (${freeModels.length})` + R));
+  P(line(S + "Name".padEnd(38) + " \u2502 " + "ID".padEnd(22) + " \u2502 " + "Context".padEnd(7) + R));
   printTable(freeModels);
 }
 
 if (config.showPollModels && pollModels.length) {
   if (!config.hideFree && freeModels.length) P(line(""));
-  P(line(S + "Pollinations: " + S + `(${pollModels.length})` + R));
-  P(line(S + "Name".padEnd(20) + " | " + "ID".padEnd(24) + " | " + "Context" + R));
+  P(line(S + C + "\u25C0 " + R + S + "Pollinations: " + S + `(${pollModels.length})` + R));
+  P(line(S + "Name".padEnd(38) + " \u2502 " + "ID".padEnd(22) + " \u2502 " + "Context".padEnd(7) + R));
   printTable(pollModels);
 }
 
 if (hasPaid) {
   if (!config.hideFree) P(line(""));
-  P(line(S + "Premium: " + S + `(${paidModels.length})` + R));
-  P(line(S + "Name".padEnd(20) + " | " + "ID".padEnd(24) + " | " + "Context" + R));
+  P(line(S + C + "\u25C0 " + R + S + "Premium: " + S + `(${paidModels.length})` + R));
+  P(line(S + "Name".padEnd(38) + " \u2502 " + "ID".padEnd(22) + " \u2502 " + "Context".padEnd(7) + R));
   printTable(paidModels);
 }
 
-P(W + "+" + hr + W + "+" + R);                                            // ╰───╯
+P(W + "\u2514" + hr + W + "\u2518" + R);                                            // └───┘
 P("");
 
-// Console commands
-(async () => {
+// Enable dashboard (sticky banner + scrollable log)
+const _isTTY = !!(process.stdout.isTTY ?? process.stdin.isTTY);
+if (_isTTY) {
+  enableDashboard(_bannerCollapsed, _bannerLines);
+  onCommand((cmd) => {
+    if (cmd === "stop") {
+      disableDashboard();
+      log("Shutting down...");
+      if (serverRef?.stop) serverRef.stop(true);
+      else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(() => process.exit(0)); }
+      setTimeout(() => process.exit(0), 2000);
+    } else if (cmd === "restart") {
+      disableDashboard();
+      log("Restarting...");
+      if (serverRef?.stop) { serverRef.stop(true); restartSelf(); }
+      else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(() => restartSelf()); }
+      else { restartSelf(); }
+      setTimeout(() => process.exit(42), 5000);
+    } else if (cmd === "update") {
+      disableDashboard();
+      log("Updating and restarting...");
+      if (serverRef?.stop) { serverRef.stop(true); restartSelf(43); }
+      else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(() => restartSelf(43)); }
+      else { restartSelf(43); }
+      setTimeout(() => process.exit(43), 5000);
+    } else if (cmd === "debug") {
+      Bun.env.DEBUG = _isDebug() ? "" : "1";
+      const newLine = _cmdLine();
+      _bannerLines[8] = newLine;
+      _bannerCollapsed[8] = newLine;
+      redrawBanner();
+      log(`DEBUG ${_isDebug() ? "ON" : "OFF"}`);
+    }
+  });
+}
+// Console commands (non-TTY fallback)
+if (!_isTTY) (async () => {
   let canUpdate = false;
   try {
     const { existsSync } = await import("node:fs");
@@ -3748,19 +3908,11 @@ P("");
         else if (serverRef?.close) { serverRef.closeAllConnections?.(); serverRef.close(() => restartSelf(43)); }
         else { restartSelf(43); }
         setTimeout(() => process.exit(43), 5000);
-      } else if (cmd) {
-        err(`Unknown command: ${cmd}`);
       }
     });
     process.stdin.resume();
-    if (canUpdate) {
-      log("\x1b[96mr\x1b[37m/\x1b[96mrestart\x1b[90m | \x1b[96ms\x1b[37m/\x1b[96mstop\x1b[90m | \x1b[96me\x1b[37m/\x1b[96mexit\x1b[90m | \x1b[96mu\x1b[37m/\x1b[96mupdate\x1b[0m");
-    } else {
-      log("\x1b[96mr\x1b[37m/\x1b[96mrestart\x1b[90m | \x1b[96ms\x1b[37m/\x1b[96mstop\x1b[90m | \x1b[96me\x1b[37m/\x1b[96mexit\x1b[0m");
-    }
   }
 })();
-}
 
 // ── Self-restart helper for standalone (.exe) runs ──
 // Restart helper. When wrapped (GC2OC_WRAPPED=1), exit and let the wrapper loop restart.
@@ -3818,3 +3970,4 @@ process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGHUP", () => gracefulShutdown("SIGHUP"));
 
+}

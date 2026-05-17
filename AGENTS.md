@@ -61,7 +61,7 @@ GitHub Copilot extension             src/server.js                       OpenCod
 
 ## Source Files
 
-### `src/server.js` (~1970 lines)
+### `src/server.js` (~3920 lines)
 **Main entry point.** HTTP routing, request orchestration, response formatting.
 
 - `restartSelf(exitCode)` — spawn `cmd /c start` → new console → inner `cmd /c` runs the exe. Uses `process.execPath` (NOT `process.argv[0]` — in Bun-compiled binaries `argv[0]` is `"bun"`, not the exe path). Wrapped mode (`GC2OC_WRAPPED=1`): just `process.exit()`.
@@ -77,6 +77,11 @@ GitHub Copilot extension             src/server.js                       OpenCod
 - `normalizeOpenAIParams()` — camelCase → snake_case parameter mapping
 - `sanitizeContent()` — strip `<|im_start|>`, `<|im_end|>` tokens
 - `mapModel(name)` — resolve model names, strip `[FREE]`/`[GO]`/`[M365]` prefixes
+- **Banner rendering** — builds a Unicode box-drawing table (`┌─┐ │ ├─┤ └─┘`, 78 chars wide) with GH2OC block-letter logo, model registry, command hints, and thinking mode labels. Produces two variants:
+  - **Collapsed** (`_bannerCollapsed`): logo + port + commands + category summaries (`▶ Free (3)`) + bottom border
+  - **Expanded** (`_bannerLines`): full model table with `◀` section headers and per-model thinking mode initials
+- **Thinking mode labels**: `L, M, H, XH` displayed after model names in white (`\x1b[37m`) with light-gray commas. Mapped via `getThinkingModes()` from `opencode-client.js`. Column widths: Name=38, ID=22, Context=7 (fits within 78-char box).
+- **Build date display**: Port/status line shows `built YYYY-MM-DD` parsed from `.version` (Unix ms timestamp), replacing the hardcoded `vs2026` label.
 
 ### `src/opencode-client.js` (1423 lines)
 **Model registry + upstream API communication.**
@@ -138,6 +143,22 @@ GitHub Copilot extension             src/server.js                       OpenCod
 
 ### `src/completion-cache.js`
 **Reasoning cache + prompt-response cache integration.** Caches `<think>` tag text per message and re-attaches on cache hits so DeepSeek-style reasoning isn't lost.
+
+### `src/logger.js` (283 lines)
+**Console dashboard TUI with virtual scrollback buffer.**
+
+- `enableDashboard(collapsedLines, expandedLines)` — enters raw-mode keyboard listener, enables alternate screen buffer (`\x1b[?1049h`, hides native scrollbar), paints banner + live log tail. Mouse reporting is disabled so text selection with cursor works.
+- `disableDashboard()` — exits raw mode, restores normal stdin.
+- `log(msg)` / `warn(msg)` / `error(msg)` / `debug(msg)` / `reqLog({...})` — in dashboard mode, push to virtual buffer (`_buffer`) and repaint live tail (last 5 entries) in-place below the banner. Outside dashboard mode, write to stdout/stderr normally. `debug()` always writes to console but only stores in the virtual buffer when `DEBUG=1`/`true`/`yes` (so debug messages don't clutter the scrollable history when debug is off).
+- **Banner variants**: `_bannerCollapsed` (GH2OC logo + port + commands + category count summaries + `└─┘`) and `_bannerExpanded` (full model table with `◀` section headers + `└─┘`). Switched via `_collapsed` flag.
+- **Model collapse/expand**: `→` (right arrow) expands to full table, `←` (left arrow) collapses to category summaries. Auto-collapses on the first chat request of any handler via `collapseBanner()`, then starts a 3s idle timer. Each subsequent request resets the timer. When the timer fires (3s after last request), auto-expands. Manual toggle (`_userToggled`) overrides idle expand until the next request.
+- **Virtual scroll buffer**: `_buffer` array holds all log entries. `_scrollOffset` tracks how far the user has scrolled up from live tail. `_scrollMode` flag enables the scroll overlay.
+- **Live tail**: banner + last 5 log entries visible by default. Footer shows `─ live tail (N entries) ─ ↑↓ PgUp PgDn = scroll ─`. Commands line shows `d/debug  ←→ collapse  ↑↓PgUp/PgDn scroll`.
+- **Scroll overlay**: `↑`/`↓` scroll 1 line, `PgUp`/`PgDn` scroll 5 lines. Shows page indicator (`─ page 3/10 ─ N entries ─ any key = live tail ─`). Any non-scroll key or typing exits scroll mode back to live tail. No auto-close timer.
+- **Console commands** (raw mode): type `s`/`stop`, `r`/`restart`, `u`/`update`, `d`/`debug`, `c`/`clear` + Enter. Characters echo while typing. `Ctrl+C` = stop. Backspace works.
+- **Debug toggle**: `d` + Enter toggles `DEBUG` on/off. When on, debug messages appear in the virtual scroll buffer; when off, they still print to the console but are excluded from the scrollback history. The commands line shows `d`/`debug` in green when enabled, cyan when disabled.
+- **Redraw**: `\x1b[H\x1b[J` clears visible area and redraws banner + log tail. Banner always redraws from `_banner` array, log tail from `_buffer`. Alternate screen buffer hides native scrollbar; mouse reporting disabled for text selection.
+- **Page calculation**: `page = Math.ceil((total - _scrollOffset) / VISIBLE_LINES)` — correctly maps scroll position to page number.
 
 ---
 
@@ -213,9 +234,12 @@ Detected in priority order:
 | Tier | Source | Count | Auth | Endpoint |
 |------|--------|-------|------|----------|
 | **Free** | OpenCode Zen | 4 models | None | `https://opencode.ai/zen/v1/chat/completions` |
+| **Freemium** | OpenCode Zen (key req.) | Same 4 free models, but with API key | `Bearer {key}` | `https://opencode.ai/zen/v1/chat/completions` |
 | **Pollinations** | text.pollinations.ai | 7 models (1 real + 6 cosplay) | None | `https://text.pollinations.ai/openai/chat/completions` |
 | **Paid** | OpenCode Go | Dynamic | `Bearer {key}` | `https://opencode.ai/zen/go/v1/chat/completions` |
 | **M365** | M365 Copilot via relay WS | 2 models (Quick/Think) | Browser session | `ws://127.0.0.1:{M365CO_PORT}` |
+
+> **Freemium detection**: On startup and each model refresh, free models are pinged against the Zen free endpoint. Models that require a key (return 401 without auth) are retried with the API key. If they respond successfully, they are marked as **freemium** — displayed in orange in the model list and routed to the Zen free endpoint with `Bearer` auth.
 
 ---
 
@@ -241,6 +265,10 @@ Free models are sourced from the **OpenCode Zen** free tier (`https://opencode.a
 | `ring-2.6-1t-free` | Ring 2.6 1T Free | ✓ | ✗ | 262000 |
 
 > **Important:** models.dev lists ~16 `opencode` models with `cost: 0`, but only 4 respond on the Zen API. The rest return `ModelError: not supported`. Always verify with a live ping before adding.
+
+### Freemium (free models with API key)
+
+When an `OPENCODE_API_KEY` or `OPENCODE_API_KEYS` environment variable is configured, free Zen models are validated via ping: first without a key, then retried with the API key on 401. Models that respond successfully with the key are marked as **freemium** — displayed in orange in the model list banner and still routed to the free Zen endpoint (`https://opencode.ai/zen/v1/chat/completions`), but now send the API key as a `Bearer` token. This allows access to free models even when the OpenCode terms require a key to be on file. Internally, the `_freemium: true` flag is set on model entries and `isFreemiumModel()` checks `_modelMap` at request time.
 
 ### HIDE_FREE
 
@@ -308,12 +336,16 @@ Messages folded into labeled plain text with `---` separator (matching [m365-cop
 - **Key rotation**: Round-robin with cooldown. 401 → 7-day persisted cooldown (via `key-state.json`), 429 → persisted cooldown duration. Validated via real inference pings. Hash persisted to `.cache/keyhash.json`.
 - **Auto-compression**: `COMPRESSION_LEVEL=auto` selects `off` for ≤3 messages, `stacked` for free/poll, `caveman` for paid.
 - **Tool output dropping**: Old (assistant tool_call → tool result) pairs are dropped at all compression levels above `off`. Groups are dropped atomically (all tool results from the same assistant are kept or dropped together) to prevent orphaned `tool` messages. Kept count per level: `lite`=8, `caveman`/`rtk`=6, `stacked`=4, `aggressive`=3, `ultra`=1. Override with `TOOL_OUTPUT_KEEP_COUNT=N`.
-- **Auto-restart**: Exit code 42 triggers restart, exit 43 triggers update-then-restart. The restart loop lives in `service.exe` (C# launcher). Console commands: `r`/`restart`, `s`/`stop`, `e`/`exit`.
+- **Auto-restart**: Exit code 42 triggers restart, exit 43 triggers update-then-restart. The restart loop lives in `service.exe` (C# launcher). Console commands: `s`/`stop`, `r`/`restart`, `u`/`update`, `d`/`debug`, `c`/`clear` (type + Enter in dashboard raw mode). Characters echo while typing. `Ctrl+C` = stop.
+- **Console dashboard**: On startup, displays a Unicode box-drawing table with GH2OC block-letter logo, model registry, thinking mode labels, and command hints. Uses alternate screen buffer (hides native scrollbar) but no mouse reporting (text selection with cursor works). All `log()`/`warn()`/`error()`/`reqLog()` output is captured to a virtual scrollback buffer. Last 5 entries shown as "live tail" below the banner. Arrow keys (`↑`/`↓`/`PgUp`/`PgDn`) browse the full buffer via scroll overlay with page numbers. Any non-scroll key or typing exits scroll mode back to live tail.
+- **Debug toggle**: `d` + Enter toggles `DEBUG` on/off. When on, debug messages appear in the virtual scroll buffer; when off, they still print to the console but are excluded from the scrollback history.
+- **Model table collapse**: `→` (right arrow) expands full model table, `←` (left arrow) collapses to category count summaries. When collapsed: `▶ Free (3) ▶ Premium (15)`. Auto-collapses on the first chat request of any handler via `collapseBanner()`, then starts a 3s idle timer. Each subsequent request resets the timer. When the timer fires (3s after last request), auto-expands. Manual toggle (`_userToggled`) overrides idle expand until the next request. Auto-collapse calls `_redraw()` immediately so the banner switches without waiting for the next log entry.
   - **Wrapped mode** (`GC2OC_WRAPPED=1` set by `service.exe`): `restartSelf()` calls `process.exit(42)`, the C# launcher catches exit code 42 and re-launches `gc2oc`/`node`.
   - **Standalone mode** (compiled `.exe` run directly, no wrapper): `restartSelf()` spawns `cmd /c start /D <wd> cmd /c <exe>` — opens a new independent console window. The inner `cmd /c` runs the exe. A 500ms delay before exit gives `start` time to create the new process.
   - **Bun binary caveat**: In Bun-compiled `.exe` binaries, `process.argv[0]` returns `"bun"`, NOT the exe path. Always use `process.execPath` for the exe path. Bun also kills all child processes on `process.exit()`, so spawning-based restart is fragile — the `cmd /c start` approach works because `start` creates the new console window before Bun exits.
 - **Graceful shutdown**: `/stop` endpoint or SIGINT/SIGTERM/SIGHUP with 30s timeout.
 - **VS 2026 file creation**: Markdown code blocks parsed into `create_file` tool calls. Project files (`.csproj`, `.sln`) handled natively.
+- **Single-pass file edits**: When editing files, plan all changes first, then apply them in one edit operation. VS receives multiple `create_file` tool calls as separate edits — batching related changes into a single edit reduces round-trips and prevents VS from seeing fragmented partial changes.
 - **Tool call normalization**: `normalizeToolCall()` in `src/server.js:419` sanitizes AI-generated tool call arguments before returning to VS. VS schemas differ from standard Copilot — always verify against actual `body.tools` schemas if tools fail.
   - **`get_file` schema (VS Insiders 18.7)**: `required: ["filename","startLine","endLine"]`, `additionalProperties: false`. Properties: `filename` (string), `startLine` (integer, 1-based), `endLine` (integer, 1-based, inclusive), `includeLineNumbers` (boolean, default false). Note: VS uses `filename` not `filePath`.
   - **`grep_search` schema (VS Insiders 18.7)**: `required: ["query","isRegexp","includePattern","maxResults"]`, `additionalProperties: false`. Properties: `query` (string, case-insensitive), `isRegexp` (boolean), `includePattern` (string|null, glob pattern), `maxResults` (integer|null, max 200, default 20). Note: VS uses `query` not `pattern`, `includePattern` not `fileTypes`, and `isRegexp` + `maxResults` are required.

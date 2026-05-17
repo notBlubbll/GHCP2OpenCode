@@ -22,10 +22,22 @@ if exist .env (
 
 if "%SERVER_PORT%"=="" set SERVER_PORT=11434
 
-REM 2. Port Cleanup
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%SERVER_PORT% " ^| findstr "LISTENING" 2^>nul') do (
-    taskkill /pid %%a /f >nul 2>&1
+REM 2. Kill any existing gc2oc instance by window title, then clean port
+echo [INFO] Stopping any existing gc2oc instance...
+taskkill /fi "WINDOWTITLE eq gc2oc" /f >nul 2>&1
+REM Wait briefly for process to die
+timeout /t 1 /nobreak >nul
+REM Port Cleanup with retry (matching service.exe 4x1s behavior)
+for /l %%i in (1,1,4) do (
+    for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%SERVER_PORT% " ^| findstr "LISTENING" 2^>nul') do (
+        taskkill /pid %%a /f >nul 2>&1
+    )
+    REM Check if port is free
+    netstat -ano | findstr ":%SERVER_PORT% " | findstr "LISTENING" >nul 2>&1
+    if errorlevel 1 goto :port_free
+    timeout /t 1 /nobreak >nul
 )
+:port_free
 
 REM 3. Set libuv thread pool size for DNS/file I/O concurrency
 if "%UV_THREADPOOL_SIZE%"=="" set UV_THREADPOOL_SIZE=8

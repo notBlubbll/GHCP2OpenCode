@@ -112,15 +112,74 @@ export function compactIdentity(model, thinking) {
   return `IDENTITY OVERRIDE: You are NOT GitHub Copilot. You are "Copilot (gc2oc)", a coding assistant running ${model}${thinkNote}. When asked who you are, say: "I am Copilot (gc2oc) running ${model}${thinkNote}." Never claim to be GitHub Copilot.`;
 }
 
-export function compactToolInstructions() {
-  return "Use tools when necessary. Explain your work. Call task_complete() when the task is fully done.";
+// ── Agent behavior core (from Copilot gpt-4.1 + Cursor Agent prompts) ──
+// ~80 tokens — shared across all clients
+function _agentCore() {
+  return `You are an expert coding agent. Work autonomously until the task is resolved — don't ask permission, act. Gather context before changes; don't assume. Don't repeat yourself after tool calls. Prefer reading large file sections over multiple small reads — minimize tool calls. Before manual research (web search, codebase exploration), check attached local agent files for relevant information. Only proceed with manual research if agent files lack sufficient detail.`;
 }
 
-export function compactOllamaToolInstructions(tools) {
+// ── Tool usage rules (token-optimized from Copilot/Cursor patterns) ──
+// ~100 tokens
+function _toolUsageCore() {
+  return `TOOL RULES:
+- Use tools instead of printing codeblocks or terminal commands
+- Call independent tools in parallel when possible
+- Don't say tool names to the user — describe actions naturally
+- After editing a file, validate the change (check for errors)
+- If info is discoverable via tools, prefer that over asking the user
+- When reading a file, read the FULL file (large line range) — don't read line-by-line
+- Search first (grep/semantic) to locate code, then read the relevant file in one call
+- You have full context of all prior tool results — don't re-read files you already read
+- Read only the files you need — don't browse the entire project speculatively`;
+}
+
+// ── Edit file rules (from Copilot editFileInstructions) ──
+// ~60 tokens
+function _editFileRules() {
+  return `EDIT RULES:
+- Avoid repeating existing code — use "// ...existing code..." comments for unchanged regions
+- Plan all edits mentally first, then apply in ONE edit per file — do NOT send multiple small edits
+- Group changes by file; use the edit tool once per file for multiple changes
+- Follow existing code style and conventions in the file`;
+}
+
+// ── VS-specific project file workflow ──
+// ~80 tokens
+function _vsProjectRules() {
+  return `VS FILE CREATION WORKFLOW:
+1. Output new file as: ## \`filename\` then \`\`\`lang code \`\`\`
+2. Add to project: ## \`project.ext\` then \`\`\`xml <ItemGroup><Content Include="filename" /></ItemGroup> \`\`\`
+If VS terminal unavailable, output command in \`\`\`powershell for user to paste.`;
+}
+
+// ── SQL Studio rules ──
+// ~50 tokens
+function _sqlRules() {
+  return `You are a SQL/database expert. Help with queries, schema design, performance tuning, and migrations. Prefer safe, reversible operations. Always show the SQL before executing. Explain execution plans when relevant.`;
+}
+
+// ── Enriched tool instructions for VS/agent mode (native tool_calls) ──
+export function compactToolInstructions(clientTag) {
+  const parts = [_agentCore(), _toolUsageCore(), _editFileRules()];
+  if (clientTag && clientTag !== "vscode" && clientTag !== "sql") {
+    parts.push(_vsProjectRules());
+  }
+  if (clientTag === "sql") {
+    parts.push(_sqlRules());
+  }
+  parts.push("Call task_complete() when the task is fully done.");
+  return parts.join("\n\n");
+}
+
+// ── Enriched tool instructions for Ollama/VSCode endpoint ──
+export function compactOllamaToolInstructions(tools, clientTag) {
   const toolList = tools.map(t =>
     `${t.function.name}: ${t.function.description ? compressDescription(t.function.description) : "(no desc)"}`
   ).join("\n");
-  return `Tools:\n${toolList}\nFormat: \`\`\`tool\n{"name":"...","arguments":{...}}\n\`\`\``;
+  const parts = [_agentCore(), _toolUsageCore(), _editFileRules()];
+  if (clientTag === "sql") parts.push(_sqlRules());
+  parts.push(`Tools:\n${toolList}\nFormat: \`\`\`tool\n{"name":"...","arguments":{...}}\n\`\`\``);
+  return parts.join("\n\n");
 }
 
 export function compactCodeCompletionPrompt() {
@@ -426,6 +485,206 @@ function _dropOldToolOutputs(messages, keepCount) {
 }
 
 // ═══════════════════════════════════════════════════
+// Tool history summary — compact context preservation
+// ═══════════════════════════════════════════════════
+
+// Build a detailed summary from tool runs — no LLM call needed.
+// Includes file content snippets, edit diffs, search results, and assistant summaries.
+export function buildToolRunSummary(messages) {
+  if (!messages?.length) return "";
+  const reads = [];      // {file, snippet}
+  const edits = [];      // {file, old, new}
+  const creates = [];    // {file, snippet}
+  const searches = [];   // {query, results}
+  const commands = [];   // {cmd, output}
+  const assistantTexts = [];
+
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+
+    // Capture assistant text (non-tool) as context
+    if (m.role === "assistant" && !m.tool_calls?.length && typeof m.content === "string" && m.content.trim().length > 20) {
+      // Skip greetings and short filler
+      const t = m.content.trim();
+      if (!/^(ok|sure|got it|understood|thanks|hi|hello)/i.test(t)) {
+        assistantTexts.push(t.slice(0, 500));
+      }
+    }
+
+    if (m.role !== "assistant" || !m.tool_calls?.length) continue;
+
+    for (const tc of m.tool_calls) {
+      const name = tc.function?.name || "";
+      let args = {};
+      try { args = typeof tc.function?.arguments === "string" ? JSON.parse(tc.function.arguments) : (tc.function?.arguments || {}); } catch {}
+      const file = args.filePath || args.filename || args.path || args.file || "";
+      const query = args.query || args.pattern || args.search || "";
+
+      // Find the matching tool result
+      const toolResult = messages.find((rm, ri) => ri > i && rm.role === "tool" && rm.tool_call_id === tc.id);
+      const resultContent = typeof toolResult?.content === "string" ? toolResult.content : "";
+
+      if (/^(get_file|read_file)$/i.test(name)) {
+        const snippet = resultContent.slice(0, 300).replace(/\n/g, " ").trim();
+        if (file) reads.push({ file, snippet: snippet.slice(0, 200) });
+      } else if (/^(replace_string_in_file|multi_replace_string_in_file)$/i.test(name)) {
+        const old = (args.oldString || args.old_string || "").slice(0, 100);
+        const nw = (args.newString || args.new_string || "").slice(0, 100);
+        if (file) edits.push({ file, old, new: nw });
+      } else if (/^(insert_edit_into_file)$/i.test(name)) {
+        const code = (args.code || args.content || "").slice(0, 200);
+        if (file) edits.push({ file, old: "", new: code });
+      } else if (/^(create_file)$/i.test(name)) {
+        const snippet = (args.content || "").slice(0, 200).replace(/\n/g, " ").trim();
+        if (file) creates.push({ file, snippet });
+      } else if (/^(grep_search|search_content|semantic_search|code_search|file_search|find_files)$/i.test(name)) {
+        const resultLines = resultContent.split("\n").slice(0, 5).join(" | ").slice(0, 300);
+        if (query) searches.push({ query, results: resultLines });
+      } else if (/^(run_command_in_terminal|execute_command|run_in_terminal)$/i.test(name)) {
+        const cmd = (args.command || args.cmd || "").slice(0, 100);
+        const output = resultContent.slice(0, 200).replace(/\n/g, " ").trim();
+        if (cmd) commands.push({ cmd, output });
+      }
+    }
+  }
+
+  const parts = [];
+  if (reads.length) {
+    const readLines = reads.slice(0, 10).map(r => `  ${r.file}${r.snippet ? ": " + r.snippet : ""}`);
+    parts.push(`FILES READ:\n${readLines.join("\n")}`);
+  }
+  if (edits.length) {
+    const editLines = edits.slice(0, 10).map(e => {
+      if (e.old) return `  ${e.file}: "${e.old}" → "${e.new}"`;
+      return `  ${e.file}: ${e.new}`;
+    });
+    parts.push(`FILES EDITED:\n${editLines.join("\n")}`);
+  }
+  if (creates.length) {
+    const createLines = creates.slice(0, 10).map(c => `  ${c.file}${c.snippet ? ": " + c.snippet : ""}`);
+    parts.push(`FILES CREATED:\n${createLines.join("\n")}`);
+  }
+  if (searches.length) {
+    const searchLines = searches.slice(0, 5).map(s => `  "${s.query}" → ${s.results}`);
+    parts.push(`SEARCHES:\n${searchLines.join("\n")}`);
+  }
+  if (commands.length) {
+    const cmdLines = commands.slice(0, 5).map(c => `  $ ${c.cmd}${c.output ? " → " + c.output : ""}`);
+    parts.push(`COMMANDS:\n${cmdLines.join("\n")}`);
+  }
+  if (assistantTexts.length) {
+    parts.push(`ASSISTANT NOTES:\n${assistantTexts.slice(-3).map(t => "  " + t).join("\n")}`);
+  }
+
+  return parts.length ? `[Task Summary]\n${parts.join("\n\n")}` : "";
+}
+
+// After task_complete: replace all tool messages with a single summary
+export function condenseAfterTaskComplete(messages) {
+  if (!messages?.length) return messages;
+  const summary = buildToolRunSummary(messages);
+  if (!summary) return messages;
+
+  const result = [];
+  let toolBlockStart = -1;
+
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+
+    // Find start of tool block (assistant with tool_calls)
+    if (m.role === "assistant" && m.tool_calls?.length && toolBlockStart < 0) {
+      toolBlockStart = i;
+    }
+
+    // Keep non-tool messages
+    if (m.role !== "tool" && !(m.role === "assistant" && m.tool_calls?.length)) {
+      result.push(m);
+      toolBlockStart = -1; // reset — this message breaks the tool block
+    }
+    // Skip tool messages and tool-calling assistants — they'll be replaced by summary
+  }
+
+  // Insert summary at the end
+  result.push({ role: "system", content: summary });
+  return result;
+}
+
+// Lightweight version for compression — just file names, no content
+function _extractToolSummary(messages) {
+  if (!messages?.length) return "";
+  const reads = [];
+  const edits = [];
+  const searches = [];
+  const commands = [];
+  const creates = [];
+  const others = [];
+
+  for (const m of messages) {
+    if (m.role !== "assistant" || !m.tool_calls?.length) continue;
+    for (const tc of m.tool_calls) {
+      const name = tc.function?.name || "";
+      let args = {};
+      try { args = typeof tc.function?.arguments === "string" ? JSON.parse(tc.function.arguments) : (tc.function?.arguments || {}); } catch {}
+      const file = args.filePath || args.filename || args.path || args.file || "";
+      const query = args.query || args.pattern || args.search || "";
+
+      if (/^(get_file|read_file)$/i.test(name)) {
+        if (file && !reads.includes(file)) reads.push(file);
+      } else if (/^(replace_string_in_file|multi_replace_string_in_file|insert_edit_into_file)$/i.test(name)) {
+        if (file && !edits.includes(file)) edits.push(file);
+      } else if (/^(create_file)$/i.test(name)) {
+        if (file && !creates.includes(file)) creates.push(file);
+      } else if (/^(grep_search|search_content|semantic_search|code_search|file_search|find_files)$/i.test(name)) {
+        if (query && !searches.includes(query)) searches.push(query);
+      } else if (/^(run_command_in_terminal|execute_command|run_in_terminal)$/i.test(name)) {
+        const cmd = args.command || args.cmd || "";
+        if (cmd) commands.push(cmd.slice(0, 80));
+      } else if (!/^(task_complete|plan|finish_plan)$/i.test(name)) {
+        others.push(name);
+      }
+    }
+  }
+
+  const parts = [];
+  if (reads.length) parts.push(`READ: ${reads.join(", ")}`);
+  if (edits.length) parts.push(`EDITED: ${edits.join(", ")}`);
+  if (creates.length) parts.push(`CREATED: ${creates.join(", ")}`);
+  if (searches.length) parts.push(`SEARCHED: ${searches.slice(0, 5).join(", ")}`);
+  if (commands.length) parts.push(`RAN: ${commands.slice(0, 5).join("; ")}`);
+  if (others.length) parts.push(`TOOLS: ${[...new Set(others)].join(", ")}`);
+
+  return parts.length ? `[Session context: ${parts.join(" | ")}]` : "";
+}
+
+function _injectToolSummary(messages) {
+  if (!messages?.length) return messages;
+  // Find the first tool result
+  let firstToolIdx = -1;
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].role === "tool") { firstToolIdx = i; break; }
+  }
+  if (firstToolIdx < 0) return messages;
+
+  // Find the assistant message with tool_calls that precedes this tool result
+  // The summary must go BEFORE the assistant, not between assistant and tool
+  let insertIdx = firstToolIdx;
+  for (let i = firstToolIdx - 1; i >= 0; i--) {
+    if (messages[i].role === "assistant" && messages[i].tool_calls?.length) {
+      insertIdx = i;
+      break;
+    }
+    if (messages[i].role !== "assistant" && messages[i].role !== "tool") break;
+  }
+
+  const toolBlock = messages.slice(firstToolIdx);
+  const summary = _extractToolSummary(toolBlock);
+  if (!summary) return messages;
+
+  // Insert summary before the assistant that starts the tool chain
+  return [...messages.slice(0, insertIdx), { role: "system", content: summary }, ...messages.slice(insertIdx)];
+}
+
+// ═══════════════════════════════════════════════════
 // Ultra compression (~75% savings)
 // All Aggressive + heuristic token pruning + stopword removal
 // ═══════════════════════════════════════════════════
@@ -566,19 +825,25 @@ export function compressMessages(messages, level = "stacked", progressiveAging =
 
   let msgs = messages;
 
+  // Inject tool history summary before compression — preserves context about what was done
+  if (level !== "off" && level !== "lite") {
+    msgs = _injectToolSummary(msgs);
+  }
+
   // Drop old tool outputs: keep only the most recent N pairs
+  // Default: 0 = never drop (context preserved until task complete)
   if (level !== "off") {
     const envKeep = parseInt(typeof Bun !== "undefined" ? Bun.env.TOOL_OUTPUT_KEEP_COUNT : process.env.TOOL_OUTPUT_KEEP_COUNT, 10);
     let keepCount = envKeep > 0 ? envKeep : 0;
     if (!keepCount) {
       switch (level) {
-        case "lite":     keepCount = 8; break;
+        case "lite":     keepCount = 0; break;
         case "caveman":
-        case "standard": keepCount = 6; break;
-        case "rtk":      keepCount = 6; break;
-        case "stacked":  keepCount = 4; break;
-        case "aggressive": keepCount = 3; break;
-        case "ultra":    keepCount = 1; break;
+        case "standard": keepCount = 0; break;
+        case "rtk":      keepCount = 0; break;
+        case "stacked":  keepCount = 0; break;
+        case "aggressive": keepCount = 0; break;
+        case "ultra":    keepCount = 0; break;
         default:         keepCount = 0; break;
       }
     }

@@ -64,6 +64,29 @@ const FREE_TIER_MODELS = [
   { id: "pol/Mistral", name: "Pollinations Mistral", family: "poll-mistral", context: 131072, tools: true, vision: false, _poll: true, _pollCosplay: true, _pollModel: "openai" },
 ];
 
+// Dynamically discovered -free models from models.dev
+let _zenFreeDiscovered = [];
+function discoverZenFreeModels() {
+  if (!_mdCache) return;
+  const allMD = { ...(_mdCache["opencode"]?.models || {}), ...(_mdCache["opencode-go"]?.models || {}) };
+  const freeIds = new Set(FREE_TIER_MODELS.map(m => m.id));
+  const discovered = [];
+  for (const [id, md] of Object.entries(allMD)) {
+    if (!id.endsWith("-free") || freeIds.has(id)) continue;
+    const displayName = md.name || id.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+    const tools = !!(md.tool_call ?? true);
+    const vision = (md.modalities?.input || []).some(v => v === "image" || v === "video");
+    discovered.push({
+      id, name: displayName, family: md.name || id, tools, vision, context: md.limit?.context || "",
+      _zenDiscovered: true,
+    });
+  }
+  if (discovered.length) {
+    _zenFreeDiscovered = discovered;
+    log(`[models] discovered ${discovered.length} -free model(s) from models.dev`);
+  }
+}
+
 function fmtParamSize(val) {
   if (!val) return "";
   const s = String(val).trim();
@@ -80,7 +103,8 @@ function fmtParamSize(val) {
 function buildFreeTierModels() {
   const now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
   const allModels = { ...((_mdCache && _mdCache["opencode-go"]?.models) || {}), ...((_mdCache && _mdCache["opencode"]?.models) || {}) };
-  const active = FREE_TIER_MODELS.filter(m => {
+  const candidates = [...FREE_TIER_MODELS, ..._zenFreeDiscovered.filter(m => m._active !== false)];
+  const active = candidates.filter(m => {
     if (m._active === false) return false;
     if (m._poll && !config.showPollModels) return false;
     if (m._pollCosplay && config.hidePollCosplay) return false;
@@ -99,6 +123,7 @@ function buildFreeTierModels() {
       size: 0,
       digest: m.id,
       maxParams: mdModel?.limit?.context || m.context || "",
+      _freemium: m._freemium || false,
       details: {
         parent_model: "",
         format: "gguf",
@@ -118,12 +143,14 @@ function buildFreeTierModels() {
     }});
 }
 
-async function pingFreeModel(m) {
+async function pingFreeModel(m, key = null) {
   const start = Date.now();
   try {
+    const headers = { "Content-Type": "application/json" };
+    if (key) headers["Authorization"] = `Bearer ${key}`;
     const resp = await fetch(`${config.baseUrlFree}/chat/completions`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({
         model: m.id,
         messages: [{ role: "user", content: "hi" }],
@@ -131,7 +158,7 @@ async function pingFreeModel(m) {
         stream: false,
       }),
     });
-    return { ok: resp.ok, ms: Date.now() - start };
+    return { ok: resp.ok, ms: Date.now() - start, status: resp.status };
   } catch {
     return { ok: false, ms: Date.now() - start };
   }
@@ -139,16 +166,44 @@ async function pingFreeModel(m) {
 
 export async function validateFreeModels() {
   log("[models] pinging free models...");
-  const results = await Promise.all(FREE_TIER_MODELS.map(async (m) => {
+  try {
+    await fetchModelsDev();
+  } catch {}
+  if (!_zenFreeDiscovered.length) discoverZenFreeModels();
+  // Get first available key for freemium detection
+  let firstKey = null;
+  if (config.hasKey) {
+    if (Bun.env.OPENCODE_API_KEY && Bun.env.OPENCODE_API_KEY.length > 5) {
+      firstKey = Bun.env.OPENCODE_API_KEY;
+    } else if (Bun.env.OPENCODE_API_KEYS) {
+      try {
+        const arr = JSON.parse(Bun.env.OPENCODE_API_KEYS);
+        firstKey = arr.find(k => k.length > 5) || null;
+      } catch {}
+    }
+  }
+  const allCandidates = [...FREE_TIER_MODELS, ..._zenFreeDiscovered];
+  const results = await Promise.all(allCandidates.map(async (m) => {
     if (m._poll) {
-      // Pollination models don't go through OpenCode free API — skip ping
       m._active = true;
       log(`[models]   ${m.id} - SKIP (poll)`);
       return true;
     }
-    const { ok, ms } = await pingFreeModel(m);
+    let { ok, ms, status } = await pingFreeModel(m);
+    m._freemium = false;
+    if (!ok && firstKey) {
+      // Freemium detection: if 401 without key, retry with key
+      const withKeyRes = await pingFreeModel(m, firstKey);
+      if (withKeyRes.ok) {
+        ok = true;
+        ms = withKeyRes.ms;
+        m._freemium = true;
+      }
+    }
     m._active = ok;
-    log(`[models]   ${m.id} - ${ok ? "OK" : "OFFLINE"} (${ms}ms)`);
+    const label = ok ? (m._freemium ? "FREEMIUM" : "OK") : "OFFLINE";
+    const tag = m._zenDiscovered ? "*" : "";
+    log(`[models]   ${m.id}${tag} - ${label} (${ms}ms)`);
     return ok;
   }));
   return results.filter(Boolean).length;
@@ -171,7 +226,14 @@ function sepModel(id, label) {
 
 export function isFreeTierModel(id) {
   const clean = (id || "").split(":")[0].trim().toLowerCase();
-  return FREE_TIER_MODELS.some(m => m.id.toLowerCase() === clean);
+  return FREE_TIER_MODELS.some(m => m.id.toLowerCase() === clean)
+      || _zenFreeDiscovered.some(m => m.id.toLowerCase() === clean);
+}
+
+export function isFreemiumModel(id) {
+  const clean = (id || "").split(":")[0].trim().toLowerCase();
+  const entry = _modelMap[clean];
+  return !!(entry?._freemium);
 }
 
 export function isPollModel(id) {
@@ -786,6 +848,7 @@ async function fetchModels() {
 
   const start = Date.now();
   const md = await fetchModelsDev();
+  if (!_zenFreeDiscovered.length) discoverZenFreeModels();
   const allModels = { ...(md["opencode-go"]?.models || {}), ...(md["opencode"]?.models || {}) };
   const goModels = md["opencode-go"]?.models || {};
   const now = new Date().toISOString().replace(/\.\d+Z$/, "Z");
@@ -906,7 +969,12 @@ async function fetchModels() {
 
   // Always register free models in the maps
   for (const m of FREE_TIER_MODELS) {
-    _modelMap[m.id.toLowerCase()] = { id: m.id, name: m.name, tools: m.tools, vision: m.vision };
+    _modelMap[m.id.toLowerCase()] = { id: m.id, name: m.name, tools: m.tools, vision: m.vision, _freemium: m._freemium || false };
+    _nameToId[m.name.toLowerCase()] = m.id;
+  }
+  for (const m of _zenFreeDiscovered) {
+    if (m._active === false) continue;
+    _modelMap[m.id.toLowerCase()] = { id: m.id, name: m.name, tools: m.tools, vision: m.vision, _freemium: m._freemium || false };
     _nameToId[m.name.toLowerCase()] = m.id;
   }
 
@@ -949,6 +1017,8 @@ export async function initModels() {
   } catch { log("[models] ping big-pickle → unreachable"); }
   // Fetch paid models async (don't block startup)
   _bgFetch = fetchGoModelsRaw().then(async () => {
+    // Detect freemium models (ping without key → 401 → retry with key)
+    if (!config.hideFree) await validateFreeModels();
     if (_paidGoData?.data?.length) {
       await fetchModels();
       await saveModelsToDisk();
@@ -1246,6 +1316,8 @@ export function resolveModel(name) {
   
   const freeMatch = FREE_TIER_MODELS.find(m => m.id.toLowerCase() === clean);
   if (freeMatch) return { id: freeMatch.id, name: freeMatch.name, tools: freeMatch.tools, vision: freeMatch.vision };
+  const zenMatch = _zenFreeDiscovered.find(m => m.id.toLowerCase() === clean);
+  if (zenMatch) return { id: zenMatch.id, name: zenMatch.name, tools: zenMatch.tools, vision: zenMatch.vision, _freemium: zenMatch._freemium };
   
   return { id: clean, name: clean, tools: true, vision: false, unverified: true };
 }
@@ -1260,6 +1332,7 @@ export function isKnownModel(id) {
   if (_modelMap[clean]) return true;
   if (_nameToId[clean]) return true;
   if (FREE_TIER_MODELS.find(m => m.id.toLowerCase() === clean)) return true;
+  if (_zenFreeDiscovered.find(m => m.id.toLowerCase() === clean)) return true;
   return false;
 }
 
@@ -1308,7 +1381,8 @@ function resolvePollModelName(id) {
 async function zenRequest(endpoint, body, opts = {}) {
   const isPoll = isPollModel(body.model);
   const isFree = !isPoll && isFreeTierModel(body.model);
-  const base = isPoll ? config.baseUrlPoll : (isFree ? config.baseUrlFree : config.baseUrl);
+  const isFm = !isPoll && isFreemiumModel(body.model);
+  const base = isPoll ? config.baseUrlPoll : ((isFree || isFm) ? config.baseUrlFree : config.baseUrl);
   const url = `${base}${endpoint}`;
   const key = withKey();
   const clientTag = opts?.clientTag || "";
@@ -1323,7 +1397,7 @@ async function zenRequest(endpoint, body, opts = {}) {
     sendBody.model = resolvePollModelName(body.model);
   }
   
-  const provider = isPoll ? "pol" : (isFree ? "zen" : "go");
+  const provider = isPoll ? "pol" : (isFm ? "zen" : (isFree ? "zen" : "go"));
 
   const headers = {
     "Content-Type": "application/json",
@@ -1331,9 +1405,17 @@ async function zenRequest(endpoint, body, opts = {}) {
   };
   
   // Poll models: no auth needed (free public API)
-  // Free models: never send auth. Paid: require key.
+  // Freemium models: free endpoint but require API key
+  // Free models (non-freemium): no auth needed
+  // Paid: require key.
   if (isPoll) {
     // Pollinations is a public API, no auth needed
+  } else if (isFm) {
+    if (key) {
+      headers["Authorization"] = `Bearer ${key}`;
+    } else {
+      throw new APIError(401, "", "Freemium models require an OpenCode API key. Configure OPENCODE_API_KEY or OPENCODE_API_KEYS.");
+    }
   } else if (key && !isFree) {
     headers["Authorization"] = `Bearer ${key}`;
   } else if (!isFree) {
@@ -1445,6 +1527,16 @@ function applyModelDefaults(modelId, body) {
       if (def.minMaxTokens && (body.max_tokens == null || body.max_tokens < def.minMaxTokens)) {
         body.max_tokens = def.minMaxTokens;
       }
+    }
+  }
+  // When tools are present, ensure enough output tokens for complete responses.
+  // Use the higher of VS's value and our calculated value.
+  if (body.tools?.length) {
+    const meta = resolveModelMetadata(modelId);
+    const ctx = meta.context_length || 131072;
+    const minTokens = Math.min(Math.floor(ctx * 0.1), 32768);
+    if (body.max_tokens == null || body.max_tokens < minTokens) {
+      body.max_tokens = minTokens;
     }
   }
 }

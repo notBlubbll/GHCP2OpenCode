@@ -2,7 +2,7 @@
 
 Ollama-emulating proxy that connects **GitHub Copilot Chat&Agent** to the [OpenCode](https://opencode.ai) Zen + Go APIs + models.
 
-**No key needed** — free models work immediately. Add a Go key in `.env` to unlock paid models. Full tool calling and streaming.
+**No key needed** — free models work immediately. Add an API key in `.env` to unlock paid models *and* enable **freemium** mode (free models with API key auth). Full tool calling and streaming.
 
 ---
 
@@ -88,6 +88,7 @@ You can now select any model from the dropdown. No model IDs to configure — th
 | Prefix | Meaning |
 |--------|---------|
 | `[FREE]` | Free tier — always available, no key needed |
+| `[FREE*]` | Freemium — free model, requires API key (orange in console) |
 | `[GO]` | Premium — requires `OPENCODE_API_KEY` in `.env` |
 | `[M365]` | Microsoft 365 Copilot — requires `M365C_TOKEN_PATH` in `.env` |
 
@@ -96,13 +97,15 @@ in VSCode:
 <img width="1392" height="525" alt="image" src="https://github.com/user-attachments/assets/bc6a2a58-776b-4d2e-8fd8-bcf5f15b7bfa" />
 
 
-### 3. (Optional) Unlock paid models
+### 3. (Optional) Unlock paid & freemium models
 
 ```env
 # .env
 OPENCODE_API_KEY=your-go-key
 OPENCODE_API_KEYS=["key1","key2"]  # multi-key rotation
 ```
+
+Adding an API key enables **freemium** mode — the Zen free models are also available with API key authentication (shown in orange in the console). Paid models are fetched dynamically and support full tool calling.
 
 **Startup key validation**: On launch, the proxy pings `deepseek-v4-flash` with `max_tokens: 1` to verify the key can run inference. If it returns 429, the key is marked as rate-limited (with timing extracted from the error message, e.g. `Resets in 1 day`) and paid models are hidden from the list — avoiding wasted API calls on an unusable key. If `deepseek-v4-flash` returns 404, it falls back to the first premium model in the API response. Cooldown state is persisted to `.cache/key-state.json` and respected on restart.
 
@@ -181,9 +184,11 @@ This means a key rate-limited from a previous session will never be pinged on re
 
 ## Models
 
-Models appear in VS Code's Copilot list as `[FREE] Model Name`, `[GO] Model Name`, and `[M365] M365 Copilot` — the prefix indicates free vs paid vs M365 tier at a glance.
+Models appear in VS Code's Copilot list as `[FREE] Model Name`, `[FREE*] Model Name`, `[GO] Model Name`, and `[M365] M365 Copilot` — the prefix indicates free vs freemium vs paid vs M365 tier at a glance.
 
 **Free** (always available, auto-validated): Big Pickle, MiniMax M2.5 Free, Nemotron 3 Super Free, Ring 2.6 1T Free
+
+**Freemium** (requires API key, same Zen free models — auto-detected via ping): Big Pickle, MiniMax M2.5 Free, Nemotron 3 Super Free, Ring 2.6 1T Free — these route to the same free Zen endpoint but authenticate with your API key. On startup, each free model is pinged without a key; if it returns 401, it's retried with your API key. Models that succeed with the key are marked **freemium** and shown in orange in the console.
 
 **Paid** (requires Go API key): fetched dynamically from OpenCode — all support tool calling
 

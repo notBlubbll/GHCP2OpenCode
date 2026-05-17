@@ -5,7 +5,7 @@
 
 Ollama-emulating proxy that connects **GitHub Copilot Chat&Agent** to the [OpenCode](https://opencode.ai) Zen + Go APIs + models.
 
-**No key needed** — free models work immediately. Add an API key in `.env` to unlock paid models *and* enable **freemium** mode (free models with API key auth). Full tool calling and streaming.
+**No key needed** — free models work immediately. Add an API key in `.env` to unlock paid models *and* enable **premium** mode (models from your go sub). Full tool calling and streaming.
 
 ---
 

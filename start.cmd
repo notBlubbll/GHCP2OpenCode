@@ -3,8 +3,6 @@ setlocal enabledelayedexpansion
 
 set GC2OC_WRAPPED=1
 
-title gc2oc
-
 REM ============================================
 REM  gc2oc — GitHub Copilot to OpenCode
 REM ============================================
@@ -25,6 +23,7 @@ if "%SERVER_PORT%"=="" set SERVER_PORT=11434
 REM 2. Kill any existing gc2oc instance by window title, then clean port
 echo [INFO] Stopping any existing gc2oc instance...
 taskkill /fi "WINDOWTITLE eq gc2oc" /f >nul 2>&1
+title gc2oc
 REM Wait briefly for process to die
 timeout /t 1 /nobreak >nul
 REM Port Cleanup with retry (matching service.exe 4x1s behavior)

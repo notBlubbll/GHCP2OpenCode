@@ -1489,7 +1489,7 @@ async function zenRequest(endpoint, body, opts = {}) {
 
     // Handle 429 (rate limit) — retry for all models (key rotation for paid, delay for free)
     if (resp.status === 429 && retries < maxRetries) {
-      if (key && !isFree && !isPoll) {
+      if (key && (isFm || !isFree) && !isPoll) {
         let resetSec = 0;
         try {
           const parsed = JSON.parse(txt);
@@ -1508,8 +1508,8 @@ async function zenRequest(endpoint, body, opts = {}) {
         }
       }
 
-      const tag = (isFree || isPoll) ? "(keyless)" : `${key.slice(0, 6)}...${key.slice(-4)}`;
-      const delay = (isFree || isPoll) ? 5000 : RETRY_DELAY_429;
+      const tag = (isFm || !isFree) && key ? `${key.slice(0, 6)}...${key.slice(-4)}` : "(keyless)";
+      const delay = (isFm || !isFree) ? RETRY_DELAY_429 : 5000;
       if (config.requestLog) log(`[${provider}] retry ${retries + 1}/${maxRetries} after ${resp.status} (${tag})`);
       await new Promise(r => setTimeout(r, delay));
       return zenRequest(endpoint, body, { ...opts, retries: retries + 1 });

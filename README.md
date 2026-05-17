@@ -15,7 +15,7 @@ Ollama-emulating proxy that connects **GitHub Copilot Chat&Agent** to the [OpenC
 
 <table><tr>
 <td><img width="731" height="643" alt="image" src="https://github.com/user-attachments/assets/0185f535-1000-47ae-af70-ad3abdc9a43c" /></td>
-<td><img alt="Console free mode" src="https://github.com/user-attachments/assets/d9116837-967d-41a0-bfd0-b4dee2eefd47"></td>
+<td><img alt="Console free mode" src="https://github.com/user-attachments/assets/1b19f2d9-5ba8-4d2e-ada6-fd096120d67a"></td>
 
 </tr></table>
 

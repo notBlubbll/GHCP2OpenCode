@@ -44,14 +44,15 @@ import { Hono } from "hono";
 import { stream } from "hono/streaming";
 import { cors } from "hono/cors";
 import { compress } from "hono/compress";
-import { config, getModels, initModels, resolveModel, resolveModelMetadata, isKnownModel, chatCompletion, APIError, isSeparator, isFreeTierModel, isFreemiumModel, isPollModel, isM365Model, SEP_PAID, SEP_FREE, SEP_FREE_P, SEP_M365, refreshModels, validateFreeModels, bgFetchDone, getKeyStatus, fetchWithAgent, getThinkingModes, parseThinkingMode } from "./opencode-client.js";
+import { config, getModels, initModels, resolveModel, resolveModelMetadata, isKnownModel, chatCompletion, APIError, isSeparator, isFreeTierModel, isFreemiumModel, isPollModel, isM365Model, isCrofModel, SEP_PAID, SEP_FREE, SEP_FREE_P, SEP_M365, SEP_CROF, refreshModels, validateFreeModels, bgFetchDone, getKeyStatus, fetchWithAgent, getThinkingModes, parseThinkingMode } from "./opencode-client.js";
 import { check as cacheCheck, store as cacheStore, cacheKey } from "./cache.js";
 import { ModelConcurrencyManager, RateLimitError, truncateToolMessagesInPayload, checkRequestBodySize } from "./concurrency.js";
 import { compactIdentity, compactToolInstructions, compactOllamaToolInstructions, compactCodeCompletionPrompt, compressMessages, compressHistory, buildToolRunSummary, condenseAfterTaskComplete } from "./token-optimizer.js";
 import { m365ChatCompletion, m365ChatCompletionStream, M365CopilotError } from "./m365-client.js";
+import { isCrofAvailable } from "./crof-client.js";
 import { trackSession, touchSession, stopSession as keepaliveStopSession, shutdown as keepaliveShutdown, stats as keepaliveStats } from "./session-keepalive.js";
 import { handleServiceCommand, runAsService } from "./win-service.js";
-import { log, error as logErr, debug, reqLog, enableDashboard, disableDashboard, onCommand, collapseBanner, redrawBanner, setBoxWidth } from "./logger.js";
+import { log, error as logErr, debug, reqLog, enableDashboard, disableDashboard, onCommand, collapseBanner, expandBanner, redrawBanner, setBoxWidth } from "./logger.js";
 
 // ── Service command routing (early exit for install/uninstall) ──
 {
@@ -241,7 +242,7 @@ function _stripAllToolCalls(messages) {
 }
 
 // Check if a user message is just a greeting/chitchat with no actual task
-const _NO_TASK_KEYWORDS = /\b(fix|change|add|create|make|implement|write|build|debug|error|bug|issue|refactor|optimiz|test|deploy|install|setup|config|run|find|search|explain|show|list|[?]|help|how|what|can|need|want|modify|update|remove|delete|move|rename|convert|generate|rewrite)\b/i;
+const _NO_TASK_KEYWORDS = /\b(fix|change|add|create|make|implement|write|build|debug|error|bug|issue|refactor|optimiz|test|deploy|install|setup|config|run|find|search|explain|show|list|[?]|help|how|need|want|modify|update|remove|delete|move|rename|convert|generate|rewrite)\b/i;
 function _isNoTaskMessage(text) {
   if (!text) return true;
   const t = text.trim();
@@ -489,6 +490,7 @@ const _workspaceSessions = new Map(); // `${workspaceRoot}|${model}` → { convI
 // Workspace summaries — compact task-completion summaries to inject into future sessions
 const _workspaceSummaries = new Map(); // workspaceRoot → { summary: string, timestamp, sessionId, model }
 const _taskCompletedSessions = new Map(); // convId → true (set when LLM finishes task_complete naturally)
+const _recentlyCompleted = new Map(); // convId → timestamp (set after hard stop, drains next VS follow-up)
 const _rateLimitedSessions = new Map();     // convId → { at: timestamp } (set when upstream returns 429)
 let _sessionCounter = 0;
 
@@ -864,10 +866,14 @@ const MODEL_MAP = {};
 
 function mapModel(name) {
   const parsed = parseThinkingMode(name);
-  let clean = parsed.model.replace(":latest", "").split(":")[0].trim();
-  clean = clean.replace(/^\s*\[(?:FREE_P|FREE|GO|M365|m365)\]\s*/i, "").trim();
-  const mapped = MODEL_MAP[clean] || MODEL_MAP[clean.toLowerCase()];
+  const raw = parsed.model.replace(/^\s*\[(?:FREE_P|FREE|GO|M365|m365|CROF|crof)\]\s*/i, "").trim();
+  let clean = raw.replace(/:latest$/i, "").split(":")[0].trim();
+  const fullClean = raw.replace(/:latest$/i, "").trim();
+  const mapped = MODEL_MAP[clean] || MODEL_MAP[clean.toLowerCase()] || MODEL_MAP[fullClean] || MODEL_MAP[fullClean.toLowerCase()];
   if (mapped) return mapped;
+  // Try full name via resolveModel which handles display names with colons
+  const resolved = resolveModel(fullClean);
+  if (resolved && !resolved.unverified) return resolved.id;
   return resolveModel(clean).id;
 }
 
@@ -1703,6 +1709,7 @@ app.get("/api/list", handleTags);
 app.get("/api/models", handleTags);
 
 async function handleTags(c) {
+  await _checkCrofRefresh();
   if (Date.now() - _lastRefresh > 60000) {
     _lastRefresh = Date.now();
     await refreshModels();
@@ -1729,7 +1736,8 @@ async function handleTags(c) {
     const isFree = isFreeTierModel(m.model);
     const isPoll = isPollModel(m.model);
     const isM365 = isM365Model(m.model);
-    const prefix = isM365 ? "[m365] " : (isPoll ? "[FREE_P] " : (isFree ? "[FREE] " : "[GO] "));
+    const isCrof = isCrofModel(m.model);
+    const prefix = isM365 ? "[m365] " : (isCrof ? "[CROF] " : (isPoll ? "[FREE_P] " : (isFree ? "[FREE] " : "[GO] ")));
     const family = m.details?.family || rawId;
     const metadata = resolveModelMetadata(rawId);
     const caps = metadata.capabilities || [];
@@ -1766,7 +1774,7 @@ async function handleTags(c) {
         capabilities: caps,
         context_length: ctxLen,
         max_output_tokens: Math.min(Math.floor(ctxLen * 0.1), 32768),
-        pricing: isM365 ? "m365" : (isPoll ? "free_poll" : (isFree ? "free" : "premium")),
+        pricing: isM365 ? "m365" : (isCrof ? "crof" : (isPoll ? "free_poll" : (isFree ? "free" : "premium"))),
         details: {
           parent_model: parentModel || (m.details?.parent_model || ""),
           format: m.details?.format || "gguf",
@@ -1822,6 +1830,36 @@ app.get("/version", async c => {
 });
 
 let _lastRefresh = 0;
+let _lastCrofAvail = null;
+
+// Check if Crof API key availability has changed since last check.
+// If so, trigger model refresh so Crof models appear/disappear without restart.
+async function _checkCrofRefresh() {
+  const nowAvail = isCrofAvailable();
+  if (_lastCrofAvail !== null && nowAvail !== _lastCrofAvail) {
+    log(`[crof] key ${nowAvail ? "set" : "removed"} — refreshing models`);
+    _lastCrofAvail = nowAvail;
+    if (Date.now() - _lastRefresh > 5000) {
+      _lastRefresh = Date.now();
+      await refreshModels();
+    }
+    return;
+  }
+  _lastCrofAvail = nowAvail;
+  // Also check: key is set but no Crof models exist in the loaded list
+  if (nowAvail && _lastRefresh > 0) {
+    const models = await getModels();
+    const hasCrofModels = models.some(m => SEP_CROF && (m.model || "").replace(":latest", "").startsWith(SEP_CROF));
+    if (!hasCrofModels) {
+      log(`[crof] key set but no Crof models — refreshing`);
+      if (Date.now() - _lastRefresh > 5000) {
+        _lastRefresh = Date.now();
+        await refreshModels();
+      }
+    }
+  }
+}
+
 app.get("/api/ps", async c => {
   const vsc = isVSCode(c);
   const allModels = await getModels();
@@ -2059,7 +2097,8 @@ app.get("/v1/models", async c => {
     const isFree = isFreeTierModel(m.model);
     const isPoll = isPollModel(m.model);
     const isM365 = isM365Model(m.model);
-    const prefix = isM365 ? "[m365] " : (isPoll ? "[FREE_P] " : (isFree ? "[FREE] " : "[GO] "));
+    const isCrof = isCrofModel(m.model);
+    const prefix = isM365 ? "[m365] " : (isCrof ? "[CROF] " : (isPoll ? "[FREE_P] " : (isFree ? "[FREE] " : "[GO] ")));
     const id = vsc ? prefix + m.name : m.name;
     const metadata = resolveModelMetadata(rawId);
     const family = metadata.family;
@@ -2114,7 +2153,7 @@ app.get("/v1/models", async c => {
           type: "chat",
           family,
         },
-        pricing: isM365 ? "m365" : (isPoll ? "free_poll" : (isFree ? "free" : "premium")),
+        pricing: isM365 ? "m365" : (isCrof ? "crof" : (isPoll ? "free_poll" : (isFree ? "free" : "premium"))),
         context_length: ctxLen,
         max_output_tokens: Math.min(Math.floor(ctxLen * 0.1), 32768),
       });
@@ -2139,6 +2178,7 @@ app.get("/v1/models", async c => {
 
 app.post("/v1/chat/completions", async c => {
   const rawBody = await getBody(c);
+  await _checkCrofRefresh();
   const body = normalizeOpenAIParams(rawBody);
   const rawModel = body.model || config.defaultModel;
   const modelParse = parseThinkingMode(rawModel);
@@ -2204,7 +2244,7 @@ app.post("/v1/chat/completions", async c => {
 
   // ── Early model mapping & session context (before expensive body processing) ──
   const goModel = mapModel(model);
-  const provider = isM365Model(goModel) ? "m365" : isPollModel(goModel) ? "poll" : isFreeTierModel(goModel) ? "zen" : "go";
+  const provider = isM365Model(goModel) ? "m365" : isCrofModel(goModel) ? "crof" : isPollModel(goModel) ? "poll" : isFreeTierModel(goModel) ? "zen" : "go";
   const reasoningCtx = createReasoningContext(messages, goModel, getWorkspaceRoot(messages), clientTag, provider, thinkingTag);
   // DEBUG: log raw first user message (VS context block) on every request, hidden
   if (messages.length > 0) {
@@ -2448,9 +2488,12 @@ app.post("/v1/chat/completions", async c => {
     // ── Condense tool history after task_complete ──
     // Only fires at the start of a NEW request after the LLM finished a task
     // naturally (not cancelled). Replaces heavy tool messages with a compact
-    // summary and returns a hard stop — the task is done, no more LLM calls needed.
+    // summary and returns task_complete so VS stops nagging.
     if (_taskCompletedSessions.get(reasoningCtx.conv)) {
       _taskCompletedSessions.delete(reasoningCtx.conv);
+      // Mark as recently completed so the inevitable VS follow-up
+      // ("Task marked as complete") is drained without another LLM call.
+      _recentlyCompleted.set(reasoningCtx.conv, Date.now());
       const before = userMsgs.length;
       const condensed = condenseAfterTaskComplete(userMsgs);
       if (condensed.length < before) {
@@ -2462,16 +2505,38 @@ app.post("/v1/chat/completions", async c => {
       }
       // Task is done — return hard stop instead of forwarding to LLM
       reasoningCtx.seslog(`\x1b[33m[autopilot] task already done — returning hard stop after condensation\x1b[0m`);
+      const hardTc = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
       if (clientWantsStream) {
         return stream(c, async s => {
           const w = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
           const base = { id: chatId, object: "chat.completion.chunk", created, model, system_fingerprint: systemFp };
           await w({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
-          await _simStream(w, base, false, [], "The task has already been completed. No further action needed.", null);
+          await _simStream(w, base, true, hardTc, "", null);
           await s.write("data: [DONE]\n\n");
         });
       }
-      return c.json(oaiResp("The task has already been completed. No further action needed.", undefined, "stop", model));
+      return c.json(oaiResp(null, hardTc, "tool_calls", model));
+    }
+
+    // ── Drain VS follow-up after task_complete ──
+    // VS sends "Task marked as complete" after receiving task_complete.
+    // Drain it silently instead of forwarding to the LLM.
+    {
+      const rc = _recentlyCompleted.get(reasoningCtx.conv);
+      if (rc && Date.now() - rc < 20000) {
+        _recentlyCompleted.delete(reasoningCtx.conv);
+        reasoningCtx.seslog(`\x1b[33m[autopilot] VS post-completion — draining silently\x1b[0m`);
+        if (clientWantsStream) {
+          return stream(c, async s => {
+            const w = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
+            const base = { id: chatId, object: "chat.completion.chunk", created, model, system_fingerprint: systemFp };
+            await w({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+            await _simStream(w, base, false, [], "", null);
+            await s.write("data: [DONE]\n\n");
+          });
+        }
+        return c.json(oaiResp("", undefined, "stop", model));
+      }
     }
 
     // ── VS nag detection ──
@@ -2571,6 +2636,40 @@ app.post("/v1/chat/completions", async c => {
       systemMsg += (systemMsg ? "\n\n" : "") + compactToolInstructions(clientTag);
     }
 
+    // ── Auto-resolve VS nags after text-only conversations ──
+    // If the entire conversation has had ZERO tool activity (just text Q&A)
+    // and VS is nagging about task completion, short-circuit with task_complete
+    // instead of forwarding the nag to the LLM. For real tasks with tools,
+    // the last assistant would have tool_calls and this won't fire.
+    if (vsTaskCompleteNags > 0) {
+      const hasToolActivity = messages.some(m =>
+        m.role === "assistant" && (
+          m.tool_calls?.length ||
+          /```tool\n\{|## `[^`]+`\n```/.test(typeof m.content === "string" ? m.content : "")
+        )
+      );
+      if (!hasToolActivity) {
+        const lastUM = userMsgs[userMsgs.length - 1];
+        const nagRe = /\byou have not yet marked the task as complete\b/i;
+        const isLastMsgNag = lastUM?.role === "user" && typeof lastUM.content === "string" && nagRe.test(lastUM.content);
+        if (isLastMsgNag) {
+          reasoningCtx.seslog(`\x1b[33m[autopilot] auto task_complete after text-only conversation (${vsTaskCompleteNags} nag(s))\x1b[0m`);
+          _recentlyCompleted.set(reasoningCtx.conv, Date.now());
+          const tc = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
+          if (clientWantsStream) {
+            return stream(c, async s => {
+              const w = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
+              const base = { id: chatId, object: "chat.completion.chunk", created, model, system_fingerprint: systemFp };
+              await w({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+              await _simStream(w, base, true, tc, "", null);
+              await s.write("data: [DONE]\n\n");
+            });
+          }
+          return c.json(oaiResp(null, tc, "tool_calls", model));
+        }
+      }
+    }
+
     // Forward to Go API with native tool support
     const apiMessages = [];
     // Strip VS nag messages so they don't confuse the model
@@ -2595,7 +2694,17 @@ app.post("/v1/chat/completions", async c => {
         if (tl === "continue" || tl === "proceed" || tl === "go on" || tl === "go ahead") {
           if (_taskCompletedSessions.get(reasoningCtx.conv)) {
             reasoningCtx.seslog(`\x1b[33m[autopilot] task already done — returning hard stop for bare "${t}"\x1b[0m`);
-            return c.json(oaiResp("The task has already been completed. No further action needed.", undefined, "stop", model));
+            const hardTc = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
+            if (clientWantsStream) {
+              return stream(c, async s => {
+                const w = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
+                const base = { id: chatId, object: "chat.completion.chunk", created, model, system_fingerprint: systemFp };
+                await w({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+                await _simStream(w, base, true, hardTc, "", null);
+                await s.write("data: [DONE]\n\n");
+              });
+            }
+            return c.json(oaiResp(null, hardTc, "tool_calls", model));
           }
           reasoningCtx.seslog(`\x1b[35m[autopilot] replacing bare "${t}" → "Continue with your current task using the tools available."\x1b[0m`);
           userMsgs[userMsgs.length - 1] = { role: "user", content: "Continue with your current task using the tools available." };
@@ -2603,27 +2712,8 @@ app.post("/v1/chat/completions", async c => {
       }
     }
 
-    // Detect first-message greetings with no actual task — short-circuit before LLM.
-    // Check the last user message. Only fire on the initial request (no prior
-    // assistant/tool messages, no nags yet).
-    if (!vsTaskCompleteNags && userMsgs.filter(m => m.role !== "user").length === 0) {
-      const lum = userMsgs[userMsgs.length - 1];
-      const t = typeof lum?.content === "string" ? lum.content.trim() : "";
-      if (lum?.role === "user" && _isNoTaskMessage(t)) {
-        reasoningCtx.seslog(`\x1b[33m[no-task] greeting detected ("${t.slice(0, 40)}") — auto task_complete\x1b[0m`);
-        const tc = [{ id: callId(), type: "function", function: { name: "task_complete", arguments: "{}" } }];
-        if (clientWantsStream) {
-          return stream(c, async (s) => {
-            const w = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
-            const base = { id: chatId, object: "chat.completion.chunk", created, model, system_fingerprint: systemFp };
-            await w({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
-            await _simStream(w, base, true, tc, "", null);
-            await s.write("data: [DONE]\n\n");
-          });
-        }
-        return c.json(oaiResp(null, tc, "tool_calls", model));
-      }
-    }
+    // First-message greetings go straight to the LLM for a real response.
+    // The auto-resolve block above handles any subsequent VS nags.
 
     if (systemMsg) apiMessages.push({ role: "system", content: systemMsg });
     apiMessages.push(...userMsgs);
@@ -3342,7 +3432,8 @@ app.post("/api/show", async c => {
   const vs2026 = isVS2026(c);
   const isFree = isFreeTierModel(goId);
   const isPoll = isPollModel(goId);
-  const prefix = isPoll ? "[FREE_P] " : (isFree ? "[FREE] " : "[GO] ");
+  const isCrof = isCrofModel(goId);
+  const prefix = isCrof ? "[CROF] " : (isPoll ? "[FREE_P] " : (isFree ? "[FREE] " : "[GO] "));
   const thinkingMode = parseThinkingMode(b.model || b.name || "");
   const thinkingSuffix = thinkingMode.thinking ? ` [${thinkingMode.thinking}]` : "";
   const displayName = vsc ? prefix + info.name : info.name;
@@ -3353,7 +3444,7 @@ app.post("/api/show", async c => {
     template: '{{ if .System }}<|im_start|>system\n{{ .System }}<|im_end|>\n{{ end }}{{ range .Messages }}<|im_start|>{{ .Role }}\n{{ .Content }}<|im_end|>\n{{ end }}<|im_start|>assistant\n',
     version: "1.0.0",
     billing: { multiplier: 1 },
-    pricing: isPoll ? "free_poll" : (isFree ? "free" : "premium"),
+    pricing: isCrof ? "crof" : (isPoll ? "free_poll" : (isFree ? "free" : "premium")),
     context_length: ctxLen,
     max_output_tokens: Math.min(Math.floor(ctxLen * 0.1), 32768),
     capabilities: caps,
@@ -3417,7 +3508,7 @@ app.post("/api/chat", async c => {
       const apiThinking = parseThinkingMode(body.model).thinking;
   const vsTools = body.tools;
   _dumpToolSchemas(vsTools);
-  const provider = isM365Model(model) ? "m365" : isPollModel(model) ? "poll" : isFreeTierModel(model) ? "zen" : "go";
+  const provider = isM365Model(model) ? "m365" : isCrofModel(model) ? "crof" : isPollModel(model) ? "poll" : isFreeTierModel(model) ? "zen" : "go";
   const reasoningCtx = createReasoningContext(messages, model, getWorkspaceRoot(messages), clientTag, provider, apiThinking);
   // DEBUG: log raw first user message (VS context block) on every request, hidden
   if (messages.length > 0) {
@@ -3493,7 +3584,14 @@ app.post("/api/chat", async c => {
           if (tl === "continue" || tl === "proceed" || tl === "go on" || tl === "go ahead") {
             if (_taskCompletedSessions.get(reasoningCtx.conv)) {
               reasoningCtx.seslog(`\x1b[33m[autopilot] task already done — returning hard stop for bare "${t}"\x1b[0m`);
-              return c.json(oaiResp("The task has already been completed. No further action needed.", undefined, "stop", model));
+              const createdAt = new Date().toISOString();
+              await s.write(JSON.stringify({
+                model, created_at: createdAt,
+                message: { role: "assistant", content: "", tool_calls: [{ function: { name: "task_complete", arguments: {} } }] },
+                done: true, done_reason: "tool_calls",
+                total_duration: 0, load_duration: 0, prompt_eval_count: 0, prompt_eval_duration: 0, eval_count: 0, eval_duration: 0,
+              }) + "\n");
+              return;
             }
             reasoningCtx.seslog(`\x1b[35m[autopilot] replacing bare "${t}" → "Continue with your current task using the tools available."\x1b[0m`);
             userMsgs[userMsgs.length - 1] = { role: "user", content: "Continue with your current task using the tools available." };
@@ -3848,6 +3946,7 @@ await checkVersion();
 // Wait for background paid-model fetch to complete, then refresh model list
 await bgFetchDone();
 models = await getModels();
+_lastCrofAvail = isCrofAvailable();
 
 const B = "\x1b[1m";
 const R = "\x1b[0m";
@@ -3868,17 +3967,20 @@ const hr = S + H.repeat(boxW - 2);
 const hasPaid = models.some(m => m.model === `${SEP_PAID}:latest`);
 const hasPoll = models.some(m => m.model === `${SEP_FREE_P}:latest`);
 const hasM365 = models.some(m => m.model === `${SEP_M365}:latest`);
+const hasCrof = models.some(m => m.model === `${SEP_CROF}:latest`);
 const hasFreemium = models.some(m => m._freemium === true);
 const modeLabel = (hasPaid
   ? (config.hideFree ? " \x1b[32m(premium mode)\x1b[90m" : " \x1b[32m(premium+free mode)\x1b[90m")
   : (hasFreemium ? " \x1b[38;5;214m(freemium mode)\x1b[90m"
     : (hasPoll ? " \x1b[33m(free+poll mode)\x1b[90m" : " \x1b[33m(free mode)\x1b[90m")))
-  + (hasM365 ? " \x1b[36m+ M365\x1b[90m" : "");
+  + (hasM365 ? " \x1b[36m+ M365\x1b[90m" : "")
+  + (hasCrof ? " \x1b[35m+ Crof\x1b[90m" : "");
 if (hasPaid) { const ks = getKeyStatus(); const firstKey = ks[0]?.keyPrefix || "?"; log(`\x1b[32m[status] Authenticated — Premium+Free (${firstKey})\x1b[0m`); }
 else if (hasFreemium) log(`\x1b[38;5;214m[status] Freemium mode — free models use API key\x1b[0m`);
 else if (hasPoll) log("\x1b[33m[status] Free mode — OpenCode free + Pollinations\x1b[0m");
 else log("\x1b[33m[status] Free mode — no API key\x1b[0m");
 if (hasM365) log("\x1b[36m[status] M365 Copilot connected\x1b[0m");
+if (hasCrof) log("\x1b[35m[status] Crof API connected\x1b[0m");
 
 let _buildDate = "";
 try {
@@ -3907,18 +4009,21 @@ P(line(S + portLabel + "  \u2502  built " + C + _buildDate + R + S + "  \u2502  
 P(_cmdLine());
 P(W + "\u251C" + hr + W + "\u2524" + R);                                            // ├───┤
 
-// Split models into sections by separator order (M365 → Free → Poll → Premium)
+// Split models into sections by separator order (M365 → Crof → Free → Poll → Premium)
 const m365Start = models.findIndex(m => m.model === `${SEP_M365}:latest`);
+const crofStart = models.findIndex(m => m.model === `${SEP_CROF}:latest`);
 const freeStart = models.findIndex(m => m.model === `${SEP_FREE}:latest`);
 const pollStart = models.findIndex(m => m.model === `${SEP_FREE_P}:latest`);
 const paidStart = models.findIndex(m => m.model === `${SEP_PAID}:latest`);
 
 // Each section: from its separator+1 to the next separator (or end)
-const m365End = [freeStart, pollStart, paidStart, models.length].find(i => i >= 0);
+const m365End = [crofStart, freeStart, pollStart, paidStart, models.length].find(i => i >= 0);
+const crofEnd = [freeStart, pollStart, paidStart, models.length].find(i => i >= 0);
 const freeEnd = [pollStart, paidStart, models.length].find(i => i >= 0);
 const pollEnd = [paidStart, models.length].find(i => i >= 0);
 
 const m365Models = m365Start >= 0 ? models.slice(m365Start + 1, m365End) : [];
+const crofModels = crofStart >= 0 ? models.slice(crofStart + 1, crofEnd) : [];
 const freeModels = freeStart >= 0 ? models.slice(freeStart + 1, freeEnd) : [];
 const pollModels = pollStart >= 0 ? models.slice(pollStart + 1, pollEnd) : [];
 const paidModels = paidStart >= 0 ? models.slice(paidStart + 1) : [];
@@ -3926,6 +4031,7 @@ const paidModels = paidStart >= 0 ? models.slice(paidStart + 1) : [];
 // Build collapsed banner: header + category summaries + bottom border
 const _bannerCollapsed = [..._bannerLines];
 if (hasM365) _bannerCollapsed.push(line(S + C + "\u25B6 " + R + S + "M365 Copilot (" + m365Models.length + ")" + R));
+if (hasCrof) _bannerCollapsed.push(line(S + C + "\u25B6 " + R + S + "Crof (" + crofModels.length + ")" + R));
 if (!config.hideFree && freeModels.length) {
   const fmCount = freeModels.filter(m => m._freemium).length;
   const fmLabel = fmCount > 0 ? ` \x1b[38;5;214m${fmCount}freemium\x1b[0m` : "";
@@ -3947,12 +4053,25 @@ function printTable(list) {
     const nameW = 38;
     const rawName = m.name + thinkLabel;
     const nameLen = rawName.replace(/\x1b\[[0-9;]*m/g, "").length;
-    const name = nameLen > nameW
-      ? rawName.slice(0, nameW - 1) + "\u2026"
-      : rawName + " ".repeat(Math.max(0, nameW - nameLen));
-    const id = (m.model.replace(":latest", "")).length > 22
-      ? (m.model.replace(":latest", "")).slice(0, 21) + "\u2026"
-      : (m.model.replace(":latest", "")).padEnd(22);
+    let name;
+    if (nameLen > nameW) {
+      let vis = 0;
+      let out = "";
+      const parts = rawName.split(/(\x1b\[[0-9;]*m)/);
+      for (const p of parts) {
+        if (p.startsWith("\x1b[")) { out += p; continue; }
+        const take = Math.min(p.length, nameW - 1 - vis);
+        out += p.slice(0, take);
+        vis += take;
+        if (vis >= nameW - 1) break;
+      }
+      name = out + "\u2026";
+    } else {
+      name = rawName + " ".repeat(Math.max(0, nameW - nameLen));
+    }
+    const id = (m.model.replace(":latest", "").replace(/^crof\//, "")).length > 22
+      ? (m.model.replace(":latest", "").replace(/^crof\//, "")).slice(0, 21) + "\u2026"
+      : (m.model.replace(":latest", "").replace(/^crof\//, "")).padEnd(22);
     const n = +m.maxParams;
     const params = n
       ? (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}K` : String(n)).padEnd(7)
@@ -3967,8 +4086,15 @@ if (hasM365) {
   printTable(m365Models);
 }
 
-if (!config.hideFree && freeModels.length) {
+if (hasCrof) {
   if (hasM365) P(line(""));
+  P(line(S + C + "\u25C0 " + R + S + "Crof: " + S + `(${crofModels.length})` + R));
+  P(line(S + "Name".padEnd(38) + " \u2502 " + "ID".padEnd(22) + " \u2502 " + "Context".padEnd(7) + R));
+  printTable(crofModels);
+}
+
+if (!config.hideFree && freeModels.length) {
+  if (hasM365 || hasCrof) P(line(""));
   const fmSuffix = config.hasKey ? " \x1b[38;5;214m(freemium)\x1b[0m" : "";
   P(line(S + C + "\u25C0 " + R + S + "Free:" + fmSuffix + S + ` (${freeModels.length})` + R));
   P(line(S + "Name".padEnd(38) + " \u2502 " + "ID".padEnd(22) + " \u2502 " + "Context".padEnd(7) + R));
@@ -3976,14 +4102,14 @@ if (!config.hideFree && freeModels.length) {
 }
 
 if (config.showPollModels && pollModels.length) {
-  if (!config.hideFree && freeModels.length) P(line(""));
+  if (hasM365 || hasCrof || (!config.hideFree && freeModels.length)) P(line(""));
   P(line(S + C + "\u25C0 " + R + S + "Pollinations: " + S + `(${pollModels.length})` + R));
   P(line(S + "Name".padEnd(38) + " \u2502 " + "ID".padEnd(22) + " \u2502 " + "Context".padEnd(7) + R));
   printTable(pollModels);
 }
 
 if (hasPaid) {
-  if (!config.hideFree) P(line(""));
+  if (hasM365 || hasCrof || (!config.hideFree && freeModels.length) || (config.showPollModels && pollModels.length)) P(line(""));
   P(line(S + C + "\u25C0 " + R + S + "Premium: " + S + `(${paidModels.length})` + R));
   P(line(S + "Name".padEnd(38) + " \u2502 " + "ID".padEnd(22) + " \u2502 " + "Context".padEnd(7) + R));
   printTable(paidModels);
@@ -4103,6 +4229,7 @@ function gracefulShutdown(signal) {
   if (_shuttingDown) return;
   _shuttingDown = true;
   log(`Received ${signal} — gracefully shutting down (30s timeout)...`);
+  _recentlyCompleted.clear();
   keepaliveShutdown();
   setTimeout(() => { err("Forced exit after shutdown timeout"); process.exit(1); }, 30000);
   if (serverRef?.stop) {

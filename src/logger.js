@@ -52,14 +52,12 @@ function _startKeys() {
     _rawMode = true;
     process.stdin.resume();
     process.stdin.on("data", _onKey);
-    process.stdout.write("\x1b[?1049h");
   } catch {}
 }
 
 function _stopKeys() {
   if (!_rawMode) return;
   try {
-    process.stdout.write("\x1b[?1049l");
     process.stdin.removeListener("data", _onKey);
     process.stdin.setRawMode(false);
     _rawMode = false;
@@ -109,12 +107,12 @@ function _onKey(buf) {
     _redraw();
     return;
   }
-  if (s === "\x1b[C" || s === "\x1bOC") {        // Right arrow = expand models
-    if (_collapsed) { _collapsed = false; _banner = _bannerExpanded; _scrollMode = false; _scrollOffset = 0; _redraw(); }
+  if (s === "\x1b[C" || s === "\x1bOC") {        // Right arrow = expand models (exit ASB, show scrollbar)
+    if (_collapsed) { process.stdout.write("\x1b[?1049l"); _collapsed = false; _banner = _bannerExpanded; _scrollMode = false; _scrollOffset = 0; _redraw(); }
     return;
   }
-  if (s === "\x1b[D" || s === "\x1bOD") {        // Left arrow = collapse models
-    if (!_collapsed) { _collapsed = true; _banner = _bannerCollapsed; _scrollMode = false; _scrollOffset = 0; _redraw(); }
+  if (s === "\x1b[D" || s === "\x1bOD") {        // Left arrow = collapse models (enter ASB, hide scrollbar)
+    if (!_collapsed) { process.stdout.write("\x1b[?1049h"); _collapsed = true; _banner = _bannerCollapsed; _scrollMode = false; _scrollOffset = 0; _redraw(); }
     return;
   }
   if (_scrollMode) { _scrollMode = false; _scrollOffset = 0; _redraw(); }
@@ -335,6 +333,7 @@ export { ts, log, warn, error, debug, reqLog, enableDashboard, disableDashboard,
 
 function collapseBanner() {
   if (!_dashboard || _collapsed) return;
+  process.stdout.write("\x1b[?1049h");
   _collapsed = true;
   _banner = _bannerCollapsed;
   _scrollMode = false;
@@ -344,6 +343,7 @@ function collapseBanner() {
 
 function expandBanner() {
   if (!_dashboard || !_collapsed) return;
+  process.stdout.write("\x1b[?1049l");
   _collapsed = false;
   _banner = _bannerExpanded;
   _scrollMode = false;

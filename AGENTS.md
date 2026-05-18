@@ -20,17 +20,18 @@ GitHub Copilot extension             src/server.js                       OpenCod
   │  → /api/chat                       │  → compression                    │  OpenCode Go (paid)
   ▼                                    │  → caching                        │  https://opencode.ai/zen/go/v1
                                     ┌───┴──────────────┐                  │
-                                    │ Client detection  │                  │
-                                    │ ├─ isVS2026()     │                  │  Pollinations (free)
-                                    │ ├─ isVSInsiders() │                  │  https://text.pollinations.ai/openai
-                                    │ ├─ isVSCode()     │                  │
-                                    │ ├─ isSqlStudio()  │                  │
+                                    │ Client detection  │                  │  CrofAI (paid)
+                                    │ ├─ isVS2026()     │                  │  https://crof.ai/v1
+                                    │ ├─ isVSInsiders() │                  │
+                                    │ ├─ isVSCode()     │                  │  Pollinations (free)
+                                    │ ├─ isSqlStudio()  │                  │  https://text.pollinations.ai/openai
                                     │ └─ LocalPilot     │                  │
                                     └───┬──────────────┘                  │
                                         │                                  │  M365 Copilot (opt)
                                     ┌───┴──────────────┐                  │  ws://127.0.0.1:8765
                                     │ Model routing     │                  │  → substrate.office.com
                                     │ ├─ M365 → relay   │                  │
+                                    │ ├─ Crof → crof.   │                  │
                                     │ ├─ Free → Zen     │                  │
                                     │ ├─ Poll → Poll.   │                  │
                                     │ └─ Paid → Go      │                  │
@@ -61,7 +62,7 @@ GitHub Copilot extension             src/server.js                       OpenCod
 
 ## Source Files
 
-### `src/server.js` (~3920 lines)
+### `src/server.js` (~4250 lines)
 **Main entry point.** HTTP routing, request orchestration, response formatting.
 
 - `restartSelf(exitCode)` — spawn `cmd /c start` → new console → inner `cmd /c` runs the exe. Uses `process.execPath` (NOT `process.argv[0]` — in Bun-compiled binaries `argv[0]` is `"bun"`, not the exe path). Wrapped mode (`GC2OC_WRAPPED=1`): just `process.exit()`.
@@ -77,14 +78,15 @@ GitHub Copilot extension             src/server.js                       OpenCod
 - `_sessionRegistry` / `_sessionCounter` — global session tracking (Map of convId → { id, clientTag, createdAt }), assigns monotonic session numbers
 - `normalizeOpenAIParams()` — camelCase → snake_case parameter mapping
 - `sanitizeContent()` — strip `<|im_start|>`, `<|im_end|>` tokens
-- `mapModel(name)` — resolve model names, strip `[FREE]`/`[GO]`/`[M365]` prefixes
+- `mapModel(name)` — resolve model names, strip `[FREE]`/`[GO]`/`[M365]`/`[CROF]` prefixes
+- `_checkCrofRefresh()` — runtime Crof key state detector: when `CROF_API_KEY` is added/removed or the key is present but no Crof models exist in the registry, triggers an immediate model refresh so Crof models appear/disappear without restart. Called from `handleTags()` and `/v1/chat/completions`.
 - **Banner rendering** — builds a Unicode box-drawing table (`┌─┐ │ ├─┤ └─┘`, 78 chars wide) with GH2OC block-letter logo, model registry, command hints, and thinking mode labels. Produces two variants:
   - **Collapsed** (`_bannerCollapsed`): logo + port + commands + category summaries (`▶ Free (3)`) + bottom border
   - **Expanded** (`_bannerLines`): full model table with `◀` section headers and per-model thinking mode initials
-- **Thinking mode labels**: `L, M, H, XH` displayed after model names in white (`\x1b[37m`) with light-gray commas. Mapped via `getThinkingModes()` from `opencode-client.js`. Column widths: Name=38, ID=22, Context=7 (fits within 78-char box).
+- **Thinking mode labels**: `L, M, H, XH` displayed after model names in white (`\x1b[37m`) with light-gray commas. Mapped via `getThinkingModes()` from `opencode-client.js`. Column widths: Name=38, ID=22, Context=7 (fits within 78-char box). Truncation is ANSI-aware (splits on escape codes before slicing) to handle names with thinking mode labels.
 - **Build date display**: Port/status line shows `built YYYY-MM-DD` parsed from `.version` (Unix ms timestamp), replacing the hardcoded `vs2026` label.
 
-### `src/opencode-client.js` (1423 lines)
+### `src/opencode-client.js` (~1950 lines)
 **Model registry + upstream API communication.**
 
 - `config` — env-var-backed configuration getters
@@ -93,7 +95,7 @@ GitHub Copilot extension             src/server.js                       OpenCod
 - `resolveModel(name)` / `resolveModelMetadata(modelId)` — model lookup with metadata inference
 - `chatCompletion(req)` — **async generator** for SSE streaming from upstream
 - `zenRequest(endpoint, body, opts)` — upstream HTTP with key rotation, retry, cooldown
-- `isKnownModel()` / `isFreeTierModel()` / `isPollModel()` / `isSeparator()` / `isM365Model()` — model classifiers
+- `isKnownModel()` / `isFreeTierModel()` / `isPollModel()` / `isSeparator()` / `isM365Model()` / `isCrofModel()` — model classifiers
 - `APIError` — structured error with OpenAI-compatible codes
 - `getKeyStatus()` / `rotateKey()` — API key management
 
@@ -107,6 +109,13 @@ GitHub Copilot extension             src/server.js                       OpenCod
 - `getM365RelayModel(modelId)` — map proxy model ID to relay model string
 - `buildM365ChatText(payload)` — fold system prompts + conversation history into labeled plain text with `---` separator
 - `relayChatStream(payload, modelId)` — shared persistent WebSocket, serialized per-turn via `_sendGate`
+
+### `src/crof-client.js` (50 lines)
+**CrofAI API client — model list fetching + availability.**
+
+- `isCrofAvailable()` / `getCrofApiKey()` — check if `CROF_API_KEY` is configured
+- `getCrofModels()` — fetch model list from `https://crof.ai/v1/models` with auth. Returns models with `crof/` prefix in IDs to avoid conflicts with OpenCode Go models. Cached in memory.
+- `clearCrofCache()` — invalidate model cache on refresh
 
 ### `src/concurrency.js` (312 lines)
 **Concurrency limiting + retry + message truncation.**
@@ -145,10 +154,10 @@ GitHub Copilot extension             src/server.js                       OpenCod
 ### `src/completion-cache.js`
 **Reasoning cache + prompt-response cache integration.** Caches `<think>` tag text per message and re-attaches on cache hits so DeepSeek-style reasoning isn't lost.
 
-### `src/logger.js` (283 lines)
+### `src/logger.js` (354 lines)
 **Console dashboard TUI with virtual scrollback buffer.**
 
-- `enableDashboard(collapsedLines, expandedLines)` — enters raw-mode keyboard listener, enables alternate screen buffer (`\x1b[?1049h`, hides native scrollbar), paints banner + live log tail. Mouse reporting is disabled so text selection with cursor works.
+- `enableDashboard(collapsedLines, expandedLines)` — enters raw-mode keyboard listener, paints banner + live log tail. No alternate screen buffer by default (starts expanded with native scrollbar visible). Mouse reporting is disabled so text selection with cursor works.
 - `disableDashboard()` — exits raw mode, restores normal stdin.
 - `log(msg)` / `warn(msg)` / `error(msg)` / `debug(msg)` / `reqLog({...})` — in dashboard mode, push to virtual buffer (`_buffer`) and repaint live tail (last 5 entries) in-place below the banner. Outside dashboard mode, write to stdout/stderr normally. `debug()` always writes to console but only stores in the virtual buffer when `DEBUG=1`/`true`/`yes` (so debug messages don't clutter the scrollable history when debug is off).
 - **Banner variants**: `_bannerCollapsed` (GH2OC logo + port + commands + category count summaries + `└─┘`) and `_bannerExpanded` (full model table with `◀` section headers + `└─┘`). Switched via `_collapsed` flag.
@@ -226,7 +235,7 @@ Detected in priority order:
 | **SQL Studio** | `baggage` contains `SSMSAgent` | `sql` | No special handling |
 | **VS Insiders** | `baggage` contains `VirtualAgentModeResponder` | `vsi` | Non-streaming upstream, markdown tool extraction, file creation workflow, simulated SSE |
 | **VS 2026** | `baggage` contains `vs.copilot.` (not `VirtualAgentModeResponder`) | `vs` | Non-streaming upstream, markdown tool extraction, file creation workflow, simulated SSE |
-| **VS Code** | UA matches `/GitHubCopilotChat\//i` | `vscode` | Separators stripped from model lists, `[FREE]`/`[GO]`/`[M365]` prefixes in model names |
+| **VS Code** | UA matches `/GitHubCopilotChat\//i` | `vscode` | Separators stripped from model lists, `[FREE]`/`[GO]`/`[M365]`/`[CROF]` prefixes in model names |
 
 ---
 
@@ -238,6 +247,7 @@ Detected in priority order:
 | **Freemium** | OpenCode Zen (key req.) | Same 4 free models, but with API key | `Bearer {key}` | `https://opencode.ai/zen/v1/chat/completions` |
 | **Pollinations** | text.pollinations.ai | 7 models (1 real + 6 cosplay) | None | `https://text.pollinations.ai/openai/chat/completions` |
 | **Paid** | OpenCode Go | Dynamic | `Bearer {key}` | `https://opencode.ai/zen/go/v1/chat/completions` |
+| **Crof** | CrofAI | Dynamic | `Bearer {key}` | `https://crof.ai/v1/chat/completions` |
 | **M365** | M365 Copilot via relay WS | 2 models (Quick/Think) | Browser session | `ws://127.0.0.1:{M365CO_PORT}` |
 
 > **Freemium detection**: On startup and each model refresh, free models are pinged against the Zen free endpoint. Models that require a key (return 401 without auth) are retried with the API key. If they respond successfully, they are marked as **freemium** — displayed in orange in the model list and routed to the Zen free endpoint with `Bearer` auth.
@@ -335,12 +345,12 @@ Messages folded into labeled plain text with `---` separator (matching [m365-cop
 - **Key validation**: On startup, pings `deepseek-v4-flash` with `max_tokens: 1` *before* fetching the paid model list. If inference fails (429), paid models are skipped entirely and `Premium+Free` mode isn't advertised. If `deepseek-v4-flash` returns 404, falls back to the first premium model from the API with a warning.
 - **Rate-limit persistence**: 429 responses are parsed for `error.type` + `error.message` (e.g. `GoUsageLimitError: Weekly usage limit reached. Resets in 1 day.`). The timing is extracted from the message and persisted to `.cache/key-state.json`. On restart, cooldowns are respected — no ping or model fetch is performed while the key is still in cooldown.
 - **Key rotation**: Round-robin with cooldown. 401 → 7-day persisted cooldown (via `key-state.json`), 429 → persisted cooldown duration. Validated via real inference pings. Hash persisted to `.cache/keyhash.json`.
-- **Auto-compression**: `COMPRESSION_LEVEL=auto` selects `off` for ≤3 messages, `stacked` for free/poll, `caveman` for paid.
+- **Auto-compression**: `COMPRESSION_LEVEL=auto` selects `off` for ≤3 messages, `stacked` for free/poll, `caveman` for paid/crof.
 - **Tool output dropping**: Old (assistant tool_call → tool result) pairs are dropped at all compression levels above `off`. Groups are dropped atomically (all tool results from the same assistant are kept or dropped together) to prevent orphaned `tool` messages. Kept count per level: `lite`=8, `caveman`/`rtk`=6, `stacked`=4, `aggressive`=3, `ultra`=1. Override with `TOOL_OUTPUT_KEEP_COUNT=N`.
 - **Auto-restart**: Exit code 42 triggers restart, exit 43 triggers update-then-restart. The restart loop lives in `service.exe` (C# launcher). Console commands: `s`/`stop`, `r`/`restart`, `u`/`update`, `d`/`debug`, `c`/`clear` (type + Enter in dashboard raw mode). Characters echo while typing. `Ctrl+C` = stop.
 - **Console dashboard**: On startup, displays a Unicode box-drawing table with GH2OC block-letter logo, model registry, thinking mode labels, and command hints. Uses alternate screen buffer (hides native scrollbar) but no mouse reporting (text selection with cursor works). All `log()`/`warn()`/`error()`/`reqLog()` output is captured to a virtual scrollback buffer. Last 5 entries shown as "live tail" below the banner. Arrow keys (`↑`/`↓`/`PgUp`/`PgDn`) browse the full buffer via scroll overlay with page numbers. Any non-scroll key or typing exits scroll mode back to live tail.
 - **Debug toggle**: `d` + Enter toggles `DEBUG` on/off. When on, debug messages appear in the virtual scroll buffer; when off, they still print to the console but are excluded from the scrollback history.
-- **Model table collapse**: `→` (right arrow) expands full model table, `←` (left arrow) collapses to category count summaries. When collapsed: `▶ Free (3) ▶ Premium (15)`. Auto-collapses on the first chat request of any handler via `collapseBanner()`, then starts a 3s idle timer. Each subsequent request resets the timer. When the timer fires (3s after last request), auto-expands. Manual toggle (`_userToggled`) overrides idle expand until the next request. Auto-collapse calls `_redraw()` immediately so the banner switches without waiting for the next log entry.
+- **Model table collapse**: `→` (right arrow) expands to full table, `←` (left arrow) collapses to category summaries. When collapsed (`▶ Free (3)`), enters alternate screen buffer (`\x1b[?1049h`) to hide native scrollbar since the small banner + log tail fits in view. When expanded (full model table), exits ASB (`\x1b[?1049l`) so the native scrollbar is available — enables scrolling through the full table content. Auto-collapses on the first chat request of any handler via `collapseBanner()`, then starts a 3s idle timer. Each subsequent request resets the timer. When the timer fires (3s after last request), auto-expands. Manual toggle (`_userToggled`) overrides idle expand until the next request.
   - **Wrapped mode** (`GC2OC_WRAPPED=1` set by `service.exe`): `restartSelf()` calls `process.exit(42)`, the C# launcher catches exit code 42 and re-launches `gc2oc`/`node`.
   - **Standalone mode** (compiled `.exe` run directly, no wrapper): `restartSelf()` spawns `cmd /c start /D <wd> cmd /c <exe>` — opens a new independent console window. The inner `cmd /c` runs the exe. A 500ms delay before exit gives `start` time to create the new process.
   - **Bun binary caveat**: In Bun-compiled `.exe` binaries, `process.argv[0]` returns `"bun"`, NOT the exe path. Always use `process.execPath` for the exe path. Bun also kills all child processes on `process.exit()`, so spawning-based restart is fragile — the `cmd /c start` approach works because `start` creates the new console window before Bun exits.
@@ -495,6 +505,7 @@ Tracks tokens-per-second throughput from upstream streaming responses and displa
 - **Key hash mismatch** → full model refresh (keys added/removed/rotated)
 - **Free tier hash mismatch** → `FREE_TIER_MODELS` changed in code (new models added upstream)
 - **M365 presence mismatch** → `M365CO_PORT` set or removed vs cached state
+- **Crof key presence mismatch** → `CROF_API_KEY` set or removed vs cached state
 
 ### In-memory caches
 
@@ -505,6 +516,7 @@ Tracks tokens-per-second throughput from upstream streaming responses and displa
 | Free models | `src/opencode-client.js` `FREE_TIER_MODELS` | Static array | Hardcoded — validated via ping on startup |
 | HIDE_FREE | `Bun.env.HIDE_FREE` | Env var | `false` — hide free tier + separators, show only premium models |
 | Paid models | `src/opencode-client.js` `_paidGoData` | Module var | Fetched from `/zen/go/v1/models` |
+| Crof models | `src/crof-client.js` `_cachedModels` | Module var | Fetched from `https://crof.ai/v1/models` |
 
 ### Startup sequence (caching)
 
@@ -517,7 +529,8 @@ initModels()
   ├─ loadModelsFromDisk() — attempt to load .cache/models.json
   │   ├─ Validates key hash match (no rotation)
   │   ├─ Validates free tier SHA256 match (no code changes)
-  │   └─ Validates M365 token presence match
+  │   ├─ Validates M365 token presence match
+  │   └─ Validates Crof key presence match (CROF_API_KEY set vs cached state)
   │   → If valid: instant startup, background refresh via _bgFetch
   │   → If invalid: sync fetch from upstream, save to disk
   └─ _bgFetch = fetchGoModelsRaw() — background paid model validation

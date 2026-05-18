@@ -97,6 +97,7 @@ You can now select any model from the dropdown. No model IDs to configure — th
 | `[FREE]` | Free tier — always available, no key needed |
 | `[FREE*]` | Freemium — free model, requires API key (orange in console) |
 | `[GO]` | Premium — requires `OPENCODE_API_KEY` in `.env` |
+| `[CROF]` | CrofAI — requires `CROF_API_KEY` in `.env` |
 | `[M365]` | Microsoft 365 Copilot — requires `M365C_TOKEN_PATH` in `.env` |
 
 
@@ -175,6 +176,7 @@ This means a key rate-limited from a previous session will never be pinged on re
 | `DEFAULT_MODEL` | `big-pickle` | Fallback model |
 | `DEFAULT_TEMPERATURE` | — | Global temperature (e.g. `0.1`) |
 | `M365CO_PORT` | — | M365 WebSocket relay port (e.g. `8765`) |
+| `CROF_API_KEY` | — | CrofAI API key for Crof models (set to enable the Crof model section) |
 | `CACHE_ENABLED` | `true` | Prompt cache |
 | `CACHE_MAX_SIZE` | `64` | Max cached entries |
 | `CACHE_TTL_SEC` | `300` | Cache TTL |
@@ -191,7 +193,7 @@ This means a key rate-limited from a previous session will never be pinged on re
 
 ## Models
 
-Models appear in VS Code's Copilot list as `[FREE] Model Name`, `[FREE*] Model Name`, `[GO] Model Name`, and `[M365] M365 Copilot` — the prefix indicates free vs freemium vs paid vs M365 tier at a glance.
+Models appear in VS Code's Copilot list as `[FREE] Model Name`, `[FREE*] Model Name`, `[GO] Model Name`, `[CROF] Model Name`, and `[M365] M365 Copilot` — the prefix indicates free vs freemium vs paid vs Crof vs M365 tier at a glance.
 
 **Free** (always available, auto-validated): Big Pickle, MiniMax M2.5 Free, Nemotron 3 Super Free, Ring 2.6 1T Free
 
@@ -460,6 +462,18 @@ All route through the same Pollinations `openai` backend — no API key required
 | `HIDE_POLL_COSPLAY` | `true` | Hide cosplay aliases (GPT-5, Claude, Gemini, DeepSeek, Llama-4, Mistral) — only show GPT-OSS 20B |
 
 ---
+
+## CrofAI (optional)
+
+You can add [CrofAI](https://crof.ai) models as an additional model provider alongside OpenCode Go. Set `CROF_API_KEY` in `.env` to enable. Crof models appear with a `[CROF]` prefix in VS Code and are listed under a **Crof** section in the console banner.
+
+```env
+CROF_API_KEY=your-crof-key
+```
+
+Crof models use the `crof/` prefix in model IDs (e.g. `crof/deepseek-v4-flash`) to avoid conflicts with OpenCode Go models. All Crof models support tool calling, streaming, vision, and thinking modes.
+
+**Auto-refresh**: Crof models detect key state changes at runtime — add or remove `CROF_API_KEY` and the model list refreshes without restarting the proxy.
 
 ## Microsoft 365 Copilot (optional)
 

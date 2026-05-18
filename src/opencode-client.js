@@ -8,6 +8,7 @@ if (typeof Bun === 'undefined') {
 import { ModelConcurrencyManager } from "./concurrency.js";
 import { compressToolDefinitions } from "./token-optimizer.js";
 import { isM365Available, getM365Models } from "./m365-client.js";
+import { getCrofModels, isCrofAvailable, getCrofApiKey, clearCrofCache } from "./crof-client.js";
 import { log, warn, error, reqLog } from "./logger.js";
 
 // ── Optimized HTTP client with connection pooling (copilot-proxy pattern) ──
@@ -243,14 +244,15 @@ export function isPollModel(id) {
 
 export function isSeparator(id) {
   const clean = (id || "").split(":")[0].trim().toLowerCase();
-  return clean === SEP_FREE || clean === SEP_PAID || clean === SEP_FREE_P || clean === SEP_M365 ||
-    clean === "== free ==" || clean === "== premium ==" || clean === "== poll ==" || clean === "== m365 ==";
+  return clean === SEP_FREE || clean === SEP_PAID || clean === SEP_FREE_P || clean === SEP_M365 || clean === SEP_CROF ||
+    clean === "== free ==" || clean === "== premium ==" || clean === "== poll ==" || clean === "== m365 ==" || clean === "== crof ==";
 }
 
 const SEP_FREE = "(free)";
 const SEP_PAID = "(go)";
 const SEP_FREE_P = "(free_p)";
 const SEP_M365 = "(m365)";
+const SEP_CROF = "(crof)";
 
 const config = {
   get apiKey() { return Bun.env.OPENCODE_API_KEY ?? ""; },
@@ -264,6 +266,7 @@ const config = {
   baseUrl: Bun.env.OPENCODE_BASE_URL ?? "https://opencode.ai/zen/go/v1",
   baseUrlFree: Bun.env.OPENCODE_BASE_FREE_URL ?? "https://opencode.ai/zen/v1",
   baseUrlPoll: "https://text.pollinations.ai/openai",
+  baseUrlCrof: "https://crof.ai/v1",
   host: Bun.env.SERVER_HOST ?? "127.0.0.1",
   port: parseInt(Bun.env.SERVER_PORT ?? "11434", 10),
   defaultModel: Bun.env.DEFAULT_MODEL ?? "big-pickle",
@@ -800,6 +803,13 @@ function loadModelsFromDisk() {
         log(`[models] M365 ${envHasM365 ? "newly set" : "removed"} — forcing refresh`);
         return false;
       }
+      // Invalidate cache if Crof key presence changed
+      const cachedHasCrof = data._models.some(m => (m.model || "").replace(":latest", "").startsWith(SEP_CROF));
+      const envHasCrof = isCrofAvailable();
+      if (envHasCrof !== cachedHasCrof) {
+        log(`[models] Crof ${envHasCrof ? "newly set" : "removed"} — forcing refresh`);
+        return false;
+      }
       // M365 is enabled via relay — availability handled by m365-client.js
       _models = data._models;
       _modelMap = data._modelMap || {};
@@ -903,6 +913,45 @@ async function fetchModels() {
         _modelMap[m365Model.id.toLowerCase()] = { id: m365Model.id, name: m365Model.name, tools: false, vision: false, _m365: true };
         _nameToId[m365Model.name.toLowerCase()] = m365Model.id;
         m365Count++;
+      }
+    }
+  }
+
+  // Crof API (optional — after M365, before Free)
+  let crofCount = 0;
+  const crofAvail = isCrofAvailable();
+  if (crofAvail) {
+    const crofModels = await getCrofModels();
+    if (crofModels.length) {
+      models.push(sepModel(SEP_CROF, "== CROF =="));
+      for (const crofModel of crofModels) {
+        models.push({
+          name: crofModel.name,
+          model: `${crofModel.id}:latest`,
+          modified_at: now,
+          size: 0,
+          digest: crofModel.id,
+          maxParams: crofModel.context_length || 0,
+          details: {
+            parent_model: "",
+            format: "gguf",
+            family: crofModel.family,
+            families: [crofModel.family],
+            parameter_size: crofModel.context_length ? `${(crofModel.context_length / 1000).toFixed(0)}K` : "",
+            quantization_level: "F16",
+            tools: true,
+            vision: true,
+            supports_tools: true,
+            supports_function_calling: true,
+            supports_vision: true,
+          },
+          capabilities: { tools: true, vision: true, function_calling: true, tool_calling: true },
+          supports_tools: true,
+          supports_function_calling: true,
+        });
+        _modelMap[crofModel.id.toLowerCase()] = { id: crofModel.id, name: crofModel.name, tools: true, vision: true, _crof: true };
+        _nameToId[crofModel.name.toLowerCase()] = crofModel.id;
+        crofCount++;
       }
     }
   }
@@ -1298,6 +1347,7 @@ export async function refreshModels() {
   log("[models] refreshing from API...");
   const start = Date.now();
   await checkKeyChanged();
+  clearCrofCache();
   if (config.hideFree) log("[models] HIDE_FREE=true — skipping free model validation");
   await Promise.all([
     config.hideFree ? Promise.resolve() : validateFreeModels(),
@@ -1316,13 +1366,21 @@ export async function refreshModels() {
 
 export function resolveModel(name) {
   const parsed = parseThinkingMode(name);
-  let clean = parsed.model.split(":")[0].trim().toLowerCase();
+  const raw = parsed.model.replace(/^\[(?:FREE_P|FREE|GO|M365|m365|CROF|crof)\]\s*/i, "").trim();
+  let clean = raw.split(":")[0].trim().toLowerCase();
   clean = clean.replace(/\s*\(free\)$/i, ""); // strip "(Free)" suffix from tag list
   clean = clean.replace(/\u2009/g, " "); // normalize thin spaces for lookup
+  // Full name (minus :latest) for names containing colons
+  const fullClean = raw.replace(/:latest$/i, "").replace(/\u2009/g, " ").trim().toLowerCase();
   
   if (isSeparator(clean)) return { id: clean, name: clean, tools: false, vision: false, separator: true };
   
   if (_modelMap[clean]) return _modelMap[clean];
+  // Try full name lookup (handles display names with colons like "Experiment!: Greg")
+  if (_nameToId[fullClean]) {
+    const nmId = _nameToId[fullClean];
+    if (_modelMap[nmId.toLowerCase()]) return _modelMap[nmId.toLowerCase()];
+  }
   const nmId = _nameToId[clean];
   if (nmId && _modelMap[nmId.toLowerCase()]) return _modelMap[nmId.toLowerCase()];
   
@@ -1337,12 +1395,16 @@ export function resolveModel(name) {
 export function isKnownModel(id) {
   if (!id) return false;
   const parsed = parseThinkingMode(id);
-  let clean = parsed.model.split(":")[0].trim().toLowerCase();
+  const raw = parsed.model.replace(/^\[(?:FREE_P|FREE|GO|M365|m365|CROF|crof)\]\s*/i, "").trim();
+  let clean = raw.split(":")[0].trim().toLowerCase();
   clean = clean.replace(/\s*\(free\)$/i, "");
   clean = clean.replace(/\u2009/g, " "); // normalize thin spaces for lookup
+  // Full name (minus :latest) for names containing colons
+  const fullClean = raw.replace(/:latest$/i, "").replace(/\u2009/g, " ").trim().toLowerCase();
   if (isSeparator(clean)) return true;
   if (_modelMap[clean]) return true;
   if (_nameToId[clean]) return true;
+  if (_nameToId[fullClean]) return true;
   if (FREE_TIER_MODELS.find(m => m.id.toLowerCase() === clean)) return true;
   if (_zenFreeDiscovered.find(m => m.id.toLowerCase() === clean)) return true;
   return false;
@@ -1353,6 +1415,13 @@ export function isM365Model(id) {
   const clean = id.split(":")[0].trim().toLowerCase();
   const info = _modelMap[clean];
   return info?._m365 === true;
+}
+
+export function isCrofModel(id) {
+  if (!id) return false;
+  const clean = id.split(":")[0].trim().toLowerCase();
+  const info = _modelMap[clean];
+  return info?._crof === true;
 }
 
 function isoNow() { return new Date().toISOString(); }
@@ -1393,8 +1462,9 @@ function resolvePollModelName(id) {
 
 async function zenRequest(endpoint, body, opts = {}) {
   const isPoll = isPollModel(body.model);
-  const isFree = !isPoll && isFreeTierModel(body.model);
-  const isFm = !isPoll && isFreemiumModel(body.model);
+  const isFree = !isPoll && !isCrofModel(body.model) && isFreeTierModel(body.model);
+  const isFm = !isPoll && !isCrofModel(body.model) && isFreemiumModel(body.model);
+  const isCrof = isCrofModel(body.model);
 
   // Circuit breaker: block NEW free/poll requests after a 429 (retries within chain still go through)
   if ((isFree || isPoll) && _zen429Until > Date.now() && (opts.retries || 0) === 0) {
@@ -1409,7 +1479,7 @@ async function zenRequest(endpoint, body, opts = {}) {
     _zen429Until = Date.now() + 10000;
   }
 
-  const base = isPoll ? config.baseUrlPoll : ((isFree || isFm) ? config.baseUrlFree : config.baseUrl);
+  const base = isPoll ? config.baseUrlPoll : (isCrof ? config.baseUrlCrof : ((isFree || isFm) ? config.baseUrlFree : config.baseUrl));
   const url = `${base}${endpoint}`;
   const key = withKey();
   const clientTag = opts?.clientTag || "";
@@ -1423,8 +1493,11 @@ async function zenRequest(endpoint, body, opts = {}) {
   if (isPoll) {
     sendBody.model = resolvePollModelName(body.model);
   }
+  if (isCrof) {
+    sendBody.model = body.model.replace(/^crof\//, "");
+  }
   
-  const provider = isPoll ? "pol" : (isFm ? "zen" : (isFree ? "zen" : "go"));
+  const provider = isPoll ? "pol" : (isCrof ? "crof" : (isFm ? "zen" : (isFree ? "zen" : "go")));
 
   const headers = {
     "Content-Type": "application/json",
@@ -1432,11 +1505,19 @@ async function zenRequest(endpoint, body, opts = {}) {
   };
   
   // Poll models: no auth needed (free public API)
+  // Crof models: require Crof API key
   // Freemium models: free endpoint but require API key
   // Free models (non-freemium): no auth needed
   // Paid: require key.
   if (isPoll) {
     // Pollinations is a public API, no auth needed
+  } else if (isCrof) {
+    const crofKey = getCrofApiKey();
+    if (crofKey) {
+      headers["Authorization"] = `Bearer ${crofKey}`;
+    } else {
+      throw new APIError(401, "", "Crof API key required. Set CROF_API_KEY.");
+    }
   } else if (isFm) {
     if (key) {
       headers["Authorization"] = `Bearer ${key}`;
@@ -1832,7 +1913,7 @@ export async function* chatCompletion(req) {
 
   const lastMsg = body.messages?.[body.messages.length - 1];
   const preview = (typeof lastMsg?.content === "string" ? lastMsg.content : "").replace(/\s+/g, " ").trim();
-  const provider = isPollModel(info.id) ? "pol" : (isFreeTierModel(info.id) ? "zen" : "go");
+  const provider = isCrofModel(info.id) ? "crof" : (isPollModel(info.id) ? "pol" : (isFreeTierModel(info.id) ? "zen" : "go"));
 
   try {
     const t0 = Date.now();
@@ -1950,4 +2031,4 @@ export async function* generateCompletion(req) {
   }
 }
 
-export { config, SEP_PAID, SEP_FREE, SEP_FREE_P, SEP_M365 };
+export { config, SEP_PAID, SEP_FREE, SEP_FREE_P, SEP_M365, SEP_CROF };

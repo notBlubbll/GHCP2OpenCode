@@ -72,6 +72,7 @@ GitHub Copilot extension             src/server.js                       OpenCod
 - `_simStream()` — simulated SSE streaming from non-stream responses (VS 2026)
 - `createReasoningContext(messages, model, workspace, clientTag, provider, thinking)` — per-request reasoning cache factory with conversation-scoped isolation (prevents cross-session poisoning)
 - `_convId(messages, model, workspace)` — stable session identifier from hashed pre-assistant user messages + model + workspace
+- `_startPrompt(messages)` — raw pre-assistant user message text for continuation matching
 - `_msgHash(msg)` — content/tool-call hash for per-message reasoning lookup
 - `_sessionRegistry` / `_sessionCounter` — global session tracking (Map of convId → { id, clientTag, createdAt }), assigns monotonic session numbers
 - `normalizeOpenAIParams()` — camelCase → snake_case parameter mapping
@@ -536,6 +537,7 @@ Distinct conversation contexts are detected and numbered. Each session gets a mo
 A session is identified by a **conversation ID** (convId) — a djb2 hash of:
 1. **All user messages before the first assistant/tool message** — this captures the VS context block + the user's actual first query, differentiating between different chat tabs even in the same workspace
 2. **Workspace root path** — same query in a different project is a different session
+3. **Model name** — switching models creates a new session
 
 ```javascript
 function _convId(messages, model, workspace) {
@@ -546,12 +548,20 @@ function _convId(messages, model, workspace) {
     if (role === "assistant" || role === "tool") break;
     if (role === "user") preAssistant.push(content);
   }
-  // Model is NOT included — switching models preserves the session
-  return hash(preAssistant.join("\n") + "|" + workspace);
+  return hash(preAssistant.join("\n") + "|" + workspace + "|" + model);
 }
 ```
 
 The convId is **stable across turns** in the same conversation (the pre-assistant prefix never changes), but **different across chat tabs** (the user's first query differs).
+
+### Workspace continuation
+
+Sessions in the same workspace+model can **continue** (reuse the previous session number) instead of incrementing. Continuation requires all three conditions to match:
+1. Same workspace root
+2. Same model
+3. **Same start prompt** (pre-assistant user message text)
+
+This prevents sessions from different chat tabs with different start prompts from leaking into each other, even when they share a workspace. The start prompt is stored in `_workspaceSessions` alongside the convId and session ID.
 
 ### Session registry
 
@@ -559,6 +569,7 @@ The convId is **stable across turns** in the same conversation (the pre-assistan
 |----------|------|---------|
 | `_sessionRegistry` | `Map<convId, {id, clientTag, createdAt}>` | Maps convId to session metadata |
 | `_sessionCounter` | `number` | Monotonic counter, incremented per new session |
+| `_workspaceSessions` | `Map<"workspace\|model", {convId, sessionId, startPrompt}>` | Tracks most recent session per workspace+model for continuation |
 
 ### Console output
 

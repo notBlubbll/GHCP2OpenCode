@@ -505,6 +505,16 @@ function _convId(messages, model, workspaceRoot) {
   return (h >>> 0).toString(36);
 }
 
+function _startPrompt(messages) {
+  const preAssistant = [];
+  for (const m of messages) {
+    const role = (m.role || "").toLowerCase().trim();
+    if (role === "assistant" || role === "tool") break;
+    if (role === "user") preAssistant.push(typeof m.content === "string" ? m.content : JSON.stringify(m.content));
+  }
+  return preAssistant.join("\n");
+}
+
 // ── Task completion summary ──
 // When LLM calls task_complete, boil down tool calls + results into a compact
 // instructional summary. Strips raw code/tool output, keeps only findings and
@@ -678,7 +688,8 @@ function createReasoningContext(messages, model, workspaceRoot, clientTag, provi
   }
   const wsKey = effectiveWorkspace ? `${effectiveWorkspace}|${model}` : null;
   const wsPrev = wsKey ? _workspaceSessions.get(wsKey) : null;
-  const isContinuation = wsPrev && wsPrev.convId !== conv; // different conversation, same workspace+model
+  const curStartPrompt = _startPrompt(messages);
+  const isContinuation = wsPrev && wsPrev.convId !== conv && wsPrev.startPrompt === curStartPrompt; // different conversation, same workspace+model+startPrompt
 
   let sessionEntry = _sessionRegistry.get(conv);
   let reusedExisting = false;
@@ -707,7 +718,7 @@ function createReasoningContext(messages, model, workspaceRoot, clientTag, provi
 
   // Update workspace registry (always — tracks the most recent session per workspace+model)
   if (wsKey) {
-    _workspaceSessions.set(wsKey, { convId: conv, sessionId: sessionEntry.id, lastSeen: new Date().toISOString(), clientTag });
+    _workspaceSessions.set(wsKey, { convId: conv, sessionId: sessionEntry.id, lastSeen: new Date().toISOString(), clientTag, startPrompt: curStartPrompt });
   }
 
   const sessionId = sessionEntry.id;

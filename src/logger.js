@@ -12,7 +12,10 @@ let _dashboard = false;
 let _stdinBuf = "";
 let _rawMode = false;
 
-const VISIBLE_LINES = 5;
+const VISIBLE_LINES = 10;
+let _boxW = 78;
+const setBoxWidth = (w) => { _boxW = w; };
+const _visLen = (s) => s.replace(/\x1b\[[0-9;]*m/g, "").length;
 
 function _debugOn() { return Bun.env.DEBUG === "1" || Bun.env.DEBUG === "true" || Bun.env.DEBUG === "yes"; }
 function _visibleBuffer() { return _debugOn() ? _buffer : _buffer.filter(e => !e.debug); }
@@ -191,12 +194,12 @@ function _redraw() {
     const page = Math.ceil((total - _scrollOffset) / VISIBLE_LINES);
     out += "\x1b[90m\u2500 page " + page + "/" + pages + " \u2500 " + total + " entries \u2500 any key = live tail \u2500\x1b[0m\n";
     for (let i = start; i < end; i++) {
-      out += "\x1b[90m" + ts() + "\x1b[0m " + vis[i].text + "\n";
+      out += "\x1b[90m" + (vis[i].ts || ts()) + "\x1b[0m " + vis[i].text + "\n";
     }
   } else {
     const start = Math.max(0, total - VISIBLE_LINES);
     for (let i = start; i < total; i++) {
-      out += "\x1b[90m" + ts() + "\x1b[0m " + vis[i].text + "\n";
+      out += "\x1b[90m" + (vis[i].ts || ts()) + "\x1b[0m " + vis[i].text + "\n";
     }
     if (total === 0) out += "\x1b[90m  idle...\x1b[0m\n";
     else out += "\x1b[90m\u2500 live tail (" + total + " entries) \u2500 \u2191\u2193 PgUp PgDn \u2500\x1b[0m\n";
@@ -210,7 +213,7 @@ function log(msg) {
   if (_dashboard) {
     const vb = _visibleBuffer();
     const oldLen = vb.length;
-    _buffer.push({ text: msg, debug: false });
+    _buffer.push({ text: msg, debug: false, ts: ts() });
     if (_scrollMode) {
       _scrollOffset += _visibleBuffer().length - oldLen;
       _updatePageCount();
@@ -224,7 +227,7 @@ function warn(msg) {
   if (_dashboard) {
     const vb = _visibleBuffer();
     const oldLen = vb.length;
-    _buffer.push({ text: "\x1b[33m" + msg + "\x1b[0m", debug: false });
+    _buffer.push({ text: "\x1b[33m" + msg + "\x1b[0m", debug: false, ts: ts() });
     if (_scrollMode) {
       _scrollOffset += _visibleBuffer().length - oldLen;
       _updatePageCount();
@@ -238,7 +241,7 @@ function error(msg) {
   if (_dashboard) {
     const vb = _visibleBuffer();
     const oldLen = vb.length;
-    _buffer.push({ text: "\x1b[31m" + msg + "\x1b[0m", debug: false });
+    _buffer.push({ text: "\x1b[31m" + msg + "\x1b[0m", debug: false, ts: ts() });
     if (_scrollMode) {
       _scrollOffset += _visibleBuffer().length - oldLen;
       _updatePageCount();
@@ -253,7 +256,7 @@ function debug(msg) {
   if (_dashboard) {
     const vb = _visibleBuffer();
     const oldLen = vb.length;
-    _buffer.push({ text: msg, debug: true });
+    _buffer.push({ text: msg, debug: true, ts: ts() });
     if (_scrollMode) {
       _scrollOffset += _visibleBuffer().length - oldLen;
       _updatePageCount();
@@ -266,14 +269,39 @@ function reqLog({ tag, provider, model, preview, thinking, elapsed, sessionId })
   const sessionPart = sessionId ? `[\x1b[36m${sessionId}\x1b[0m]` : "";
   const thinkPart = thinking ? `[\x1b[36m${thinking}\x1b[0m]` : "";
   const provModel = `[\x1b[0m${provider}/\x1b[1m${model || "?"}\x1b[0m]`;
-  const trail = preview ? ` — ${JSON.stringify(preview)}` : "";
+  const prefix = `${tagPart}${sessionPart}>${thinkPart}${provModel}`;
+  const prefixLen = _visLen(prefix);
+
+  // Max suffix length: " → [XXXXXms]" — reserve worst-case space
+  const maxSuffixLen = 14;
+  const maxTrailLen = _boxW - 4 - prefixLen - maxSuffixLen;
+
+  let trail = "";
+  if (preview) {
+    if (_debugOn()) {
+      trail = ` — ${JSON.stringify(preview)}`;
+    } else {
+      const sep = " — ";
+      const rawTrail = sep + JSON.stringify(preview);
+      if (_visLen(rawTrail) <= maxTrailLen) {
+        trail = rawTrail;
+      } else {
+        let maxChunk = Math.max(1, maxTrailLen - sep.length - 3);
+        let chunk = preview.slice(0, maxChunk);
+        while (chunk.length > 0 && _visLen(sep + JSON.stringify(chunk + "\u2026")) > maxTrailLen) {
+          chunk = chunk.slice(0, -1);
+        }
+        trail = chunk ? sep + JSON.stringify(chunk + "\u2026") : "";
+      }
+    }
+  }
 
   if (elapsed != null) {
-    const msg = `${tagPart}${sessionPart}>${thinkPart}${provModel}${trail} \x1b[32m→\x1b[0m [${elapsed}ms]`;
+    const msg = `${prefix}${trail} \x1b[32m→\x1b[0m [${elapsed}ms]`;
     if (_dashboard) {
       const vb = _visibleBuffer();
       const oldLen = vb.length;
-      _buffer.push({ text: msg, debug: false });
+      _buffer.push({ text: msg, debug: false, ts: ts() });
       if (_scrollMode) {
         _scrollOffset += _visibleBuffer().length - oldLen;
         _updatePageCount();
@@ -283,26 +311,27 @@ function reqLog({ tag, provider, model, preview, thinking, elapsed, sessionId })
     return;
   }
 
-  const prefix = `\x1b[90m${ts()}\x1b[0m ${tagPart}${sessionPart}>${thinkPart}${provModel}${trail}— … `;
-  if (!_dashboard) process.stdout.write(prefix);
+  const initSuffix = "\u2014 \u2026 ";
+  const initLine = `\x1b[90m${ts()}\x1b[0m ${prefix}${trail}${initSuffix}`;
+  if (!_dashboard) process.stdout.write(initLine);
 
   return (elapsed) => {
-    const msg = `${tagPart}${sessionPart}>${thinkPart}${provModel}${trail} \x1b[32m→\x1b[0m [${elapsed}ms]`;
+    const msg = `${prefix}${trail} \x1b[32m→\x1b[0m [${elapsed}ms]`;
     if (_dashboard) {
       const vb = _visibleBuffer();
       const oldLen = vb.length;
-      _buffer.push({ text: msg, debug: false });
+      _buffer.push({ text: msg, debug: false, ts: ts() });
       if (_scrollMode) {
         _scrollOffset += _visibleBuffer().length - oldLen;
         _updatePageCount();
       } else { _scrollOffset = 0; _redraw(); }
     }
-    else { process.stdout.write(`\r${prefix}\x1b[32m→\x1b[0m [${elapsed}ms]\n`); }
+    else { process.stdout.write(`\r${initLine}\x1b[32m→\x1b[0m [${elapsed}ms]\n`); }
   };
 }
 
 function redrawBanner() { if (_dashboard) _redraw(); }
-export { ts, log, warn, error, debug, reqLog, enableDashboard, disableDashboard, onCommand, redrawBanner };
+export { ts, log, warn, error, debug, reqLog, enableDashboard, disableDashboard, onCommand, redrawBanner, setBoxWidth };
 
 function collapseBanner() {
   if (!_dashboard || _collapsed) return;

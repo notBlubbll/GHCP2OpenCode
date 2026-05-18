@@ -51,7 +51,7 @@ import { compactIdentity, compactToolInstructions, compactOllamaToolInstructions
 import { m365ChatCompletion, m365ChatCompletionStream, M365CopilotError } from "./m365-client.js";
 import { trackSession, touchSession, stopSession as keepaliveStopSession, shutdown as keepaliveShutdown, stats as keepaliveStats } from "./session-keepalive.js";
 import { handleServiceCommand, runAsService } from "./win-service.js";
-import { log, error as logErr, debug, reqLog, enableDashboard, disableDashboard, onCommand, collapseBanner, redrawBanner } from "./logger.js";
+import { log, error as logErr, debug, reqLog, enableDashboard, disableDashboard, onCommand, collapseBanner, redrawBanner, setBoxWidth } from "./logger.js";
 
 // ── Service command routing (early exit for install/uninstall) ──
 {
@@ -150,6 +150,7 @@ async function checkVersion() {
       setConsoleTitle("gc2oc (outdated, check github for new version)");
       showToast("gc2oc is outdated", "Check GitHub for the latest version");
       try { (await import("node:child_process")).exec("powershell -NoProfile -Command \"[System.Media.SystemSounds]::Exclamation.Play()\""); } catch {} // fire-and-forget
+
     } else {
       log(`\x1b[90m[version] no remote version\x1b[0m`);
     }
@@ -252,12 +253,14 @@ function _isNoTaskMessage(text) {
 }
 
 // Pre-flight: strip orphaned tool_calls from assistant messages that have no
-// matching tool results. This prevents DeepSeek validation errors (tool_calls
-// must have matching results) without injecting fake results that confuse the model.
+// matching tool results, AND strip orphaned tool messages that have no matching
+// assistant with tool_calls. Prevents DeepSeek validation errors both directions.
 function _stripOrphanedToolCalls(messages) {
   if (!messages?.length) return { messages, stripped: 0 };
   let stripped = 0;
-  const result = messages.map(m => {
+
+  // First pass: strip orphaned tool_calls from assistant messages
+  let result = messages.map(m => {
     if (m.role !== "assistant" || !m.tool_calls?.length) return m;
 
     const callIds = m.tool_calls.map(tc => tc.id);
@@ -287,7 +290,26 @@ function _stripOrphanedToolCalls(messages) {
     return m;
   });
 
-  if (stripped) log(`  [tool] stripped orphaned tool calls from ${stripped} assistant message${stripped !== 1 ? "s" : ""}`);
+  // Second pass: strip orphaned tool messages that have no matching assistant with tool_calls
+  const before = result.length;
+  result = result.filter(m => {
+    if (m.role !== "tool") return true;
+    // Walk backwards to find a preceding assistant with matching tool_calls
+    const idx = result.indexOf(m);
+    for (let j = idx - 1; j >= 0; j--) {
+      const prev = result[j];
+      if (prev.role === "assistant" && prev.tool_calls?.length) {
+        if (prev.tool_calls.some(tc => tc.id === m.tool_call_id)) return true;
+      }
+      if (prev.role !== "assistant" && prev.role !== "tool") break;
+    }
+    stripped++;
+    return false;
+  });
+  const orphanedTools = before - result.length;
+  if (orphanedTools) debug(`  [tool] stripped ${orphanedTools} orphaned tool message${orphanedTools !== 1 ? "s" : ""}`);
+
+  if (stripped) debug(`  [tool] stripped orphaned tool calls/messages from ${stripped} total`);
   return { messages: result, stripped };
 }
 
@@ -909,7 +931,7 @@ function _dumpToolSchemas(tools) {
       required: t.function?.parameters?.required,
       properties: t.function?.parameters?.properties ? Object.keys(t.function.parameters.properties) : undefined,
     });
-    log(`\x1b[33m[schema] ${summary}\x1b[0m`);
+    debug(`\x1b[33m[schema] ${summary}\x1b[0m`);
   }
 }
 
@@ -2230,8 +2252,8 @@ app.post("/v1/chat/completions", async c => {
       }));
 
       const lastMsg = m365Messages[m365Messages.length - 1];
-      const preview = typeof lastMsg?.content === "string" ? lastMsg.content.replace(/\s+/g, " ").trim().slice(0, 60) : "";
-      const logDone = config.requestLog ? reqLog({ tag: clientTag, provider: "m365", model, thinking: thinkingTag, preview: `${preview}${(lastMsg?.content?.length || 0) > 60 ? "\u2026" : ""}` }) : null;
+      const preview = typeof lastMsg?.content === "string" ? lastMsg.content.replace(/\s+/g, " ").trim() : "";
+      const logDone = config.requestLog ? reqLog({ tag: clientTag, provider: "m365", model, thinking: thinkingTag, preview }) : null;
       const m365t0 = Date.now();
 
       if (streamMode) {
@@ -2414,7 +2436,8 @@ app.post("/v1/chat/completions", async c => {
 
     // ── Condense tool history after task_complete ──
     // Only fires at the start of a NEW request after the LLM finished a task
-    // naturally (not cancelled). Replaces heavy tool messages with a compact summary.
+    // naturally (not cancelled). Replaces heavy tool messages with a compact
+    // summary and returns a hard stop — the task is done, no more LLM calls needed.
     if (_taskCompletedSessions.get(reasoningCtx.conv)) {
       _taskCompletedSessions.delete(reasoningCtx.conv);
       const before = userMsgs.length;
@@ -2426,6 +2449,18 @@ app.post("/v1/chat/completions", async c => {
         const summaryMsg = condensed.find(m => m.role === "system" && m.content?.includes("[Task Summary]"));
         reasoningCtx.seslog(`\x1b[35m[condensed] replaced ${dropped} tool messages with summary${summaryMsg ? " (" + summaryMsg.content.slice(0, 80) + "...)" : ""}\x1b[0m`);
       }
+      // Task is done — return hard stop instead of forwarding to LLM
+      reasoningCtx.seslog(`\x1b[33m[autopilot] task already done — returning hard stop after condensation\x1b[0m`);
+      if (clientWantsStream) {
+        return stream(c, async s => {
+          const w = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
+          const base = { id: chatId, object: "chat.completion.chunk", created, model, system_fingerprint: systemFp };
+          await w({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
+          await _simStream(w, base, false, [], "The task has already been completed. No further action needed.", null);
+          await s.write("data: [DONE]\n\n");
+        });
+      }
+      return c.json(oaiResp("The task has already been completed. No further action needed.", undefined, "stop", model));
     }
 
     // ── VS nag detection ──
@@ -2547,6 +2582,10 @@ app.post("/v1/chat/completions", async c => {
         const t = typeof lastUM.content === "string" ? lastUM.content.trim() : "";
         const tl = t.toLowerCase();
         if (tl === "continue" || tl === "proceed" || tl === "go on" || tl === "go ahead") {
+          if (_taskCompletedSessions.get(reasoningCtx.conv)) {
+            reasoningCtx.seslog(`\x1b[33m[autopilot] task already done — returning hard stop for bare "${t}"\x1b[0m`);
+            return c.json(oaiResp("The task has already been completed. No further action needed.", undefined, "stop", model));
+          }
           reasoningCtx.seslog(`\x1b[35m[autopilot] replacing bare "${t}" → "Continue with your current task using the tools available."\x1b[0m`);
           userMsgs[userMsgs.length - 1] = { role: "user", content: "Continue with your current task using the tools available." };
         }
@@ -2577,6 +2616,20 @@ app.post("/v1/chat/completions", async c => {
 
     if (systemMsg) apiMessages.push({ role: "system", content: systemMsg });
     apiMessages.push(...userMsgs);
+
+    // Message paging: keep system messages + last N non-system messages to control context length
+    const _paging = config.messagesPaging;
+    if (_paging > 0 && apiMessages.length > _paging) {
+      const sysMsgs = apiMessages.filter(m => m.role === "system");
+      const nonSysMsgs = apiMessages.filter(m => m.role !== "system");
+      if (nonSysMsgs.length > _paging) {
+        const dropped = nonSysMsgs.length - _paging;
+        const paged = [...sysMsgs, ...nonSysMsgs.slice(-_paging)];
+        apiMessages.length = 0;
+        apiMessages.push(...paged);
+        debug(`  ${reasoningCtx.sessionPrefix} [paging] kept ${_paging} messages (dropped ${dropped})`);
+      }
+    }
 
     // Strip orphaned tool_calls before compression (prevents upstream 400)
     const { messages: validatedMessages, stripped: _strippedOrphaned } = _stripOrphanedToolCalls(apiMessages);
@@ -2683,19 +2736,20 @@ app.post("/v1/chat/completions", async c => {
             hasTools = false;
         }
 
+        const hasTC = toolCalls?.length && toolCalls.some(tc => tc.function?.name === "task_complete");
+
         if (clientWantsStream) {
           return stream(c, async (s) => {
             const w = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
             const base = { id: chatId, object: "chat.completion.chunk", created, model, system_fingerprint: systemFp };
             await w({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
-            await _simStream(w, base, hasTools, toolCalls, text, reasoningContent);
+            await _simStream(w, base, hasTools, toolCalls, text, hasTC ? null : reasoningContent);
             await s.write("data: [DONE]\n\n");
           });
         }
 
-        const hasTC = toolCalls?.length && toolCalls.some(tc => tc.function?.name === "task_complete");
-        const resp = oaiResp(hasTools && !hasTC ? null : text, hasTools ? toolCalls : undefined, hasTools ? "tool_calls" : "stop", model);
-        if (reasoningContent) {
+        const resp = oaiResp(hasTools ? null : text, hasTools ? toolCalls : undefined, hasTools ? "tool_calls" : "stop", model);
+        if (reasoningContent && !hasTC) {
           const choice = resp.choices[0];
           if (_displayReasoning) {
             choice.message.content = _foldReasoningIntoContent(reasoningContent, choice.message.content || "");
@@ -3004,6 +3058,19 @@ app.post("/v1/chat/completions", async c => {
       cleanText = "";
     }
 
+    // When task_complete is present, drop all other tool calls.
+    // LLMs often emit task_complete alongside unnecessary tool calls (get_file,
+    // grep_search, etc.) in the same response. VS would execute those too,
+    // wasting round-trips on work that's already done.
+    if (allToolCalls.length > 1) {
+      const tcIdx = allToolCalls.findIndex(tc => tc.function?.name === "task_complete");
+      if (tcIdx >= 0) {
+        const dropped = allToolCalls.filter((_, i) => i !== tcIdx);
+        reasoningCtx.seslog(`\x1b[35m[task_complete] dropping ${dropped.length} extra tool call${dropped.length !== 1 ? "s" : ""}: ${dropped.map(tc => tc.function?.name).join(", ")}\x1b[0m`);
+        allToolCalls = [allToolCalls[tcIdx]];
+      }
+    }
+
     let hasTools = allToolCalls.length > 0;
 
     // Store reasoning keyed by content/tool hash
@@ -3077,7 +3144,9 @@ app.post("/v1/chat/completions", async c => {
     }
 
     const hasTaskComplete = allToolCalls.length && allToolCalls.some(tc => tc.function?.name === "task_complete");
-    const resp = oaiResp(hasTools && !hasTaskComplete ? null : cleanText, hasTools ? allToolCalls : undefined, hasTools ? "tool_calls" : "stop", model, usage);
+    // When task_complete is present, suppress text content — only the tool call matters.
+    // Previously cleanText was kept, giving VS three outputs (content + tool_calls + reasoning).
+    const resp = oaiResp(hasTools ? null : cleanText, hasTools ? allToolCalls : undefined, hasTools ? "tool_calls" : "stop", model, usage);
     if (hasTools) debug(`${reasoningCtx.sessionPrefix} \x1b[35m[TOOLS-TO-VS] ${allToolCalls.map(tc => `${tc.function.name}(${tc.function.arguments})`).join(" \u2502 ")}\x1b[0m`);
     else debug(`${reasoningCtx.sessionPrefix} \x1b[35m[TEXT-TO-VS] ${(cleanText || "").slice(0, 200).replace(/\n/g,"\\n")}\x1b[0m`);
 
@@ -3102,7 +3171,7 @@ app.post("/v1/chat/completions", async c => {
       }
     }
 
-    if (reasoningContent) {
+    if (reasoningContent && !hasTaskComplete) {
       const choice = resp.choices[0];
       if (_displayReasoning) {
         choice.message.content = _foldReasoningIntoContent(reasoningContent, choice.message.content || "");
@@ -3117,7 +3186,7 @@ app.post("/v1/chat/completions", async c => {
         const w = (o) => s.write(`data: ${JSON.stringify(o)}\n\n`);
         const base = { id: chatId, object: "chat.completion.chunk", created, model, system_fingerprint: systemFp };
         await w({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] });
-        await _simStream(w, base, hasTools, allToolCalls, cleanText, reasoningContent);
+        await _simStream(w, base, hasTools, allToolCalls, cleanText, hasTaskComplete ? null : reasoningContent);
         await s.write("data: [DONE]\n\n");
       });
     }
@@ -3411,6 +3480,10 @@ app.post("/api/chat", async c => {
           const t = typeof lastUM.content === "string" ? lastUM.content.trim() : "";
           const tl = t.toLowerCase();
           if (tl === "continue" || tl === "proceed" || tl === "go on" || tl === "go ahead") {
+            if (_taskCompletedSessions.get(reasoningCtx.conv)) {
+              reasoningCtx.seslog(`\x1b[33m[autopilot] task already done — returning hard stop for bare "${t}"\x1b[0m`);
+              return c.json(oaiResp("The task has already been completed. No further action needed.", undefined, "stop", model));
+            }
             reasoningCtx.seslog(`\x1b[35m[autopilot] replacing bare "${t}" → "Continue with your current task using the tools available."\x1b[0m`);
             userMsgs[userMsgs.length - 1] = { role: "user", content: "Continue with your current task using the tools available." };
           }
@@ -3418,6 +3491,21 @@ app.post("/api/chat", async c => {
       }
 
       const apiMessages = systemMsg ? [{ role: "system", content: systemMsg }, ...userMsgs] : userMsgs;
+
+      // Message paging: keep system messages + last N non-system messages to control context length
+      const _paging2 = config.messagesPaging;
+      if (_paging2 > 0 && apiMessages.length > _paging2) {
+        const sysMsgs = apiMessages.filter(m => m.role === "system");
+        const nonSysMsgs = apiMessages.filter(m => m.role !== "system");
+        if (nonSysMsgs.length > _paging2) {
+          const dropped = nonSysMsgs.length - _paging2;
+          const paged = [...sysMsgs, ...nonSysMsgs.slice(-_paging2)];
+          apiMessages.length = 0;
+          apiMessages.push(...paged);
+          debug(`  ${reasoningCtx.sessionPrefix} [paging] kept ${_paging2} messages (dropped ${dropped})`);
+        }
+      }
+
       const { messages: validatedMessages, stripped: _strippedOrphaned2 } = _stripOrphanedToolCalls(apiMessages);
 
       // Delta compression (KitPilot): strip historical VS context blocks, compact consumed tool outputs
@@ -3756,6 +3844,7 @@ const C = "\x1b[36m";
 const S = "\x1b[90m";
 const W = "\x1b[37m";
 const boxW = 78;
+setBoxWidth(boxW);
 const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, "").length;
 const V = "\u2502";   // │ vertical border
 const H = "\u2500";   // ─ horizontal border

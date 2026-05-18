@@ -15,7 +15,7 @@
 //   Delta     (60-90%)— Historical VS context stripping (KitPilot) + tool output compacting
 //
 // Also compresses tool descriptions, schemas, identity prompts, and tool instructions.
-import { log } from "./logger.js";
+import { log, debug } from "./logger.js";
 //
 // Compression strategies:
 //   1. Strip verbose prefixes ("This tool allows you to", "Use this function to")
@@ -854,7 +854,7 @@ function _compactHistoricalToolOutputs(messages) {
         const head = content.slice(0, 200).replace(/\n/g, " ").trim();
         const compact = `[gc2oc: consumed tool output — ${head}... (${content.length} chars)]`;
         result.push({ ...m, content: compact });
-        log(`[delta] compacted consumed tool output (${content.length} → ${compact.length} chars) at message[${i}]`);
+        debug(`[delta] compacted consumed tool output (${content.length} → ${compact.length} chars) at message[${i}]`);
       } else {
         result.push(m);
       }

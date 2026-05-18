@@ -338,6 +338,10 @@ const config = {
   get sessionKeepaliveMaxLifetimeMs() {
     return Math.max(3600000, parseInt(Bun.env.SESSION_KEEPALIVE_MAX_LIFETIME_MS || "86400000", 10));
   },
+  get messagesPaging() {
+    const v = parseInt(Bun.env.MESSAGES_PAGING, 10);
+    return isNaN(v) ? 10 : Math.max(0, v);
+  },
 };
 
 export function setApiKey(key) { Bun.env.OPENCODE_API_KEY = key; }
@@ -1827,12 +1831,12 @@ export async function* chatCompletion(req) {
   }
 
   const lastMsg = body.messages?.[body.messages.length - 1];
-  const preview = (typeof lastMsg?.content === "string" ? lastMsg.content : "").replace(/\s+/g, " ").trim().slice(0, 500);
+  const preview = (typeof lastMsg?.content === "string" ? lastMsg.content : "").replace(/\s+/g, " ").trim();
   const provider = isPollModel(info.id) ? "pol" : (isFreeTierModel(info.id) ? "zen" : "go");
 
   try {
     const t0 = Date.now();
-    const logDone = config.requestLog ? reqLog({ tag: req.clientTag, sessionId: req.sessionId, provider, model, thinking: thinkingTag, preview: `${preview}${lastMsg?.content?.length > 60 ? "\u2026" : ""}` }) : null;
+    const logDone = config.requestLog ? reqLog({ tag: req.clientTag, sessionId: req.sessionId, provider, model, thinking: thinkingTag, preview }) : null;
     const resp = await zenRequest("/chat/completions", body, { signal: ac?.signal, clientTag: req.clientTag });
 
     if (req.stream === false) {

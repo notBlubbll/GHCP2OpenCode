@@ -614,6 +614,17 @@ function withKey() {
   return _balancer.getNextKey();
 }
 
+function _parseRetryAfter(resp) {
+  const val = resp?.headers?.get("Retry-After");
+  if (!val) return 0;
+  const secs = parseInt(val, 10);
+  if (!isNaN(secs) && secs > 0) return secs;
+  // Try HTTP-date format
+  const ms = Date.parse(val);
+  if (!isNaN(ms)) return Math.max(0, Math.round((ms - Date.now()) / 1000));
+  return 0;
+}
+
 function report429(key, resetSeconds = 0) {
   if (key && _balancer) {
     _balancer.mark429(key, resetSeconds);
@@ -1226,28 +1237,30 @@ async function fetchGoModelsRaw() {
         } else if (pingResp.status === 429) {
           const txt = await pingResp.text().catch(() => "");
           let errType = "429", errMsg = "";
+          let resetSec = _parseRetryAfter(pingResp);
           try {
             const p = JSON.parse(txt);
             errType = p.error?.type || p.error?.code || errType;
             errMsg = p.error?.message || "";
-            // Parse duration from message (e.g. "Resets in 1 day", "Resets in 15hr 8min", "Resets in 4 hours 30 minutes")
-            let resetSec = 0;
-            try {
-              const dm = errMsg.match(/resets?\s+in\s+(.+?)(?:\.|$|\s+To)/i);
-              if (dm) {
-                const durStr = dm[1];
-                let m2;
-                const re = /(\d+)\s*(day|hour|hr|minute|min|second|sec)s?/gi;
-                while ((m2 = re.exec(durStr)) !== null) {
-                  const n = parseInt(m2[1], 10);
-                  const u = m2[2].toLowerCase();
-                  if (u === 'day') resetSec += n * 86400;
-                  else if (u === 'hour' || u === 'hr') resetSec += n * 3600;
-                  else if (u === 'minute' || u === 'min') resetSec += n * 60;
-                  else if (u === 'second' || u === 'sec') resetSec += n;
+            if (!resetSec) {
+              // Parse duration from message (e.g. "Resets in 1 day", "Resets in 15hr 8min", "Resets in 4 hours 30 minutes")
+              try {
+                const dm = errMsg.match(/resets?\s+in\s+(.+?)(?:\.|$|\s+To)/i);
+                if (dm) {
+                  const durStr = dm[1];
+                  let m2;
+                  const re = /(\d+)\s*(day|hour|hr|minute|min|second|sec)s?/gi;
+                  while ((m2 = re.exec(durStr)) !== null) {
+                    const n = parseInt(m2[1], 10);
+                    const u = m2[2].toLowerCase();
+                    if (u === 'day') resetSec += n * 86400;
+                    else if (u === 'hour' || u === 'hr') resetSec += n * 3600;
+                    else if (u === 'minute' || u === 'min') resetSec += n * 60;
+                    else if (u === 'second' || u === 'sec') resetSec += n;
+                  }
                 }
-              }
-            } catch {}
+              } catch {}
+            }
             if (resetSec > 0) {
               report429(k, resetSec);
             }
@@ -1281,27 +1294,29 @@ async function fetchGoModelsRaw() {
                 } else if (fallPing.status === 429) {
                   const ftxt = await fallPing.text().catch(() => "");
                   let ftype = "429", fmsg = "";
+                  let fResetSec = _parseRetryAfter(fallPing);
                   try {
                     const fp = JSON.parse(ftxt);
                     ftype = fp.error?.type || ftype;
                     fmsg = fp.error?.message || "";
-                    let fResetSec = 0;
-                    try {
-                      const dm = fmsg.match(/resets?\s+in\s+(.+?)(?:\.|$|\s+To)/i);
-                      if (dm) {
-                        const durStr = dm[1];
-                        let m2;
-                        const re = /(\d+)\s*(day|hour|hr|minute|min|second|sec)s?/gi;
-                        while ((m2 = re.exec(durStr)) !== null) {
-                          const n = parseInt(m2[1], 10);
-                          const u = m2[2].toLowerCase();
-                          if (u === 'day') fResetSec += n * 86400;
-                          else if (u === 'hour' || u === 'hr') fResetSec += n * 3600;
-                          else if (u === 'minute' || u === 'min') fResetSec += n * 60;
-                          else if (u === 'second' || u === 'sec') fResetSec += n;
+                    if (!fResetSec) {
+                      try {
+                        const dm = fmsg.match(/resets?\s+in\s+(.+?)(?:\.|$|\s+To)/i);
+                        if (dm) {
+                          const durStr = dm[1];
+                          let m2;
+                          const re = /(\d+)\s*(day|hour|hr|minute|min|second|sec)s?/gi;
+                          while ((m2 = re.exec(durStr)) !== null) {
+                            const n = parseInt(m2[1], 10);
+                            const u = m2[2].toLowerCase();
+                            if (u === 'day') fResetSec += n * 86400;
+                            else if (u === 'hour' || u === 'hr') fResetSec += n * 3600;
+                            else if (u === 'minute' || u === 'min') fResetSec += n * 60;
+                            else if (u === 'second' || u === 'sec') fResetSec += n;
+                          }
                         }
-                      }
-                    } catch {}
+                      } catch {}
+                    }
                     if (fResetSec > 0) {
                       report429(k, fResetSec);
                     }
@@ -1575,15 +1590,17 @@ async function zenRequest(endpoint, body, opts = {}) {
     // Handle 429 (rate limit) — retry for all models (key rotation for paid, delay for free)
     if (resp.status === 429 && retries < maxRetries) {
       if (key && (isFm || !isFree) && !isPoll) {
-        let resetSec = 0;
+        let resetSec = _parseRetryAfter(resp);
         try {
           const parsed = JSON.parse(txt);
-          if (parsed.monthlyUsage?.status === "rate-limited") {
-            resetSec = parsed.monthlyUsage.resetInSec;
-          } else if (parsed.weeklyUsage?.status === "rate-limited") {
-            resetSec = parsed.weeklyUsage.resetInSec;
-          } else if (parsed.rollingUsage?.status === "rate-limited") {
-            resetSec = parsed.rollingUsage.resetInSec;
+          if (!resetSec) {
+            if (parsed.monthlyUsage?.status === "rate-limited") {
+              resetSec = parsed.monthlyUsage.resetInSec;
+            } else if (parsed.weeklyUsage?.status === "rate-limited") {
+              resetSec = parsed.weeklyUsage.resetInSec;
+            } else if (parsed.rollingUsage?.status === "rate-limited") {
+              resetSec = parsed.rollingUsage.resetInSec;
+            }
           }
         } catch {}
         report429(key, resetSec);

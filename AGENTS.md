@@ -391,10 +391,13 @@ On startup and model refresh (`refreshModels` → `fetchGoModelsRaw`), the proxy
 | Event | Action |
 |-------|--------|
 | 401 response | `ApiBalancer.mark401()` → sets 1h `cooldownUntil` (override via `OPENCODE_401_COOLDOWN_MS`), persists to disk |
-| 429 response | `ApiBalancer.mark429()` → increments `consecutive429`, sets `cooldownUntil` if threshold met or upstream timer provided |
+| 429 response (body) | `ApiBalancer.mark429()` → increments `consecutive429`, sets `cooldownUntil` if threshold met or upstream timer parsed from error message |
+| 429 response (header) | `_parseRetryAfter(resp)` extracts `Retry-After` header (seconds or HTTP-date) → passed to `mark429()` as `resetSeconds`. Takes precedence over body parsing. Used for Cloudflare WAF 429s with empty body |
 | Successful request | `ApiBalancer.markSuccess()` → clears `cooldownUntil`, resets `consecutive429` to 0 |
 | State save | `saveKeyState()` → writes all cooldowns + counters to `.cache/key-state.json` |
 | State load | `loadKeyState()` + `_restoreState()` + direct disk safety net |
+
+> **`_parseRetryAfter(resp)`** (`src/opencode-client.js:617`): reads `Retry-After` header from the HTTP response. Accepts either a decimal integer (seconds) or an HTTP-date. Returns `0` if absent/unparseable. Called in three 429-handling paths: key verification ping, fallback key ping, and `zenRequest` (actual requests).
 
 ### Key state file format
 

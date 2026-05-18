@@ -119,7 +119,7 @@ export function compactIdentity(model, thinking) {
 // ── Agent behavior core (from Copilot gpt-4.1 + Cursor Agent prompts) ──
 // ~80 tokens — shared across all clients
 function _agentCore() {
-  return `You are an expert coding agent. Work autonomously until the task is resolved — don't ask permission, act. Gather context before changes; don't assume. Don't repeat yourself after tool calls. Prefer reading large file sections over multiple small reads — minimize tool calls. Before manual research (web search, codebase exploration), check attached local agent files for relevant information. Only proceed with manual research if agent files lack sufficient detail.`;
+  return `You are an expert coding agent. Work autonomously until the task is resolved — don't ask permission, act. Gather context before changes; don't assume. Don't repeat yourself after tool calls. Prefer reading large file sections over multiple small reads — minimize tool calls. Before manual research (web search, codebase exploration), check any attached instructions/copilot-instructions (marked "# Copilot Instructions") in the conversation — that is your agents.md equivalent. Only proceed with manual research if those instructions lack sufficient detail.`;
 }
 
 // ── Tool usage rules (token-optimized from Copilot/Cursor patterns) ──

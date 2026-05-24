@@ -1,3 +1,5 @@
+Superseded with deeper integration by https://github.com/notBlubbll/GC2XY
+
 # gc2oc — GitHub Copilot to [OpenCode]
 
 <img width="213" height="46" alt="image" src="https://github.com/user-attachments/assets/6a6a2626-1779-4873-a30e-7fc2d8621967" />
